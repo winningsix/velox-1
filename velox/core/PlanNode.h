@@ -1002,6 +1002,32 @@ class LimitNode : public PlanNode {
   const std::vector<std::shared_ptr<const PlanNode>> sources_;
 };
 
+class JITedNode : public PlanNode {
+ public:
+  JITedNode(
+      const PlanNodeId& id,
+      const std::string jit_plan_str,
+      const std::shared_ptr<const PlanNode>& source)
+      : PlanNode(id), jit_plan_str_(jit_plan_str), sources_{source} {};
+
+  // TODO (Cheng) change to the right output types
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  const std::vector<std::shared_ptr<const PlanNode>>& sources() const override {
+    return sources_;
+  }
+
+  std::string_view name() const override {
+    return "JITed";
+  }
+
+ private:
+  const std::string jit_plan_str_;
+  const std::vector<std::shared_ptr<const PlanNode>> sources_;
+};
+
 /// Expands arrays and maps into separate columns. Arrays are expanded into a
 /// single column, and maps are expanded into two columns (key, value). Can be
 /// used to expand multiple columns. In this case will produce as many rows as
