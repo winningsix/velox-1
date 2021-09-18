@@ -31,6 +31,7 @@
 #include "velox/exec/TopN.h"
 #include "velox/exec/Unnest.h"
 #include "velox/exec/Values.h"
+#include "velox/exec/CiderJITedOperator.h"
 
 namespace facebook::velox::exec {
 
@@ -89,6 +90,13 @@ OperatorSupplier makeConsumerSupplier(
           std::dynamic_pointer_cast<const core::HashJoinNode>(planNode)) {
     return [join](int32_t operatorId, DriverCtx* ctx) {
       return std::make_unique<HashBuild>(operatorId, ctx, join);
+    };
+  }
+
+  // FIXME (Cheng) do we need a separated node for consumer side
+  if (auto jit = std::dynamic_pointer_cast<const core::JITedNode>(planNode)) {
+    return [jit](int32_t operatorId, DriverCtx* ctx) {
+      return std::make_unique<CiderJITedOperator>(operatorId, ctx, jit);
     };
   }
   return nullptr;
@@ -304,6 +312,11 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
                 planNode)) {
       operators.push_back(
           std::make_unique<EnforceSingleRow>(id, ctx.get(), enforceSingleRow));
+    } else if (
+        auto jited =
+            std::dynamic_pointer_cast<const core::JITedNode>(planNode)) {
+      operators.push_back(
+          std::make_unique<CiderJITedOperator>(id, ctx.get(), jited));
     } else {
       auto extended = Operator::fromPlanNode(ctx.get(), id, planNode);
       VELOX_CHECK(extended, "Unsupported plan node: {}", planNode->toString());

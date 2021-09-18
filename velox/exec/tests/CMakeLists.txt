@@ -51,6 +51,7 @@ add_executable(
   TableWriteTest.cpp
   TopNTest.cpp
   LimitTest.cpp
+  CiderJITedOperatorTest.cpp
   OrderByTest.cpp
   MergeTest.cpp
   HashJoinTest.cpp

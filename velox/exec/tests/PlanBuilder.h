@@ -182,6 +182,8 @@ class PlanBuilder {
       const std::vector<ChannelIndex>& output,
       core::JoinType joinType = core::JoinType::kInner);
 
+  PlanBuilder& jitedNode(const std::string& relAlgStr);
+
   PlanBuilder& unnest(
       const std::vector<std::string>& replicateColumns,
       const std::vector<std::string>& unnestColumns,

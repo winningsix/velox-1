@@ -448,6 +448,12 @@ PlanBuilder& PlanBuilder::hashJoin(
   return *this;
 }
 
+PlanBuilder& PlanBuilder::jitedNode(const std::string& jitPlanStr) {
+  planNode_ = std::make_shared<core::JITedNode>(
+      nextPlanNodeId(), jitPlanStr, planNode_);
+  return *this;
+}
+
 PlanBuilder& PlanBuilder::unnest(
     const std::vector<std::string>& replicateColumns,
     const std::vector<std::string>& unnestColumns,
