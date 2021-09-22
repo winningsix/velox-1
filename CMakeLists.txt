@@ -191,3 +191,4 @@ include_directories(.)
 install(FILES velox/type/Type.h DESTINATION "include/velox")
 
 add_subdirectory(velox)
+add_subdirectory(cider)
