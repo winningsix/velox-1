@@ -14,12 +14,12 @@
 #include "velox/cider/core/CiderPlanNode.h"
 
 namespace intel::cider::core {
- namespace {
-  static const std::vector<std::shared_ptr<const CiderPlanNode>> EMPTY_SOURCES;
- }
+namespace {
+static const std::vector<std::shared_ptr<const CiderPlanNode>> EMPTY_SOURCES;
+}
 
- const std::vector<std::shared_ptr<const CiderPlanNode>>& CiderTableScanNode::sources()
-    const {
+const std::vector<std::shared_ptr<const CiderPlanNode>>&
+CiderTableScanNode::sources() const {
   return EMPTY_SOURCES;
 }
-}
+} // namespace intel::cider::core

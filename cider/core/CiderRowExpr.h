@@ -12,14 +12,14 @@
  * limitations under the License.
  */
 #pragma once
-#include "string.h"
 #include "nlohmann/json.hpp"
+#include "string.h"
 using json = nlohmann::json;
 
-namespace intel::cider::core{
+namespace intel::cider::core {
 class CiderRowExpr {
  public:
   virtual json toCiderJSON() const = 0;
   virtual ~CiderRowExpr() = default;
- };
-}
+};
+} // namespace intel::cider::core
