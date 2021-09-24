@@ -12,8 +12,9 @@
  * limitations under the License.
  */
 #pragma once
-#include "nlohmann/json.hpp"
+#include "external/json/json.hpp"
 #include "string.h"
+
 using json = nlohmann::json;
 
 namespace intel::cider::core {
