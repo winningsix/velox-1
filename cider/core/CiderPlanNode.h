@@ -41,6 +41,14 @@ class CiderPlanNode {
 
   virtual std::string name() const = 0;
 
+  /**
+   * Convert from CiderPlanNode into Cider RelAlg node json string
+   * @param node as CiderPlanNode
+   * @return cider RelAlg string
+   */
+  static std::string toCiderRelAlgStr(
+      const std::shared_ptr<CiderPlanNode>& node);
+
  private:
   const PlanNodeId id_;
 };

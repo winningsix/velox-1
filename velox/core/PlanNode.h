@@ -17,6 +17,9 @@
 
 #include "velox/connectors/Connector.h"
 #include "velox/core/Expressions.h"
+#include "cider/core/CiderPlanNode.h"
+
+using namespace intel::cider::core;
 
 namespace facebook::velox::core {
 
@@ -1006,9 +1009,9 @@ class JITedNode : public PlanNode {
  public:
   JITedNode(
       const PlanNodeId& id,
-      const std::string jit_plan_str,
+      const std::shared_ptr<const CiderPlanNode>& ciderPlanNode,
       const std::shared_ptr<const PlanNode>& source)
-      : PlanNode(id), jit_plan_str_(jit_plan_str), sources_{source} {};
+      : PlanNode(id), ciderPlanNode_(ciderPlanNode), sources_{source} {};
 
   // TODO (Cheng) change to the right output types
   const RowTypePtr& outputType() const override {
@@ -1024,7 +1027,7 @@ class JITedNode : public PlanNode {
   }
 
  private:
-  const std::string jit_plan_str_;
+  const std::shared_ptr<const CiderPlanNode>& ciderPlanNode_;
   const std::vector<std::shared_ptr<const PlanNode>> sources_;
 };
 

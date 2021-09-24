@@ -38,8 +38,6 @@ TEST_F(CiderJITedOperatorTest, basic) {
   }
   createDuckDbTable(vectors);
 
-  // TODO (Cheng) add low level API for cider plan str builder
-  const std::string planStr = "";
-  auto plan = PlanBuilder().values(vectors).jitedNode(planStr).planNode();
+  auto plan = PlanBuilder().values(vectors).jitedNode(nullptr).planNode();
   assertQuery(plan, "SELECT * FROM tmp");
 }
