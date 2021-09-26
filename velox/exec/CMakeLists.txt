@@ -15,7 +15,7 @@ add_library(
   velox_exec
   Aggregate.cpp
   AllocationPool.cpp
-        HybridExecOperator.cpp
+  CiderQueryRunner.cpp
   ContainerRowSerde.cpp
   Driver.cpp
   EnforceSingleRow.cpp
@@ -28,6 +28,7 @@ add_library(
   HashStringAllocator.cpp
   HashTable.cpp
   JoinBridge.cpp
+  HybridExecOperator.cpp
   Limit.cpp
   LocalPartition.cpp
   LocalPlanner.cpp
@@ -55,6 +56,12 @@ target_link_libraries(
   velox_time
   velox_codegen
   velox_common_base)
+
+if(${CIDER_WITH_OMNISCI})
+  target_link_libraries(
+    velox_exec
+    libDBEngine.so)
+endif()
 
 add_subdirectory(tests)
 add_subdirectory(benchmarks)

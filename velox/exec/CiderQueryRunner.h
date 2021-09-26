@@ -15,10 +15,14 @@
  */
 #pragma once
 
+#include <string>
+
+#ifdef CIDER_WITH_OMNISCI
+#include <Embedded/DBEngine.h>
+#endif
+
 namespace facebook::velox::exec {
 
-//TODO (Qi): A placeholder to show how OmnisciDB API looks like
-// Remove this once OmnisciDB dependency issues resolved
 class CiderQueryRunner {
  public:
   static CiderQueryRunner* getInstance();
@@ -26,22 +30,37 @@ class CiderQueryRunner {
   void createTable(){};
   void processBlocks(){};
 
-//  void createTable(
-//      const std::string& name,
-//      const struct ArrowArray* tableData,
-//      const struct ArrowSchema* tableSchema);
-//
-//  struct ArrowArray* processBlocks(
-//      const std::string& sql,
-//      const struct ArrowArray* inputData,
-//      const struct ArrowSchema* inputSchema,
-//      const struct ArrowSchema* outputSchema);
+  std::string getBackend() {
+    return backend_;
+  }
+
+  //  void createTable(
+  //      const std::string& name,
+  //      const struct ArrowArray* tableData,
+  //      const struct ArrowSchema* tableSchema);
+  //
+  //  struct ArrowArray* processBlocks(
+  //      const std::string& sql,
+  //      const struct ArrowArray* inputData,
+  //      const struct ArrowSchema* inputSchema,
+  //      const struct ArrowSchema* outputSchema);
+
+  void cleanup() {
+#ifdef CIDER_WITH_OMNISCI
+    if (dbe_) {
+      dbe_.reset();
+    }
+#endif
+  };
 
  private:
-  void init(){};
-  void cleanup(){};
-  //  std::shared_ptr<EmbeddedDatabase::DBEngine> dbe_;
+  void init();
+#ifdef CIDER_WITH_OMNISCI
+  void initOminisciDBEngine();
+  std::shared_ptr<EmbeddedDatabase::DBEngine> dbe_;
+#endif
   static std::unique_ptr<CiderQueryRunner> instance_;
+  static std::string backend_;
 };
 
 } // namespace facebook::velox::exec
