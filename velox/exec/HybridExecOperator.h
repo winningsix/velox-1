@@ -18,15 +18,15 @@
 
 namespace facebook::velox::exec {
 /**
- * Cider JITed operator which fuses all operators when possible. Underlying, it
- * uses OmnisciDB as an execution engine.
+ * HybridExecOperator which converges all operators when possible. Underlying,
+ * it leverages other engine like OmnisciDB as an execution backend.
  */
-class CiderJITedOperator : public Operator {
+class HybridExecOperator : public Operator {
  public:
-  CiderJITedOperator(
+  HybridExecOperator(
       int32_t operatorId,
       DriverCtx* driverCtx,
-      const std::shared_ptr<const core::JITedNode>& jitedNode);
+      const std::shared_ptr<const core::ConvergedNode>& cnode);
 
   bool needsInput() const override;
 

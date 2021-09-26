@@ -181,11 +181,11 @@ class QueryCtx : public Context {
   static constexpr const char* kCodegenLazyLoading =
       "driver.codegen.lazy_loading";
 
-  // Configuration to enable JITed engine and JIT backend
-  static constexpr const char* kJITEnabled = "driver.jit.enabled";
-  static constexpr const char* kJITBackend =
-      "driver.codegen.configuration_file_path";
-
+  // Enable hybrid execution mode allowing multiple execution backends
+  static constexpr const char* kHybridExecEnabled =
+      "driver.hybrid.execution.enabled";
+  static constexpr const char* kHybridExecutionBackends =
+      "driver.hybrid.execution.backends";
 
   // User provided session timezone. Stores a string with the actual timezone
   // name, e.g: "America/Los_Angeles".

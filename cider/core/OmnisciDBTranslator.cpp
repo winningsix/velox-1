@@ -11,28 +11,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <stack>
-#include <set>
-#include "velox/cider/core/CiderPlanNode.h"
+#pragma once
+#include "OmnisciDBTranslator.h"
 
-namespace intel::cider::core {
-namespace {
-static const std::vector<std::shared_ptr<const CiderPlanNode>> EMPTY_SOURCES;
-}
-
-const std::vector<std::shared_ptr<const CiderPlanNode>>&
-CiderTableScanNode::sources() const {
-  return EMPTY_SOURCES;
-}
-
-std::string CiderPlanNode::toCiderRelAlgStr(
-    const std::shared_ptr<CiderPlanNode>& node) {
+std::string OmnisciDBTranslator::toRelAlgStr(
+    const std::shared_ptr<ComputeIRNode>& node) {
   // return json string
-  std::stack<std::shared_ptr<const CiderPlanNode>> planNodes;
-  std::set<std::shared_ptr<const CiderPlanNode>> visited;
+  std::stack<std::shared_ptr<const ComputeIRNode>> planNodes;
+  std::set<std::shared_ptr<const ComputeIRNode>> visited;
   planNodes.emplace(node);
   visited.emplace(node);
-  std::shared_ptr<const CiderPlanNode> currentNode;
+  std::shared_ptr<const ComputeIRNode> currentNode;
   std::string lastConvertedPlanId;
   json rootNode = json::object();
   json relsNode = json::array();
@@ -58,12 +47,11 @@ std::string CiderPlanNode::toCiderRelAlgStr(
       }
     }
     // add json
-    relsNode.push_back(currentNode->toCiderJSON(std::to_string(ciderPlanId)));
+    relsNode.push_back(
+        currentNode->toOmnisciDBJSON(std::to_string(ciderPlanId)));
     ciderPlanId++;
     planNodes.pop();
   }
   rootNode.push_back({"relsNode", relsNode});
   return rootNode.dump();
 }
-
-} // namespace intel::cider::core

@@ -12,15 +12,12 @@
  * limitations under the License.
  */
 #pragma once
-#include "external/json/json.hpp"
-#include "string.h"
-
-using json = nlohmann::json;
+#include "velox/cider/core/ComputeIRNode.h"
 
 namespace intel::cider::core {
-class CiderRowExpr {
+class OmnisciDBTranslator {
  public:
-  virtual json toCiderJSON() const = 0;
-  virtual ~CiderRowExpr() = default;
+  std::string OmnisciDBTranslator::toRelAlgStr(
+      const std::shared_ptr<ComputeIRNode>& node);
 };
 } // namespace intel::cider::core

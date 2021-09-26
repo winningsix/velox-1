@@ -15,7 +15,7 @@ add_library(
   velox_exec
   Aggregate.cpp
   AllocationPool.cpp
-  CiderJITedOperator.cpp
+        HybridExecOperator.cpp
   ContainerRowSerde.cpp
   Driver.cpp
   EnforceSingleRow.cpp

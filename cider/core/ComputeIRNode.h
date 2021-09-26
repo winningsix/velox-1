@@ -13,7 +13,7 @@
  */
 #pragma once
 #include "string.h"
-#include "velox/cider/core/CiderRowExpr.h"
+#include "velox/cider/core/IRRowExpr.h"
 #include "velox/external/json/json.hpp"
 #include "velox/external/map/fifo_map.hpp"
 
@@ -24,48 +24,48 @@ using tmp_json = nlohmann::basic_json<tmp_fifo_map>;
 
 namespace intel::cider::core {
 typedef std::string PlanNodeId;
-class CiderPlanNode {
+class ComputeIRNode {
  public:
-  explicit CiderPlanNode(const PlanNodeId& id) : id_{id} {}
+  explicit ComputeIRNode(const PlanNodeId& id) : id_{id} {}
 
-  virtual ~CiderPlanNode() {}
+  virtual ~ComputeIRNode() {}
 
   const PlanNodeId& id() const {
     return id_;
   }
 
-  virtual const std::vector<std::shared_ptr<const CiderPlanNode>>& sources()
+  virtual const std::vector<std::shared_ptr<const ComputeIRNode>>& sources()
       const = 0;
 
-  virtual json toCiderJSON(std::string ciderPlanId) const = 0;
+  virtual json toOmnisciDBJSON(std::string ciderPlanId) const = 0;
 
   virtual std::string name() const = 0;
 
   /**
-   * Convert from CiderPlanNode into Cider RelAlg node json string
-   * @param node as CiderPlanNode
-   * @return cider RelAlg string
+   * Convert from IRPlanNode into OmnisciDB RelAlg node json string
+   * @param node as ComputeIRNode
+   * @return OmnisciDB RelAlg string
    */
-  static std::string toCiderRelAlgStr(
-      const std::shared_ptr<CiderPlanNode>& node);
+  static std::string toOmnisciDBRelAlgStr(
+      const std::shared_ptr<ComputeIRNode>& node);
 
  private:
   const PlanNodeId id_;
 };
 
-class CiderProjectNode : public CiderPlanNode {
+class ProjectIRNode : public ComputeIRNode {
  public:
-  CiderProjectNode(
+  ProjectIRNode(
       const PlanNodeId& id,
       std::vector<std::string> assignmentKeys,
-      std::vector<std::shared_ptr<const CiderRowExpr>> assignmentExprs,
-      std::shared_ptr<const CiderPlanNode> source)
-      : CiderPlanNode(id),
+      std::vector<std::shared_ptr<const IRRowExpr>> assignmentExprs,
+      std::shared_ptr<const ComputeIRNode> source)
+      : ComputeIRNode(id),
         assignmentKeys_{assignmentKeys},
         assignmentExprs_(assignmentExprs),
         sources_{source} {}
 
-  json toCiderJSON(std::string ciderPlanId) const override {
+  json toOmnisciDBJSON(std::string ciderPlanId) const override {
     json projectNode = json::object();
     projectNode.push_back({"id", ciderPlanId});
     projectNode.push_back({"relOp", name()});
@@ -85,28 +85,28 @@ class CiderProjectNode : public CiderPlanNode {
     return "LogicalProject";
   }
 
-  const std::vector<std::shared_ptr<const CiderPlanNode>>& sources()
+  const std::vector<std::shared_ptr<const ComputeIRNode>>& sources()
       const override {
     return sources_;
   }
 
  private:
   const std::vector<std::string> assignmentKeys_;
-  const std::vector<std::shared_ptr<const CiderRowExpr>> assignmentExprs_;
-  const std::vector<std::shared_ptr<const CiderPlanNode>> sources_;
+  const std::vector<std::shared_ptr<const IRRowExpr>> assignmentExprs_;
+  const std::vector<std::shared_ptr<const ComputeIRNode>> sources_;
 };
 
-class CiderFilterNode : public CiderPlanNode {
+class FilterIRNode : public ComputeIRNode {
  public:
-  CiderFilterNode(
+  FilterIRNode(
       const PlanNodeId& id,
-      std::shared_ptr<const CiderRowExpr> filter,
-      std::shared_ptr<const CiderPlanNode> source)
-      : CiderPlanNode(id), filter_(filter), sources_{source} {}
+      std::shared_ptr<const IRRowExpr> filter,
+      std::shared_ptr<const ComputeIRNode> source)
+      : ComputeIRNode(id), filter_(filter), sources_{source} {}
 
-  json toCiderJSON(std::string ciderPlanId) const override {
+  json toOmnisciDBJSON(std::string cid) const override {
     json filterNode = json::object();
-    filterNode.push_back({"id", ciderPlanId});
+    filterNode.push_back({"id", cid});
     filterNode.push_back({"relOp", name()});
     filterNode.push_back({"condition", filter_->toCiderJSON()});
     return filterNode;
@@ -116,24 +116,24 @@ class CiderFilterNode : public CiderPlanNode {
     return "LogicalFilter";
   }
 
-  const std::vector<std::shared_ptr<const CiderPlanNode>>& sources()
+  const std::vector<std::shared_ptr<const ComputeIRNode>>& sources()
       const override {
     return sources_;
   }
 
  private:
-  const std::shared_ptr<const CiderRowExpr> filter_;
-  const std::vector<std::shared_ptr<const CiderPlanNode>> sources_;
+  const std::shared_ptr<const IRRowExpr> filter_;
+  const std::vector<std::shared_ptr<const ComputeIRNode>> sources_;
 };
 
-class CiderTableScanNode : public CiderPlanNode {
+class TableScanIRNode : public ComputeIRNode {
  public:
-  CiderTableScanNode(
+  TableScanIRNode(
       const PlanNodeId& id,
       std::string tableName,
       std::string schemaName,
       std::vector<std::string> fieldNames)
-      : CiderPlanNode(id),
+      : ComputeIRNode(id),
         tableName_(tableName),
         schemaName_(schemaName),
         fieldNames_(fieldNames){};
@@ -142,9 +142,9 @@ class CiderTableScanNode : public CiderPlanNode {
     return "LogicalTableScan";
   }
 
-  json toCiderJSON(std::string ciderPlanId) const override {
+  json toOmnisciDBJSON(std::string cid) const override {
     json scanNode = json::object();
-    scanNode.push_back({"id", ciderPlanId});
+    scanNode.push_back({"id", cid});
     scanNode.push_back({"name", name()});
 
     tmp_json fieldJsonNames = tmp_json::array();
@@ -160,7 +160,7 @@ class CiderTableScanNode : public CiderPlanNode {
     return scanNode;
   }
 
-  const std::vector<std::shared_ptr<const CiderPlanNode>>& sources()
+  const std::vector<std::shared_ptr<const ComputeIRNode>>& sources()
       const override;
 
  private:

@@ -19,10 +19,10 @@
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
 
-class CiderJITedOperatorTest: public OperatorTestBase {};
+class HybridExecOperatorTest: public OperatorTestBase {};
 
 // Simple filter/project case
-TEST_F(CiderJITedOperatorTest, basic) {
+TEST_F(HybridExecOperatorTest, basic) {
   vector_size_t batchSize = 100;
   std::vector<RowVectorPtr> vectors;
   for (int32_t i = 0; i < 3; ++i) {
@@ -38,6 +38,6 @@ TEST_F(CiderJITedOperatorTest, basic) {
   }
   createDuckDbTable(vectors);
 
-  auto plan = PlanBuilder().values(vectors).jitedNode(nullptr).planNode();
+  auto plan = PlanBuilder().values(vectors).convergedNode(nullptr).planNode();
   assertQuery(plan, "SELECT * FROM tmp");
 }

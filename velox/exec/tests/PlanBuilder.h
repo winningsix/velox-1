@@ -182,7 +182,7 @@ class PlanBuilder {
       const std::vector<ChannelIndex>& output,
       core::JoinType joinType = core::JoinType::kInner);
 
-  PlanBuilder& jitedNode(const std::shared_ptr<CiderPlanNode>& ciderPlanNode);
+  PlanBuilder& convergedNode(const std::shared_ptr<ComputeIRNode>& ciderPlanNode);
 
   PlanBuilder& unnest(
       const std::vector<std::string>& replicateColumns,

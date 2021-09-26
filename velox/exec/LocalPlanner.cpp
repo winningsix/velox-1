@@ -22,6 +22,7 @@
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashProbe.h"
+#include "velox/exec/HybridExecOperator.h"
 #include "velox/exec/Limit.h"
 #include "velox/exec/Merge.h"
 #include "velox/exec/OrderBy.h"
@@ -31,7 +32,6 @@
 #include "velox/exec/TopN.h"
 #include "velox/exec/Unnest.h"
 #include "velox/exec/Values.h"
-#include "velox/exec/CiderJITedOperator.h"
 
 namespace facebook::velox::exec {
 
@@ -94,9 +94,9 @@ OperatorSupplier makeConsumerSupplier(
   }
 
   // FIXME (Cheng) do we need a separated node for consumer side
-  if (auto jit = std::dynamic_pointer_cast<const core::JITedNode>(planNode)) {
+  if (auto jit = std::dynamic_pointer_cast<const core::ConvergedNode>(planNode)) {
     return [jit](int32_t operatorId, DriverCtx* ctx) {
-      return std::make_unique<CiderJITedOperator>(operatorId, ctx, jit);
+      return std::make_unique<HybridExecOperator>(operatorId, ctx, jit);
     };
   }
   return nullptr;
@@ -314,9 +314,9 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
           std::make_unique<EnforceSingleRow>(id, ctx.get(), enforceSingleRow));
     } else if (
         auto jited =
-            std::dynamic_pointer_cast<const core::JITedNode>(planNode)) {
+            std::dynamic_pointer_cast<const core::ConvergedNode>(planNode)) {
       operators.push_back(
-          std::make_unique<CiderJITedOperator>(id, ctx.get(), jited));
+          std::make_unique<HybridExecOperator>(id, ctx.get(), jited));
     } else {
       auto extended = Operator::fromPlanNode(ctx.get(), id, planNode);
       VELOX_CHECK(extended, "Unsupported plan node: {}", planNode->toString());

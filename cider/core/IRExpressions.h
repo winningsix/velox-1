@@ -12,7 +12,7 @@
  * limitations under the License.
  */
 #pragma once
-#include "velox/cider/core/CiderRowExpr.h"
+#include "velox/cider/core/IRRowExpr.h"
 
 using json = nlohmann::json;
 
@@ -58,9 +58,9 @@ namespace intel::cider::core{
    }
  }
 
- class CiderConstantExpr : public CiderRowExpr {
+ class IRConstantExpr : public IRRowExpr {
   public:
-   CiderConstantExpr(std::string value, std::string type)
+   IRConstantExpr(std::string value, std::string type)
    : type_{move(type)}, value_{move(value)} {}
 
    std::string value() const{
@@ -123,7 +123,7 @@ namespace intel::cider::core{
    const std::string value_;
  };
 
- class CiderVariableExpr : public CiderRowExpr {
+ class CiderVariableExpr : public IRRowExpr {
   public:
   CiderVariableExpr(std::string name, std::string type, int index)
   : name_{move(name)}, type_{move(type)}, index_(index) {}
@@ -141,9 +141,9 @@ namespace intel::cider::core{
  };
 
 // row expression that describes a predicate, such as "field_a > 2"
-class CiderCallExpr : public CiderRowExpr {
+class CiderCallExpr : public IRRowExpr {
  public:
- CiderCallExpr(std::string op, std::string type, std::vector<std::shared_ptr<const CiderRowExpr>>& expressions)
+ CiderCallExpr(std::string op, std::string type, std::vector<std::shared_ptr<const IRRowExpr>>& expressions)
  : op_{move(op)}, type_{move(type)}, expressions_{move(expressions)} {}
 
  json toCiderJSON() const override {
@@ -167,6 +167,6 @@ class CiderCallExpr : public CiderRowExpr {
  private:
   const std::string op_;
   const std::string type_;
-  const std::vector<std::shared_ptr<const CiderRowExpr>> expressions_;
+  const std::vector<std::shared_ptr<const IRRowExpr>> expressions_;
 };
 }

@@ -15,9 +15,9 @@
  */
 #pragma once
 
+#include "cider/core/ComputeIRNode.h"
 #include "velox/connectors/Connector.h"
 #include "velox/core/Expressions.h"
-#include "cider/core/CiderPlanNode.h"
 
 using namespace intel::cider::core;
 
@@ -1005,13 +1005,13 @@ class LimitNode : public PlanNode {
   const std::vector<std::shared_ptr<const PlanNode>> sources_;
 };
 
-class JITedNode : public PlanNode {
+class ConvergedNode : public PlanNode {
  public:
-  JITedNode(
+  ConvergedNode(
       const PlanNodeId& id,
-      const std::shared_ptr<const CiderPlanNode>& ciderPlanNode,
+      const std::shared_ptr<const ComputeIRNode>& IRNode,
       const std::shared_ptr<const PlanNode>& source)
-      : PlanNode(id), ciderPlanNode_(ciderPlanNode), sources_{source} {};
+      : PlanNode(id), cir_(IRNode), sources_{source} {};
 
   // TODO (Cheng) change to the right output types
   const RowTypePtr& outputType() const override {
@@ -1023,11 +1023,11 @@ class JITedNode : public PlanNode {
   }
 
   std::string_view name() const override {
-    return "JITed";
+    return "ConvergedNode";
   }
 
  private:
-  const std::shared_ptr<const CiderPlanNode>& ciderPlanNode_;
+  const std::shared_ptr<const ComputeIRNode>& cir_;
   const std::vector<std::shared_ptr<const PlanNode>> sources_;
 };
 

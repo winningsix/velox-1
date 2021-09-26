@@ -448,9 +448,9 @@ PlanBuilder& PlanBuilder::hashJoin(
   return *this;
 }
 
-PlanBuilder& PlanBuilder::jitedNode(
-    const std::shared_ptr<CiderPlanNode>& ciderPlanNode) {
-  planNode_ = std::make_shared<core::JITedNode>(
+PlanBuilder& PlanBuilder::convergedNode(
+    const std::shared_ptr<ComputeIRNode>& ciderPlanNode) {
+  planNode_ = std::make_shared<core::ConvergedNode>(
       nextPlanNodeId(), ciderPlanNode, planNode_);
   return *this;
 }

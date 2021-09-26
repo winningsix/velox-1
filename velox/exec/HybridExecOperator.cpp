@@ -14,40 +14,40 @@
  * limitations under the License.
  */
 
-#include "CiderJITedOperator.h"
+#include "HybridExecOperator.h"
 
 namespace facebook::velox::exec {
 
-CiderJITedOperator::CiderJITedOperator(
+HybridExecOperator::HybridExecOperator(
     int32_t operatorId,
     DriverCtx* driverCtx,
-    const std::shared_ptr<const core::JITedNode>& jitedNode)
+    const std::shared_ptr<const core::ConvergedNode>& cnode)
     : Operator(
           driverCtx,
-          jitedNode->outputType(),
+          cnode->outputType(),
           operatorId,
-          jitedNode->id(),
-          "CiderJITedOperator"){};
+          cnode->id(),
+          "HybridExecOperator"){};
 
-bool CiderJITedOperator::needsInput() const {
+bool HybridExecOperator::needsInput() const {
   return (input_ == nullptr);
 }
 
-void CiderJITedOperator::addInput(RowVectorPtr input) {
+void HybridExecOperator::addInput(RowVectorPtr input) {
   input_ = input;
 }
 
-RowVectorPtr CiderJITedOperator::getOutput() {
+RowVectorPtr HybridExecOperator::getOutput() {
   auto output = input_;
   input_.reset();
   return output;
 }
 
-BlockingReason CiderJITedOperator::isBlocked(ContinueFuture* /*future*/) {
+BlockingReason HybridExecOperator::isBlocked(ContinueFuture* /*future*/) {
   return BlockingReason::kNotBlocked;
 }
 
-void CiderJITedOperator::finish() {
+void HybridExecOperator::finish() {
   Operator::finish();
 }
 } // namespace facebook::velox::exec
