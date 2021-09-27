@@ -1228,13 +1228,11 @@ TEST_F(VectorTest, valueHook) {
   EXPECT_EQ(hook.errors(), 0);
 }
 
-
-
 TEST_F(VectorTest, RowVector2ArrowArray){
   RowVectorPtr baseRow = createSimpleRow(vectorSize_, true);
   int i = baseRow.use_count();
-  std::pair<ArrowArray*, ArrowSchema*> arrowPair = VeloxToArrow(baseRow);
+  std::pair<ArrowArray*, ArrowSchema*> arrowPair =
+      DataUtil::fromVeloxToArrow(baseRow);
   ArrowArray* arrow_array = arrowPair.first;
   ArrowSchema* arrow_schema = arrowPair.second;
-
 }

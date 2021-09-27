@@ -1488,38 +1488,6 @@ TypePtr getType(const std::string& name, std::vector<TypePtr> childTypes);
         VELOX_FAIL("not a known type kind: {}", mapTypeKindToName(typeKind));  \
     }                                                                          \
   }()
-
-
-/***TODO:                                                                        \
-      case ::facebook::velox::TypeKind::VARCHAR: {                             \
-        return PREFIX<::facebook::velox::TypeKind::VARCHAR> SUFFIX(            \
-            __VA_ARGS__);                                                      \
-      }                                                                        \
-      case ::facebook::velox::TypeKind::VARBINARY: {                           \
-        return PREFIX<::facebook::velox::TypeKind::VARBINARY> SUFFIX(          \
-            __VA_ARGS__);                                                      \
-      }                                                                        \
-      case ::facebook::velox::TypeKind::TIMESTAMP: {                           \
-        return PREFIX<::facebook::velox::TypeKind::TIMESTAMP> SUFFIX(          \
-            __VA_ARGS__);                                                      \
-      }                                                                        \
-      case ::facebook::velox::TypeKind::ARRAY: {                               \
-        return PREFIX<::facebook::velox::TypeKind::ARRAY> SUFFIX(__VA_ARGS__); \
-      }                                                                        \
-      case ::facebook::velox::TypeKind::MAP: {                                 \
-        return PREFIX<::facebook::velox::TypeKind::MAP> SUFFIX(__VA_ARGS__);   \
-      }                                                                        \
-      case ::facebook::velox::TypeKind::ROW: {                                 \
-        return PREFIX<::facebook::velox::TypeKind::ROW> SUFFIX(__VA_ARGS__);   \
-      }  
-      ***/                                                                      \
-
-
-
-
-
-
-
 } // namespace facebook::velox
 
 namespace folly {

@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-/***
+/**
  *
  * Unitills for zero-copy data transform with Arrow::array
  *
- ***/
+ **/
 #include "velox/vector/DataExchangeWithArrow.h"
 #include "velox/vector/FlatVector.h"
 
@@ -29,14 +29,13 @@ namespace facebook {
 namespace velox {
 
 // Reference:https://arrow.apache.org/docs/format/CDataInterface.html#exporting-a-struct-float32-utf8-array
-std::pair<ArrowArray*, ArrowSchema*> DataUtil::VeloxToArrow(
-    RowVectorPtr& row_vector_ptr) {
-  int n_p = row_vector_ptr.use_count();
+std::pair<ArrowArray*, ArrowSchema*> DataUtil::fromVeloxToArrow(
+    const RowVectorPtr& row_vector_ptr) {
   // for now we only focus on primitive type
   ArrowArray* array = new ArrowArray;
   ArrowSchema* schema = new ArrowSchema;
   // Note: Make sure construct schema first and then array. Since after
-  // export_from_velox(), the object could not be accessed. 
+  // export_from_velox(), the object could not be accessed.
   export_schema_from_Velox_type(row_vector_ptr, schema);
   export_from_velox(row_vector_ptr, array);
   return std::make_pair(array, schema);
@@ -48,18 +47,18 @@ void DataUtil::release_malloced_array(struct ArrowArray* array) {
   // Free children, call children's release
   for (i = 0; i < array->n_children; ++i) {
     struct ArrowArray* child = array->children[i];
-    if (child->release != NULL) {
+    if (child->release != nullptr) {
       child->release(child);
     }
   }
   std::free(array->children);
-  //Free original phisical buffer. TODO:test
+  // Free original phisical buffer. TODO:test
   delete array->private_data;
   // Mark released
-  array->release = NULL;
+  array->release = nullptr;
 }
 
-// Take RowVectorPtr as input, construct ArrowArray as output 
+// Take RowVectorPtr as input, construct ArrowArray as output
 void DataUtil::export_from_velox(
     const RowVectorPtr& row_vector_ptr,
     struct ArrowArray* array) {
@@ -76,11 +75,11 @@ void DataUtil::export_from_velox(
       .offset = 0,
       .n_buffers = 1, // VERIFY: parent has one buffer
       .n_children = static_cast<int long>(children_size),
-      .dictionary = NULL,
+      .dictionary = nullptr,
       // Bookkeeping
       .release = &release_malloced_array};
   array->buffers = (const void**)malloc(sizeof(void*) * array->n_buffers);
-  array->buffers[0] = NULL; // no nulls, null bitmap can be omitted
+  array->buffers[0] = nullptr; // no nulls, null bitmap can be omitted
   // Allocate list of children arrays
   array->children =
       (ArrowArray**)malloc(sizeof(struct ArrowArray*) * array->n_children);
@@ -100,8 +99,8 @@ void DataUtil::export_from_velox(
         .n_buffers =
             2, // VERIFY: only 2 buffers no matter how large a vector is?
         .n_children = 0,
-        .children = NULL,
-        .dictionary = NULL, // TODO: for now only focus on primitive data
+        .children = nullptr,
+        .dictionary = nullptr, // TODO: for now only focus on primitive data
         // Bookkeeping
         .release = &release_malloced_array};
 
@@ -194,7 +193,6 @@ void DataUtil::export_from_velox(
                 ->values()
                 ->asMutable<TypeTraits<TypeKind::TIMESTAMP>::NativeType>();
         break;
-        // TODO
         // default:
         //  throw UnsupportedException();
     }
@@ -209,13 +207,13 @@ void DataUtil::release_malloced_schema(struct ArrowSchema* schema) {
   // call release for each child
   for (i = 0; i < schema->n_children; ++i) {
     struct ArrowSchema* child = schema->children[i];
-    if (child->release != NULL) {
+    if (child->release != nullptr) {
       child->release(child);
     }
   }
   std::free(schema->children);
   // Mark released
-  schema->release = NULL;
+  schema->release = nullptr;
 }
 
 // Take RowVectorPtr as input, read shcema info and construct ArrowSchema
@@ -232,10 +230,10 @@ void DataUtil::export_schema_from_Velox_type(
       (struct ArrowSchema){// Type description
                            .format = "+s",
                            .name = "",
-                           .metadata = NULL,
+                           .metadata = nullptr,
                            .flags = 0, // TODO
                            .n_children = static_cast<int long>(children_size),
-                           .dictionary = NULL,
+                           .dictionary = nullptr,
                            // Bookkeeping
                            .release = &release_malloced_schema};
   // Allocate list of children types
@@ -249,22 +247,21 @@ void DataUtil::export_schema_from_Velox_type(
         (ArrowSchema*)malloc(sizeof(struct ArrowSchema));
     *child = (struct ArrowSchema){
         // Type description
-        .format = SwitchFormat(rowType.childAt(i)),
+        .format = getArrowTypeByVeloxType(rowType.childAt(i)),
         // Verify: in Velox name is string, but in arrowschema name is char
         .name = rowType.nameOf(i).c_str(),
-        .metadata = NULL,
+        .metadata = nullptr,
         .flags = ARROW_FLAG_NULLABLE, // TODO
         .n_children = 0,
-        .children = NULL,
-        .dictionary = NULL,
+        .children = nullptr,
+        .dictionary = nullptr,
         // Bookkeeping
         .release = &release_malloced_schema};
   }
 }
 
-
 // TODO: may change to macro
-const char* DataUtil::SwitchFormat(const std::shared_ptr<const Type>& type) {
+const char* DataUtil::getArrowTypeByVeloxType(const std::shared_ptr<const Type>& type) {
   char format;
   switch (type->kind()) {
     case TypeKind::BOOLEAN:
@@ -292,27 +289,26 @@ const char* DataUtil::SwitchFormat(const std::shared_ptr<const Type>& type) {
   const char* format_ptr = &format;
   return format_ptr;
 }
-
-// Work in progress
-RowVectorPtr& DataUtil::ArrowToVelox(std::pair<ArrowArray*, ArrowSchema*> arrowPair) {
-  ArrowArray* arrow_array = arrowPair.first;
-  ArrowSchema* arrow_schema = arrowPair.second;
-  // No consider nested 
-  std::vector<VectorPtr> children(arrow_array->n_children);
-  for (int i = 0; i < arrow_array->n_children; i++) {
-    ArrowArray* arrow_array_child = arrow_array->children[i];
-    ArrowSchema* arrow_schema_child = arrow_schema->children[i];
-    children[i] = VELOX_DYNAMIC_ARROW_TYPE_DISPATCH(
-      ArrowArrayToVector,  //template function
-      arrow_schema_child->format,
-        );
-  }
-}
-// ref imlpliment: createScalar
-template <typename T>
-static VectorPtr DataUtil::ArrowArrayToVector() {
-
-}
+//
+//// Work in progress
+//RowVectorPtr& DataUtil::ArrowToVelox(
+//    std::pair<ArrowArray*, ArrowSchema*> arrowPair) {
+//  ArrowArray* arrow_array = arrowPair.first;
+//  ArrowSchema* arrow_schema = arrowPair.second;
+//  // No consider nested 
+//  std::vector<VectorPtr> children(arrow_array->n_children);
+//  for (int i = 0; i < arrow_array->n_children; i++) {
+//    ArrowArray* arrow_array_child = arrow_array->children[i];
+//    ArrowSchema* arrow_schema_child = arrow_schema->children[i];
+//    children[i] = VELOX_DYNAMIC_ARROW_TYPE_DISPATCH(
+//      ArrowArrayToVector,  //template function
+//      arrow_schema_child->format,
+//        );
+//  }
+//}
+//// ref imlpliment: createScalar
+//template <typename T>
+//static VectorPtr DataUtil::ArrowArrayToVector() {}
 
 } // namespace velox
 } // namespace facebook

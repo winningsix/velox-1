@@ -17,6 +17,7 @@
 #include "HybridExecOperator.h"
 #include "HybridExecutor.h"
 #include "velox/cider/core/OmnisciDBTranslator.h"
+#include "velox/vector/DataExchangeWithArrow.h"
 
 namespace facebook::velox::exec {
 
@@ -46,6 +47,7 @@ RowVectorPtr HybridExecOperator::getOutput() {
   HybridExecutor* exec = HybridExecutor::getInstance();
 //  TODO (Cheng): should handled by engine level.
 //  auto str = OmnisciDBTranslator::toRelAlgStr(IRNode_);
+//  DataUtil::ArrowToVelox()
 //  exec->processBlocks(str, nullptr, nullptr, nullptr);
   return output;
 }

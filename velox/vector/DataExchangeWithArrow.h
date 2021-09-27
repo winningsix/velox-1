@@ -18,33 +18,29 @@
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
 
-#define ARROW_FLAG_DICTIONARY_ORDERED 1
-#define ARROW_FLAG_NULLABLE 2
-#define ARROW_FLAG_MAP_KEYS_SORTED 4
-
 namespace facebook::velox {
 
 /**
- * Utill Class for Data sharing with Arrow
+ * Util Class for Data Interexchange based on Arrow
  */
-class DataUtill {
+class DataUtil {
  public:
   // Zero-copy exchange data from Velox to Arrow
   // Input: velox::RowVectorPtr
   // Output: std::pair<ArrowArray*, ArrowSchema*>
-  static std::pair<ArrowArray*, ArrowSchema*> VeloxToArrow(
+  static std::pair<ArrowArray*, ArrowSchema*> fromVeloxToArrow(
       const RowVectorPtr& row_vector_ptr);
 
   // Zero-copy exchange data from Arrow to Velox
   // Input: std::pair<ArrowArray*, ArrowSchema*>
   // Output: velox::RowVectorPtr
-  static velox::RowVectorPtr ArrowToVelox(
+  static velox::RowVectorPtr fromArrowToVelox(
       ArrowArray* arrow_array,
       ArrowSchema schema);
 
  private:
   // Util functions for VeloxToArrow
-  static const char* SwitchFormat(const std::shared_ptr<const Type>& type);
+  static const char* getArrowTypeByVeloxType(const std::shared_ptr<const Type>& type);
   static void release_malloced_array(struct ArrowArray* array);
   static void export_from_velox(
       const RowVectorPtr& row_vector_ptr,
@@ -54,5 +50,4 @@ class DataUtill {
       const RowVectorPtr& row_vector_ptr,
       struct ArrowSchema* schema);
 };
-
 } // namespace facebook::velox
