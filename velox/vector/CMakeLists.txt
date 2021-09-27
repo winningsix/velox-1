@@ -23,7 +23,8 @@ add_library(
   SelectivityVector.cpp
   SimpleVector.cpp
   VectorStream.cpp
-  VectorEncoding.cpp)
+  VectorEncoding.cpp
+  DataExchangeWithArrow.cpp)
 
 target_link_libraries(velox_vector velox_memory velox_type velox_encode)
 

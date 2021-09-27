@@ -1451,6 +1451,75 @@ bool typeExists(const std::string& name);
 /// child types.
 TypePtr getType(const std::string& name, std::vector<TypePtr> childTypes);
 
+#define VELOX_DYNAMIC_ARROW_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...) \
+  VELOX_DYNAMIC_ARROW_TYPE_DISPATCH_IMPL(TEMPLATE_FUNC, , typeKind, __VA_ARGS__)
+
+#define VELOX_DYNAMIC_ARROW_TYPE_DISPATCH_IMPL(PREFIX, SUFFIX, typeKind, ...)        \
+  [&]() {                                                                      \
+    switch (typeKind) {                                                        \
+      case 'b': {                             \
+        return PREFIX<::facebook::velox::TypeKind::BOOLEAN> SUFFIX(            \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case 'i': {                             \
+        return PREFIX<::facebook::velox::TypeKind::INTEGER> SUFFIX(            \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case 'c': {                             \
+        return PREFIX<::facebook::velox::TypeKind::TINYINT> SUFFIX(            \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case 's': {                            \
+        return PREFIX<::facebook::velox::TypeKind::SMALLINT> SUFFIX(           \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case 'l': {                              \
+        return PREFIX<::facebook::velox::TypeKind::BIGINT> SUFFIX(             \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case 'f': {                                \
+        return PREFIX<::facebook::velox::TypeKind::REAL> SUFFIX(__VA_ARGS__);  \
+      }                                                                        \
+      case 'g': {                              \
+        return PREFIX<::facebook::velox::TypeKind::DOUBLE> SUFFIX(             \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      default:                                                                 \
+        VELOX_FAIL("not a known type kind: {}", mapTypeKindToName(typeKind));  \
+    }                                                                          \
+  }()
+
+
+/***TODO:                                                                        \
+      case ::facebook::velox::TypeKind::VARCHAR: {                             \
+        return PREFIX<::facebook::velox::TypeKind::VARCHAR> SUFFIX(            \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case ::facebook::velox::TypeKind::VARBINARY: {                           \
+        return PREFIX<::facebook::velox::TypeKind::VARBINARY> SUFFIX(          \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case ::facebook::velox::TypeKind::TIMESTAMP: {                           \
+        return PREFIX<::facebook::velox::TypeKind::TIMESTAMP> SUFFIX(          \
+            __VA_ARGS__);                                                      \
+      }                                                                        \
+      case ::facebook::velox::TypeKind::ARRAY: {                               \
+        return PREFIX<::facebook::velox::TypeKind::ARRAY> SUFFIX(__VA_ARGS__); \
+      }                                                                        \
+      case ::facebook::velox::TypeKind::MAP: {                                 \
+        return PREFIX<::facebook::velox::TypeKind::MAP> SUFFIX(__VA_ARGS__);   \
+      }                                                                        \
+      case ::facebook::velox::TypeKind::ROW: {                                 \
+        return PREFIX<::facebook::velox::TypeKind::ROW> SUFFIX(__VA_ARGS__);   \
+      }  
+      ***/                                                                      \
+
+
+
+
+
+
+
 } // namespace facebook::velox
 
 namespace folly {

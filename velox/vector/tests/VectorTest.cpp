@@ -24,6 +24,7 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
 #include "velox/vector/tests/VectorMaker.h"
+#include "velox/vector/DataExchangeWithArrow.h"
 
 using namespace facebook::velox;
 using facebook::velox::ComplexType;
@@ -157,6 +158,22 @@ class VectorTest : public testing::Test {
         numNulls,
         false,
         size * sizeof(T));
+  }
+
+  RowVectorPtr createSimpleRow(int32_t numRows, bool withNulls) {
+      auto row_Type =
+          ROW({"c0_bigint", "c1_real"}, {BIGINT(), REAL()});
+
+      std::vector<VectorPtr> row_vector = {
+          createScalar<TypeKind::BIGINT>(BIGINT(), numRows, withNulls),
+          createScalar<TypeKind::REAL>(REAL(), numRows, withNulls)};
+      return std::make_shared<RowVector>(
+          pool_.get(),
+          row_Type,
+          BufferPtr(nullptr),
+          numRows,
+          std::move(row_vector),
+          0 /*nullCount*/);
   }
 
   VectorPtr createRow(int32_t numRows, bool withNulls) {
@@ -1209,4 +1226,15 @@ TEST_F(VectorTest, valueHook) {
   // subset of rows and the position of each row within this set.
   lazy->load(rows, &hook);
   EXPECT_EQ(hook.errors(), 0);
+}
+
+
+
+TEST_F(VectorTest, RowVector2ArrowArray){
+  RowVectorPtr baseRow = createSimpleRow(vectorSize_, true);
+  int i = baseRow.use_count();
+  std::pair<ArrowArray*, ArrowSchema*> arrowPair = VeloxToArrow(baseRow);
+  ArrowArray* arrow_array = arrowPair.first;
+  ArrowSchema* arrow_schema = arrowPair.second;
+
 }
