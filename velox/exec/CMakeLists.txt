@@ -15,7 +15,7 @@ add_library(
   velox_exec
   Aggregate.cpp
   AllocationPool.cpp
-  CiderQueryRunner.cpp
+  HybridExecutor.cpp
   ContainerRowSerde.cpp
   Driver.cpp
   EnforceSingleRow.cpp
@@ -57,7 +57,7 @@ target_link_libraries(
   velox_codegen
   velox_common_base)
 
-if(${CIDER_WITH_OMNISCI})
+if(${EXEC_WITH_OMNISCI})
   target_link_libraries(
     velox_exec
     libDBEngine.so)

@@ -1026,6 +1026,10 @@ class ConvergedNode : public PlanNode {
     return "ConvergedNode";
   }
 
+  const std::shared_ptr<const ComputeIRNode>& getIR() const {
+    return cir_;
+  }
+
  private:
   const std::shared_ptr<const ComputeIRNode>& cir_;
   const std::vector<std::shared_ptr<const PlanNode>> sources_;

@@ -32,9 +32,9 @@ if(${CODEGEN_SUPPORT})
   add_compile_definitions(CODEGEN_ENABLED=1)
 endif()
 
-option(CIDER_WITH_OMNISCI "Build with cider omnisci support" OFF)
-if(${CIDER_WITH_OMNISCI})
-  add_definitions(-DCIDER_WITH_OMNISCI)
+option(HE_WITH_OMNISCI "Build with omnisci execution support" OFF)
+if(${EXEC_WITH_OMNISCI})
+  add_definitions(-DEXEC_WITH_OMNISCI)
 endif()
 
 # MacOSX enables two-level namespace by default:

@@ -41,14 +41,6 @@ class ComputeIRNode {
 
   virtual std::string name() const = 0;
 
-  /**
-   * Convert from IRPlanNode into OmnisciDB RelAlg node json string
-   * @param node as ComputeIRNode
-   * @return OmnisciDB RelAlg string
-   */
-  static std::string toOmnisciDBRelAlgStr(
-      const std::shared_ptr<ComputeIRNode>& node);
-
  private:
   const PlanNodeId id_;
 };

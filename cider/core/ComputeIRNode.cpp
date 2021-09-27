@@ -12,8 +12,6 @@
  * limitations under the License.
  */
 #include "velox/cider/core/ComputeIRNode.h"
-#include <set>
-#include <stack>
 
 namespace intel::cider::core {
 namespace {

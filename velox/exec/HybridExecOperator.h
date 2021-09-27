@@ -40,39 +40,6 @@ class HybridExecOperator : public Operator {
 
  private:
   RowVectorPtr input_;
-
-  // public:
-//  CiderJITedOperator(
-//      int32_t operatorId,
-//      DriverCtx* driverCtx,
-//      const std::shared_ptr<const core::JITedNode>& jitedNode);
-//
-//  bool needsInput() const override;
-//
-//  void addInput(RowVectorPtr input) override;
-//
-//  RowVectorPtr getOutput() override;
-//
-//  BlockingReason isBlocked(ContinueFuture* /*future*/) override;
-//
-//  void finish() override;
-
-// private:
-//  bool contain_join_build_ = false;
-//  bool contain_join_probe_ = false;
-//  bool contain_blocking_ops_ = false;
-//  // Cider RelAlg node string for all blocking string。 It will be called at
-//  // addInput method. Intermediate data structure is employed and return when
-//  // getOutput method is called.
-//  const std::string blocking_cider_str_ = "";
-//
-//  // Cider RelAlg node string for all non-blocking string
-//  // It will be called at getOutput method
-//  const std::string non_blocking_cider_str_= "";
-//  RowVectorPtr input_;
-//  // For join build, it will be broadcast to pair drivers like join op
-//  // TODO (Cheng) change to Arrow format or other format
-//  RowVectorPtr non_blocking_res_;
+  const std::shared_ptr<const ComputeIRNode>& IRNode_;
 };
-
 } // namespace facebook::velox::exec

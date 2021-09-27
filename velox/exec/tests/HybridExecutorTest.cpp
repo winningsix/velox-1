@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/exec/CiderQueryRunner.h"
 #include <gtest/gtest.h>
 #include <iostream>
+#include "velox/exec/HybridExecutor.h"
 
 using namespace facebook::velox::exec;
 
-TEST(CiderQueryRunnerTest, basic) {
-  auto qr = CiderQueryRunner::getInstance();
+TEST(HybridExecutorTest, basic) {
+  auto qr = HybridExecutor::getInstance();
   std::cout << qr->getBackend() << std::endl;
   qr->cleanup();
 }

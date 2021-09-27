@@ -17,7 +17,7 @@
 namespace intel::cider::core {
 class OmnisciDBTranslator {
  public:
-  std::string OmnisciDBTranslator::toRelAlgStr(
-      const std::shared_ptr<ComputeIRNode>& node);
+  static std::string toRelAlgStr(
+      const std::shared_ptr<const ComputeIRNode>& node);
 };
 } // namespace intel::cider::core

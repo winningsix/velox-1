@@ -19,12 +19,12 @@
 
 #include <boost/filesystem.hpp>
 
-#include "velox/exec/CiderQueryRunner.h"
+#include "velox/exec/HybridExecutor.h"
 
 namespace facebook::velox::exec {
 
-#ifdef CIDER_WITH_OMNISCI
-void CiderQueryRunner::initOminisciDBEngine() {
+#ifdef EXEC_WITH_OMNISCI
+void HybridExecutor::initOminisciDBEngine() {
   std::string base_path =
       boost::filesystem::unique_path(
           boost::filesystem::temp_directory_path() / "omnidbe-%%%%-%%%%-%%%%")
@@ -39,13 +39,13 @@ void CiderQueryRunner::initOminisciDBEngine() {
 }
 #endif
 
-void CiderQueryRunner::init() {
+void HybridExecutor::init() {
   std::transform(
       backend_.begin(), backend_.end(), backend_.begin(), [](unsigned char c) {
         return std::tolower(c);
       });
   if (backend_ == "omnisci") {
-#ifdef CIDER_WITH_OMNISCI
+#ifdef EXEC_WITH_OMNISCI
     initOminisciDBEngine();
 #else
     backend_ = "default";
@@ -61,18 +61,18 @@ void CiderQueryRunner::init() {
   return;
 }
 
-std::unique_ptr<CiderQueryRunner> CiderQueryRunner::instance_ = nullptr;
-std::string CiderQueryRunner::backend_ = "default";
+std::unique_ptr<HybridExecutor> HybridExecutor::instance_ = nullptr;
+std::string HybridExecutor::backend_ = "default";
 
-CiderQueryRunner* CiderQueryRunner::getInstance() {
+HybridExecutor* HybridExecutor::getInstance() {
   static std::mutex mutex;
   static std::atomic<bool> cider_query_runner_inited(false);
 
   if (!cider_query_runner_inited) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!cider_query_runner_inited) {
-      backend_ = getenv("CIDER_QUERY_BACKEND");
-      instance_.reset(new CiderQueryRunner());
+      backend_ = getenv("driver.hybrid.execution.backends");
+      instance_.reset(new HybridExecutor());
       instance_->init();
       cider_query_runner_inited = true;
     }

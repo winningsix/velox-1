@@ -15,6 +15,8 @@
  */
 
 #include "HybridExecOperator.h"
+#include "HybridExecutor.h"
+#include "velox/cider/core/OmnisciDBTranslator.h"
 
 namespace facebook::velox::exec {
 
@@ -27,7 +29,8 @@ HybridExecOperator::HybridExecOperator(
           cnode->outputType(),
           operatorId,
           cnode->id(),
-          "HybridExecOperator"){};
+          "HybridExecOperator"),
+      IRNode_(cnode->getIR()){};
 
 bool HybridExecOperator::needsInput() const {
   return (input_ == nullptr);
@@ -40,6 +43,10 @@ void HybridExecOperator::addInput(RowVectorPtr input) {
 RowVectorPtr HybridExecOperator::getOutput() {
   auto output = input_;
   input_.reset();
+  HybridExecutor* exec = HybridExecutor::getInstance();
+//  TODO (Cheng): should handled by engine level.
+//  auto str = OmnisciDBTranslator::toRelAlgStr(IRNode_);
+//  exec->processBlocks(str, nullptr, nullptr, nullptr);
   return output;
 }
 

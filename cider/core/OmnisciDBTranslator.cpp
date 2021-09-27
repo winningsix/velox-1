@@ -13,9 +13,12 @@
  */
 #pragma once
 #include "OmnisciDBTranslator.h"
+#include <stack>
+#include <set>
 
+namespace intel::cider::core {
 std::string OmnisciDBTranslator::toRelAlgStr(
-    const std::shared_ptr<ComputeIRNode>& node) {
+    const std::shared_ptr<const ComputeIRNode>& node) {
   // return json string
   std::stack<std::shared_ptr<const ComputeIRNode>> planNodes;
   std::set<std::shared_ptr<const ComputeIRNode>> visited;
@@ -55,3 +58,4 @@ std::string OmnisciDBTranslator::toRelAlgStr(
   rootNode.push_back({"relsNode", relsNode});
   return rootNode.dump();
 }
+} // namespace intel::cider::core

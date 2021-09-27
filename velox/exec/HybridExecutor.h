@@ -17,36 +17,53 @@
 
 #include <string>
 
-#ifdef CIDER_WITH_OMNISCI
+#ifdef EXEC_WITH_OMNISCI
 #include <Embedded/DBEngine.h>
 #endif
 
 namespace facebook::velox::exec {
 
-class CiderQueryRunner {
+/**
+ * A wrapper to execution backend when enbaling Hybrid execution mode
+ */
+class HybridExecutor {
  public:
-  static CiderQueryRunner* getInstance();
-
-  void createTable(){};
-  void processBlocks(){};
+  static HybridExecutor* getInstance();
 
   std::string getBackend() {
     return backend_;
   }
+  /**
+   * API to create build side hash table, it's based on Arrow data format.
+   * @param name for hash table
+   * @param tableData for hash table data
+   * @param tableSchema for hash table schema
+   */
+  void createTable(
+      const std::string& name,
+      const struct ArrowArray* tableData,
+      const struct ArrowSchema* tableSchema){
+      // TODO
+  };
 
-  //  void createTable(
-  //      const std::string& name,
-  //      const struct ArrowArray* tableData,
-  //      const struct ArrowSchema* tableSchema);
-  //
-  //  struct ArrowArray* processBlocks(
-  //      const std::string& sql,
-  //      const struct ArrowArray* inputData,
-  //      const struct ArrowSchema* inputSchema,
-  //      const struct ArrowSchema* outputSchema);
+  /**
+   * API to process data batch-by-batch
+   * @param sql
+   * @param inputData
+   * @param inputSchema
+   * @param outputSchema
+   * @return Arrow based result
+   */
+  struct ArrowArray* processBlocks(
+      const std::string& sql,
+      const struct ArrowArray* inputData,
+      const struct ArrowSchema* inputSchema,
+      const struct ArrowSchema* outputSchema){
+      //TODO
+  };
 
   void cleanup() {
-#ifdef CIDER_WITH_OMNISCI
+#ifdef EXEC_WITH_OMNISCI
     if (dbe_) {
       dbe_.reset();
     }
@@ -55,11 +72,11 @@ class CiderQueryRunner {
 
  private:
   void init();
-#ifdef CIDER_WITH_OMNISCI
+#ifdef EXEC_WITH_OMNISCI
   void initOminisciDBEngine();
   std::shared_ptr<EmbeddedDatabase::DBEngine> dbe_;
 #endif
-  static std::unique_ptr<CiderQueryRunner> instance_;
+  static std::unique_ptr<HybridExecutor> instance_;
   static std::string backend_;
 };
 

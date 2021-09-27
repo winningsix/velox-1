@@ -51,7 +51,7 @@ add_executable(
   TableWriteTest.cpp
   TopNTest.cpp
   LimitTest.cpp
-  CiderQueryRunnerTest.cpp
+  HybridExecutorTest.cpp
   HybridExecOperatorTest.cpp
   OrderByTest.cpp
   MergeTest.cpp
@@ -106,7 +106,7 @@ target_link_libraries(
   ${FMT}
   ${FILESYSTEM})
 
-if(${CIDER_WITH_OMNISCI})
+if(${EXEC_WITH_OMNISCI})
   target_link_libraries(
     velox_exec_test
     libDBEngine.so)
