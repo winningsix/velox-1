@@ -364,6 +364,14 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     return false;
   }
 
+  // Expressions handled by FunctionExpression (not representable as cuDF AST
+  // operators). Return false silently -- the caller will fall through to
+  // the FunctionExpression evaluator which supports these.
+  if (name == "might_contain" || name == "xxhash64_with_seed" ||
+      name == "murmur3hash_with_seed" || name == "isnull") {
+    return false;
+  }
+
   LOG(WARNING) << "Unsupported expression by AST: " << expr->toString();
   return false;
 }
