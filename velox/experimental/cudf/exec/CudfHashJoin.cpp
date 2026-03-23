@@ -55,7 +55,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <thread>
 
 #include <nvtx3/nvtx3.hpp>
@@ -64,22 +66,74 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
-static constexpr int kOomMaxRetries = 3;
+static constexpr int kOomMaxRetries = 5;
+
+// Maximum cumulative time (ms) spent on OOM retries per getOutput() call.
+// Prevents infinite retry loops from causing timeouts (Q93-style).
+static constexpr int64_t kMaxRetryTotalMs = 30000;
+
+// Serialization for large hash joins. When a join's estimated memory
+// footprint (build table + hash table + join output) exceeds this
+// fraction of total GPU memory, acquire exclusive access to prevent
+// cross-task RMM pool corruption from concurrent large allocations.
+// With maxConcurrentGpuTasks=3 and 22 GB RMM pool, two large joins
+// can simultaneously exhaust the pool; this mutex ensures only one
+// heavy join runs at a time while allowing small joins full parallelism.
+static std::mutex sLargeJoinMutex;
+static constexpr double kLargeJoinMemoryFraction = 0.30;
+
 
 void recoverGpuMemory() {
-  cudaDeviceSynchronize();
-  cudaGetLastError();
+  auto syncErr = cudaDeviceSynchronize();
+  auto lastErr = cudaGetLastError();
+  // OOM errors are expected and recoverable. Fatal errors (illegal address,
+  // assert, device unavailable) mean the context is corrupted -- fail fast
+  // instead of proceeding to corrupt the RMM pool further.
+  auto err = (syncErr != cudaSuccess) ? syncErr : lastErr;
+  if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+    VELOX_FAIL(
+        "Fatal CUDA error during GPU memory recovery: {} ({}). "
+        "Device context is corrupted.",
+        cudaGetErrorString(err),
+        static_cast<int>(err));
+  }
 }
 
-void trimGpuMemoryPool() {
-  cudaMemPool_t pool = nullptr;
-  int device = 0;
-  if (cudaGetDevice(&device) == cudaSuccess &&
-      cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
-      pool != nullptr) {
-    cudaMemPoolTrimTo(pool, 0);
+// Check for sticky CUDA errors and throw if the device is corrupted.
+// Must be called after stream.synchronize() to detect async errors
+// before they corrupt the RMM pool during subsequent deallocations.
+void checkCudaHealth(const char* context) {
+  auto err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    auto msg = cudaGetErrorString(err);
+    VELOX_FAIL(
+        "CUDA device error detected at {}: {} ({}). "
+        "GPU context may be corrupted -- failing fast to prevent "
+        "RMM pool metadata corruption.",
+        context,
+        msg,
+        static_cast<int>(err));
   }
-  cudaGetLastError();
+}
+
+size_t freeGpuMemoryBytes() {
+  size_t freeMem = 0, totalMem = 0;
+  if (cudaMemGetInfo(&freeMem, &totalMem) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  return freeMem;
+}
+
+void ensureGpuMemoryAvailable(size_t desiredBytes, const char* context) {
+  size_t freeMem = freeGpuMemoryBytes();
+  if (freeMem > 0 && freeMem < desiredBytes) {
+    LOG(INFO) << context << ": free GPU memory " << (freeMem >> 20)
+              << "MB < desired " << (desiredBytes >> 20)
+              << "MB, recovering deferred frees";
+    recoverGpuMemory();
+    checkCudaHealth(context);
+  }
 }
 
 bool isCudaRelatedError(const std::exception& e) {
@@ -296,27 +350,46 @@ void CudfHashJoinBuild::noMoreInput() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  // OOM retry for build-side concatenation: when many tasks share a GPU,
-  // deferred frees may not have completed. cudaDeviceSynchronize forces
-  // all pending frees, making memory available for this allocation.
+  // Reclaim deferred async frees before attempting a large allocation.
+  // With many concurrent tasks, cudaFreeAsync defers actual deallocation;
+  // this forces those frees, reducing the chance of OOM during concatenation.
+  ensureGpuMemoryAvailable(256ULL << 20, "CudfHashJoinBuild::noMoreInput");
+
   std::vector<std::unique_ptr<cudf::table>> tbls;
   for (int attempt = 0;; ++attempt) {
     try {
       tbls = getConcatenatedTableBatched(
           inputs_, joinNode_->sources()[1]->outputType(), stream);
       break;
-    } catch (const std::bad_alloc& e) {
+    } catch (const std::exception& e) {
+      if (!isCudaRelatedError(e)) {
+        throw;
+      }
+      // If the device has a sticky error (not just OOM), retrying is futile
+      // and will only cause timeouts or RMM corruption.
+      {
+        auto err = cudaPeekAtLastError();
+        if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+          VELOX_FAIL(
+              "CUDA device error {} ({}) during build concatenation for "
+              "planNode {}. Aborting: {}",
+              static_cast<int>(err),
+              cudaGetErrorString(err),
+              planNodeId(),
+              e.what());
+        }
+      }
       if (attempt >= kOomMaxRetries) {
-        trimGpuMemoryPool();
         throw;
       }
       LOG(WARNING)
           << "CudfHashJoinBuild OOM during concatenation for planNode "
-          << planNodeId() << " (attempt " << (attempt + 1)
-          << "): " << e.what() << ". Recovering GPU memory and retrying.";
+          << planNodeId() << " (attempt " << (attempt + 1) << "/"
+          << kOomMaxRetries << "): " << e.what()
+          << ". Recovering GPU memory and retrying.";
       recoverGpuMemory();
       std::this_thread::sleep_for(
-          std::chrono::milliseconds(100 * (1 << attempt)));
+          std::chrono::milliseconds(200 * (1 << attempt)));
     }
   }
   inputs_.clear();
@@ -420,6 +493,13 @@ void CudfHashJoinBuild::noMoreInput() {
     VLOG(1) << "CudfHashJoinBuild setting build stream: planNodeId="
             << planNodeId() << ", splitGroupId=" << splitGroupId;
   }
+  // Synchronize and check for async CUDA errors from build-side
+  // concatenation before handing tables to the probe. Without this,
+  // corrupted table data from a build-side kernel error would silently
+  // propagate and corrupt the RMM pool when the probe dereferences it.
+  stream.synchronize();
+  checkCudaHealth("CudfHashJoinBuild::noMoreInput before bridge handoff");
+
   cudfHashJoinBridge->setBuildStream(stream);
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinBuild setBuildStream completed: planNodeId="
@@ -802,6 +882,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
+  checkCudaHealth("CudfHashJoinProbe::unfilteredOutput");
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -858,6 +939,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
+  checkCudaHealth("CudfHashJoinProbe::filteredOutput");
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -957,8 +1039,6 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
           leftTableView.select(leftKeyIndices_),
           std::nullopt,
           buildStream_.has_value() ? buildStream_.value() : stream);
-    } catch (const std::bad_alloc&) {
-      throw;
     } catch (const std::exception& e) {
       if (isCudaRelatedError(e)) {
         throw;
@@ -1609,6 +1689,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
+  checkCudaHealth("CudfHashJoinProbe::leftSemiProjectJoin");
   cudfOutputs.push_back(
       std::make_unique<cudf::table>(std::move(outCols)));
   return cudfOutputs;
@@ -2040,6 +2121,7 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
           buildStream_.value());
     }
     stream.synchronize();
+    checkCudaHealth("CudfHashJoinProbe::rightJoin empty-match path");
     cudfOutputs.push_back(
         std::make_unique<cudf::table>(std::move(outCols)));
     return cudfOutputs;
@@ -2066,6 +2148,7 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
+  checkCudaHealth("CudfHashJoinProbe::rightJoin");
   cudfOutputs.push_back(
       std::make_unique<cudf::table>(std::move(outCols)));
   return cudfOutputs;
@@ -2225,6 +2308,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+
+  // Detect sticky CUDA errors from prior operations before starting the join.
+  // Proceeding with a corrupted context will crash in RMM deallocate_async.
+  checkCudaHealth("CudfHashJoinProbe::getOutput entry");
+
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();
@@ -2277,11 +2365,45 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   bool const needHashJoin =
       joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
       joinNode_->isRightJoin() || joinNode_->isFullJoin();
+
+  // Estimate build-side memory for large-join detection.
+  size_t buildBytesTotal = 0;
+  {
+    auto& rt = hashObject_.value().first;
+    for (const auto& t : rt) {
+      buildBytesTotal +=
+          static_cast<size_t>(t->num_rows()) * t->num_columns() * 16;
+    }
+  }
+
+  // Acquire exclusive large-join lock if this join is memory-heavy.
+  // This serializes large hash joins that would otherwise corrupt the
+  // RMM pool when running concurrently under maxConcurrentGpuTasks>1.
+  std::unique_lock<std::mutex> largeJoinLock;
+  {
+    size_t freeMem = 0, totalMem = 0;
+    if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && totalMem > 0) {
+      size_t joinFootprint = buildBytesTotal * 3;
+      if (joinFootprint >
+          static_cast<size_t>(totalMem * kLargeJoinMemoryFraction)) {
+        LOG(INFO) << "Large join detected for planNode " << joinNode_->id()
+                  << " (buildEstMB=" << (buildBytesTotal >> 20)
+                  << ", footprintMB=" << (joinFootprint >> 20)
+                  << ", totalGpuMB=" << (totalMem >> 20)
+                  << "). Serializing with other large joins.";
+        largeJoinLock = std::unique_lock<std::mutex>(sLargeJoinMutex);
+        recoverGpuMemory();
+      }
+    }
+  }
+
   if (needHashJoin) {
     auto& rightTables = hashObject_.value().first;
     auto& hbs = hashObject_.value().second;
     for (size_t i = 0; i < rightTables.size(); ++i) {
       if (!hbs[i]) {
+        ensureGpuMemoryAvailable(
+            128ULL << 20, "CudfHashJoinProbe hash table construction");
         for (int attempt = 0;; ++attempt) {
           try {
             hbs[i] = std::make_shared<cudf::hash_join>(
@@ -2289,19 +2411,34 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
                 cudf::null_equality::UNEQUAL,
                 stream);
             break;
-          } catch (const std::bad_alloc& e) {
+          } catch (const std::exception& e) {
+            if (!isCudaRelatedError(e)) {
+              throw;
+            }
+            {
+              auto err = cudaPeekAtLastError();
+              if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+                VELOX_FAIL(
+                    "CUDA device error {} ({}) building hash table for "
+                    "planNode {} batch {}. Aborting: {}",
+                    static_cast<int>(err),
+                    cudaGetErrorString(err),
+                    joinNode_->id(),
+                    i,
+                    e.what());
+              }
+            }
             if (attempt >= kOomMaxRetries) {
-              trimGpuMemoryPool();
               throw;
             }
             LOG(WARNING)
                 << "CudfHashJoinProbe OOM building hash table for planNode "
                 << joinNode_->id() << " batch " << i << " (attempt "
-                << (attempt + 1) << "): " << e.what()
+                << (attempt + 1) << "/" << kOomMaxRetries << "): " << e.what()
                 << ". Recovering GPU memory and retrying.";
             recoverGpuMemory();
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(100 * (1 << attempt)));
+                std::chrono::milliseconds(200 * (1 << attempt)));
           }
         }
       }
@@ -2349,11 +2486,33 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && totalMem > 0) {
       size_t outputRowBytes =
           std::max(size_t(16), static_cast<size_t>(outputType_->size()) * 8);
-      // Conservative: assume 20x amplification per probe row (joins can be
-      // many-to-many). Each output row costs indices (8B) + data.
-      size_t costPerProbeRow = (8 + outputRowBytes) * 20;
-      // Allow each join call to use at most 25% of free GPU memory.
-      size_t maxAlloc = freeMem / 4;
+
+      // Estimate build-side size to compute a realistic amplification factor.
+      // Large build tables cause higher amplification (more matches per row).
+      auto& rightTables = hashObject_.value().first;
+      size_t totalBuildRows = 0;
+      size_t buildBytesEstimate = 0;
+      for (const auto& rt : rightTables) {
+        totalBuildRows += rt->num_rows();
+        buildBytesEstimate +=
+            static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
+      }
+      // Adaptive amplification: base 20x, scale up with build size.
+      // For builds > 10M rows, amplification can be 100x+.
+      size_t amplification = std::min(
+          size_t(200),
+          std::max(size_t(20), totalBuildRows / 50000));
+      size_t costPerProbeRow = (8 + outputRowBytes) * amplification;
+
+      // Subtract estimated hash table footprint (build table bytes * ~2x
+      // for hash buckets + overhead) from free memory to get realistic
+      // available memory for the join output.
+      size_t hashTableFootprint = buildBytesEstimate * 2;
+      size_t usableFree =
+          (freeMem > hashTableFootprint) ? (freeMem - hashTableFootprint) : (freeMem / 4);
+
+      // Allow each join call to use at most 15% of usable free GPU memory.
+      size_t maxAlloc = usableFree * 15 / 100;
       auto maxRows = static_cast<cudf::size_type>(std::min(
           static_cast<size_t>(leftTableView.num_rows()),
           std::max(
@@ -2363,7 +2522,12 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         LOG(INFO) << "Proactive probe split for planNode " << joinNode_->id()
                   << ": " << leftTableView.num_rows() << " rows -> chunks of "
                   << maxRows << " (freeMem=" << (freeMem >> 20) << "MB"
-                  << ", totalMem=" << (totalMem >> 20) << "MB)";
+                  << ", totalMem=" << (totalMem >> 20) << "MB"
+                  << ", buildRows=" << totalBuildRows
+                  << ", buildEstMB=" << (buildBytesEstimate >> 20)
+                  << ", hashTableEstMB=" << (hashTableFootprint >> 20)
+                  << ", usableFreeMB=" << (usableFree >> 20)
+                  << ", amplification=" << amplification << "x)";
         std::vector<cudf::size_type> splitIndices;
         for (cudf::size_type i = maxRows; i < leftTableView.num_rows();
              i += maxRows) {
@@ -2380,9 +2544,21 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     probeSlices.push_back(leftTableView);
   }
 
+  auto retryBudgetStart = std::chrono::steady_clock::now();
+
   while (!probeSlices.empty()) {
     auto slice = probeSlices.back();
     probeSlices.pop_back();
+
+    // Pre-join memory check: if memory is tight, reclaim before attempting.
+    // This is cheap (~0.1ms) and prevents OOM cascades.
+    {
+      size_t freeMem = 0, totalMem = 0;
+      if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess &&
+          totalMem > 0 && freeMem < totalMem / 8) {
+        recoverGpuMemory();
+      }
+    }
 
     try {
       auto results = executeJoin(slice);
@@ -2394,9 +2570,39 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         throw;
       }
 
+      // Check if the CUDA context itself is corrupted (sticky error).
+      // If so, further retries will only waste time and cause timeouts.
+      {
+        auto err = cudaPeekAtLastError();
+        if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+          VELOX_FAIL(
+              "CUDA device error {} ({}) during join for planNode {}. "
+              "GPU context is corrupted, aborting instead of retrying.",
+              static_cast<int>(err),
+              cudaGetErrorString(err),
+              joinNode_->id());
+        }
+      }
+
+      // Check cumulative retry time budget to prevent timeout from infinite
+      // OOM retry/split loops (Q93-style: retries consume >600s).
+      auto retryElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - retryBudgetStart).count();
+      if (retryElapsed > kMaxRetryTotalMs) {
+        VELOX_FAIL(
+            "GPU join exceeded {}ms retry budget (elapsed={}ms) for "
+            "planNode {}. Join type={}, remaining slices={}. "
+            "Consider reducing concurrentGpuTasks or increasing "
+            "shuffle.partitions: {}",
+            kMaxRetryTotalMs,
+            retryElapsed,
+            joinNode_->id(),
+            joinNode_->joinType(),
+            probeSlices.size(),
+            e.what());
+      }
+
       // Force all pending GPU frees across all streams to complete.
-      // With many concurrent tasks, cudaFreeAsync defers actual deallocation;
-      // cudaDeviceSynchronize forces those frees, recovering memory.
       recoverGpuMemory();
 
       // If we can't split further, retry with backoff (other tasks may
@@ -2410,7 +2616,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
               << " (retry " << (attempt + 1) << "/" << kOomMaxRetries
               << "): " << e.what();
           std::this_thread::sleep_for(
-              std::chrono::milliseconds(100 * (1 << attempt)));
+              std::chrono::milliseconds(200 * (1 << attempt)));
           recoverGpuMemory();
           try {
             auto results = executeJoin(slice);
@@ -2427,15 +2633,17 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           }
         }
         if (!retried) {
-          trimGpuMemoryPool();
+          size_t freeMem = freeGpuMemoryBytes();
           VELOX_FAIL(
-              "GPU join error: {} (probe={} rows, planNode={}). "
+              "GPU join error: {} (probe={} rows, planNode={}, "
+              "freeGpuMB={}). "
               "Consider reducing "
               "spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks "
               "or increasing spark.sql.shuffle.partitions: {}",
               joinNode_->joinType(),
               slice.num_rows(),
               joinNode_->id(),
+              freeMem >> 20,
               e.what());
         }
         continue;
@@ -2463,6 +2671,23 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  // Synchronize the probe stream and build stream before releasing any GPU
+  // objects. Without this, hash_join / gather kernels still in flight on the
+  // build stream can reference memory that is freed below, corrupting the
+  // RMM async pool metadata (manifests as SIGSEGV in deallocate_async).
+  stream.synchronize();
+  if (buildStream_.has_value()) {
+    buildStream_.value().synchronize();
+  }
+  checkCudaHealth("CudfHashJoinProbe before hash table release");
+
+  // Release the large-join lock now that all GPU-heavy work is done.
+  // Hash table/input release below is lightweight (just refcount + free);
+  // letting other large joins start sooner improves overall throughput.
+  if (largeJoinLock.owns_lock()) {
+    largeJoinLock.unlock();
+  }
+
   // Release transient hash tables immediately after probing to free GPU
   // memory for other tasks. They'll be rebuilt on the next getOutput() call.
   if (needHashJoin) {
@@ -2478,6 +2703,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // the refcount while cudfInput still holds a reference.
   cudfInput.reset();
   input_.reset();
+
+  // Force deferred frees to complete so that memory from the released hash
+  // tables and input is actually available for other tasks/allocations.
+  // recoverGpuMemory() will throw if the device is fatally corrupted.
+  recoverGpuMemory();
 
   // Remove empty tables before deciding how to return.
   cudfOutputs.erase(
