@@ -1829,6 +1829,10 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       aggregators_,
       inputTableStream);
 
+  if (!groupbyOnInput) {
+    return;
+  }
+
   // If we already have partial output, concatenate the new results with it.
   if (partialOutput_) {
     // Create a vector of tables to concatenate
@@ -2116,6 +2120,10 @@ CudfVectorPtr CudfHashAggregation::getDistinctKeys(
 
 CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
   VELOX_DCHECK(!isGlobal_);
+  if (!partialOutput_) {
+    numInputRows_ = 0;
+    return nullptr;
+  }
   auto numOutputRows = partialOutput_->size();
   const double aggregationPct =
       numOutputRows == 0 ? 0 : (numOutputRows * 1.0) / numInputRows_ * 100;
@@ -2166,7 +2174,16 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  if (inputs_.empty() && !noMoreInput_) {
+  if (inputs_.empty()) {
+    if (!noMoreInput_) {
+      return nullptr;
+    }
+    finished_ = true;
+    if (isGlobal_) {
+      auto stream = cudfGlobalStreamPool().get_stream();
+      auto tbl = makeEmptyTable(inputType_);
+      return doGlobalAggregation(tbl->view(), stream);
+    }
     return nullptr;
   }
 
