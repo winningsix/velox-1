@@ -620,6 +620,84 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         } catch (...) {
         }
         if (mismatch) {
+          // When both operands are the same decimal base type (e.g. both
+          // DECIMAL128) but differ only in scale, align them by casting
+          // each operand to the finer (more-negative cuDF) scale.  cuDF AST
+          // has no CAST_TO_DECIMAL, so we add precompute instructions that
+          // call cudf::cast before the AST evaluator runs.
+          try {
+            auto t0 = veloxToCudfDataType(expr->inputs()[0]->type());
+            auto t1 = veloxToCudfDataType(expr->inputs()[1]->type());
+            bool isDecimal0 = (t0.id() == cudf::type_id::DECIMAL32 ||
+                               t0.id() == cudf::type_id::DECIMAL64 ||
+                               t0.id() == cudf::type_id::DECIMAL128);
+            bool isDecimal1 = (t1.id() == cudf::type_id::DECIMAL32 ||
+                               t1.id() == cudf::type_id::DECIMAL64 ||
+                               t1.id() == cudf::type_id::DECIMAL128);
+            if (isDecimal0 && isDecimal1 && t0.id() == t1.id()) {
+              int commonScale = std::min(t0.scale(), t1.scale());
+              std::string castInstr =
+                  "decimal_cast:" + std::to_string(commonScale);
+
+              auto locateField =
+                  [&](const std::shared_ptr<velox::exec::Expr>& input)
+                  -> std::optional<std::pair<size_t, size_t>> {
+                auto field =
+                    std::dynamic_pointer_cast<FieldReference>(input);
+                if (!field)
+                  return std::nullopt;
+                auto fname = field->inputs().empty()
+                    ? stripPrefix(
+                          field->name(),
+                          CudfConfig::getInstance().functionNamePrefix)
+                    : field->inputs()[0]->name();
+                for (size_t s = 0; s < inputRowSchema.size(); ++s) {
+                  if (inputRowSchema[s].get()->containsChild(fname))
+                    return std::make_pair(
+                        s, inputRowSchema[s].get()->getChildIdx(fname));
+                }
+                auto pos = fname.rfind('_');
+                if (pos != std::string::npos && pos + 1 < fname.size()) {
+                  auto base = fname.substr(0, pos);
+                  for (size_t s = 0; s < inputRowSchema.size(); ++s) {
+                    if (inputRowSchema[s].get()->containsChild(base))
+                      return std::make_pair(
+                          s, inputRowSchema[s].get()->getChildIdx(base));
+                  }
+                }
+                return std::nullopt;
+              };
+
+              auto loc0 = locateField(expr->inputs()[0]);
+              auto loc1 = locateField(expr->inputs()[1]);
+              if (loc0 && loc1) {
+                auto [side0, col0] = *loc0;
+                auto [side1, col1] = *loc1;
+                cudf::ast::expression const* ref0;
+                if (t0.scale() != commonScale) {
+                  ref0 = &addPrecomputeInstructionOnSide(
+                      side0, col0, castInstr, "");
+                } else {
+                  ref0 = &tree.push(cudf::ast::column_reference(
+                      col0,
+                      static_cast<cudf::ast::table_reference>(side0)));
+                }
+                cudf::ast::expression const* ref1;
+                if (t1.scale() != commonScale) {
+                  ref1 = &addPrecomputeInstructionOnSide(
+                      side1, col1, castInstr, "");
+                } else {
+                  ref1 = &tree.push(cudf::ast::column_reference(
+                      col1,
+                      static_cast<cudf::ast::table_reference>(side1)));
+                }
+                return tree.push(
+                    Operation{binaryOps.at(name), *ref0, *ref1});
+              }
+            }
+          } catch (...) {
+          }
+
           try {
             int sideIdx = findExpressionSide(expr);
             if (sideIdx >= 0) {
@@ -1031,6 +1109,14 @@ std::vector<ColumnOrView> precomputeSubexpressions(
       auto view = inputColumnViews[dependent_column_index].child(
           nested_dependent_column_indices[0]);
       precomputedColumns.push_back(view);
+    } else if (ins_name.rfind("decimal_cast:", 0) == 0) {
+      int targetScale = std::stoi(ins_name.substr(13));
+      auto targetType = cudf::data_type{
+          cudf::type_id::DECIMAL128, targetScale};
+      auto result = cudf::cast(
+          inputColumnViews[dependent_column_index], targetType, stream,
+          cudf::get_current_device_resource_ref());
+      precomputedColumns.push_back(std::move(result));
     } else {
       VELOX_FAIL("Unsupported precompute operation " + ins_name);
     }
