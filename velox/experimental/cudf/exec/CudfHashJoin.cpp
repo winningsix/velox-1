@@ -45,6 +45,7 @@
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/unary.hpp>
 
 #include <cuda_runtime_api.h>
@@ -2397,6 +2398,146 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  bool usedPartitionedJoin = false;
+
+  // --- Grace (partitioned) hash join ---
+  // When the hash table exceeds available GPU memory, partition both build
+  // and probe by join key hash and process each partition independently.
+  // Peak memory: ~2B + P + 3B/N  (vs ~3B + P for non-partitioned).
+  {
+    bool const canPartition = needHashJoin &&
+        (joinNode_->isInnerJoin() || joinNode_->isLeftJoin());
+
+    if (canPartition) {
+      size_t gpuFree = 0, gpuTotal = 0;
+      if (cudaMemGetInfo(&gpuFree, &gpuTotal) == cudaSuccess && gpuFree > 0) {
+        size_t hashTableEst = buildBytesTotal * 2;
+        if (hashTableEst > gpuFree * 60 / 100) {
+          // Size partitions so each hash table fits in ~25% of free memory.
+          int numPartitions = std::max(
+              2,
+              static_cast<int>(
+                  (4 * hashTableEst + gpuFree - 1) / gpuFree));
+          numPartitions = std::min(numPartitions, 32);
+
+          LOG(INFO)
+              << "Grace hash join for planNode " << joinNode_->id()
+              << ": " << numPartitions << " partitions"
+              << " (buildEstMB=" << (buildBytesTotal >> 20)
+              << ", htEstMB=" << (hashTableEst >> 20)
+              << ", freeMB=" << (gpuFree >> 20)
+              << ", probeRows=" << leftTableView.num_rows() << ")";
+
+          // Concatenate build tables if split across multiple chunks.
+          auto& origRT = hashObject_.value().first;
+          cudf::table_view buildView = origRT[0]->view();
+          std::unique_ptr<cudf::table> concatBuild;
+          if (origRT.size() > 1) {
+            std::vector<cudf::table_view> views;
+            for (const auto& t : origRT) views.push_back(t->view());
+            concatBuild = cudf::concatenate(views, stream);
+            buildView = concatBuild->view();
+          }
+
+          // Partition both sides with identical hash function + seed so
+          // matching rows land in the same bucket.
+          auto [partBuild, buildOffsets] = cudf::hash_partition(
+              buildView,
+              rightKeyIndices_,
+              numPartitions,
+              cudf::hash_id::HASH_MURMUR3,
+              0,
+              stream);
+
+          auto [partProbe, probeOffsets] = cudf::hash_partition(
+              leftTableView,
+              leftKeyIndices_,
+              numPartitions,
+              cudf::hash_id::HASH_MURMUR3,
+              0,
+              stream);
+
+          // Release temporaries before per-partition work.
+          concatBuild.reset();
+          cudfInput.reset();
+          input_.reset();
+          recoverGpuMemory();
+
+          // offsets vector has num_partitions+1 elements.
+          std::vector<cudf::size_type> bSplits(
+              buildOffsets.begin() + 1, buildOffsets.end() - 1);
+          auto buildParts = cudf::split(partBuild->view(), bSplits);
+
+          std::vector<cudf::size_type> pSplits(
+              probeOffsets.begin() + 1, probeOffsets.end() - 1);
+          auto probeParts = cudf::split(partProbe->view(), pSplits);
+
+          // Save class state that join methods read; restore after loop.
+          auto savedHash = std::move(hashObject_);
+          bool savedAst = useAstFilter_;
+          auto savedRP = std::move(cachedRightPrecomputed_);
+          auto savedEV = std::move(cachedExtendedRightViews_);
+          auto savedBS = buildStream_;
+
+          useAstFilter_ = false;
+          cachedRightPrecomputed_.clear();
+          cachedExtendedRightViews_.clear();
+          buildStream_ = std::nullopt;
+
+          auto restoreState = [&]() {
+            hashObject_ = std::move(savedHash);
+            useAstFilter_ = savedAst;
+            cachedRightPrecomputed_ = std::move(savedRP);
+            cachedExtendedRightViews_ = std::move(savedEV);
+            buildStream_ = savedBS;
+          };
+
+          try {
+            for (int p = 0; p < numPartitions; ++p) {
+              auto bPart = buildParts[p];
+              auto pPart = probeParts[p];
+
+              if (pPart.num_rows() == 0) continue;
+              if (bPart.num_rows() == 0 && joinNode_->isInnerJoin()) continue;
+
+              auto partTable = std::make_shared<cudf::table>(bPart);
+              auto partHJ = std::make_shared<cudf::hash_join>(
+                  partTable->view().select(rightKeyIndices_),
+                  cudf::null_equality::UNEQUAL,
+                  stream);
+
+              std::vector<std::shared_ptr<cudf::table>> pt = {partTable};
+              std::vector<std::shared_ptr<cudf::hash_join>> ph = {partHJ};
+              hashObject_ = std::make_optional(
+                  std::make_pair(std::move(pt), std::move(ph)));
+
+              auto results = joinNode_->isInnerJoin()
+                  ? innerJoin(pPart, stream)
+                  : leftJoin(pPart, stream);
+
+              for (auto& r : results) {
+                cudfOutputs.push_back(std::move(r));
+              }
+
+              // Release partition hash table before next partition.
+              hashObject_.reset();
+              recoverGpuMemory();
+            }
+          } catch (...) {
+            restoreState();
+            throw;
+          }
+
+          restoreState();
+          usedPartitionedJoin = true;
+        }
+      }
+    }
+  }
+
+  if (!usedPartitionedJoin) {
+
   if (needHashJoin) {
     auto& rightTables = hashObject_.value().first;
     auto& hbs = hashObject_.value().second;
@@ -2475,7 +2616,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin();
   static constexpr cudf::size_type kMinSplitRows = 1024;
 
-  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   std::vector<cudf::table_view> probeSlices;
 
   // Proactive probe splitting: when GPU memory is under pressure from
@@ -2670,6 +2810,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       }
     }
   }
+
+  } // !usedPartitionedJoin
 
   // Synchronize the probe stream and build stream before releasing any GPU
   // objects. Without this, hash_join / gather kernels still in flight on the
