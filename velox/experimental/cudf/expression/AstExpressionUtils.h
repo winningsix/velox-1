@@ -29,6 +29,7 @@
 
 #include <optional>
 #include <regex>
+#include <unordered_set>
 
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
@@ -42,6 +43,18 @@
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+// Expressions handled by CudfFunction / FunctionExpression rather than the
+// cuDF AST compute_column path. Used both by isAstExprSupported (to return
+// false silently) and by pushExprToTree (to route to the precompute path).
+const std::unordered_set<std::string> kFunctionExprNames = {
+    "might_contain",
+    "xxhash64_with_seed",
+    "hash_with_seed",
+    "murmur3hash_with_seed",
+    "isnull",
+    "row_constructor",
+};
 
 cudf::ast::literal createLiteral(
     const VectorPtr& vector,
@@ -367,8 +380,7 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   // Expressions handled by FunctionExpression (not representable as cuDF AST
   // operators). Return false silently -- the caller will fall through to
   // the FunctionExpression evaluator which supports these.
-  if (name == "might_contain" || name == "xxhash64_with_seed" ||
-      name == "murmur3hash_with_seed" || name == "isnull") {
+  if (kFunctionExprNames.count(name)) {
     return false;
   }
 
@@ -903,6 +915,22 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     }
 
     VELOX_FAIL("Field not found, " + name);
+  } else if (
+      !allowPureAstOnly && kFunctionExprNames.count(name) &&
+      canBeEvaluatedByCudf(expr, /*deep=*/false)) {
+    // Bloom-filter / hash expressions (might_contain, xxhash64_with_seed,
+    // hash_with_seed, etc.) are not cuDF AST operators but ARE registered
+    // CudfFunctions. Route them through the precompute path so the AST
+    // tree gets a column_reference pointing at the precomputed result.
+    int sideIdx = findExpressionSide(expr);
+    if (sideIdx < 0) {
+      // No field references found (e.g. all-constant inputs).
+      // Default to side 0 -- the precomputed column will be broadcast.
+      sideIdx = 0;
+    }
+    auto node =
+        createCudfExpression(expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+    return addPrecomputeInstructionOnSide(sideIdx, 0, name, "", node);
   } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
     int sideIdx = findExpressionSide(expr);
     if (sideIdx < 0) {
