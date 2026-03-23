@@ -55,7 +55,6 @@
 #include <future>
 #include <limits>
 #include <memory>
-#include <set>
 #include <string>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -85,8 +84,10 @@ CudfHiveDataSource::CudfHiveDataSource(
       baseReaderOpts_(pool_),
       outputType_(outputType),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
-  // Set up column projection, separating Parquet data columns from
-  // Hive partition key columns that live in directory names only.
+  // Set up column projection.  All columns are always requested from the
+  // Parquet reader.  Partition-key columns are tracked separately so that
+  // injectPartitionColumns() can replace them with constants when the split
+  // actually provides partition values (Hive-partitioned data).
   auto readColumnTypes = outputType_->children();
   for (size_t i = 0; i < outputType_->size(); ++i) {
     const auto& outputName = outputType_->nameOf(i);
@@ -98,33 +99,15 @@ CudfHiveDataSource::CudfHiveDataSource(
 
     auto* handle =
         static_cast<const hive::HiveColumnHandle*>(it->second.get());
+    readColumnNames_.emplace_back(handle->name());
     if (handle->columnType() ==
         hive::HiveColumnHandle::ColumnType::kPartitionKey) {
       partitionColumns_.push_back(
           {i, handle->name(), outputType_->childAt(i)});
-    } else {
-      readColumnNames_.emplace_back(handle->name());
     }
   }
 
-  // Build dataOutputType_: outputType_ minus partition columns.
-  if (partitionColumns_.empty()) {
-    dataOutputType_ = outputType_;
-  } else {
-    std::set<size_t> partitionIndices;
-    for (const auto& pc : partitionColumns_) {
-      partitionIndices.insert(pc.outputIndex);
-    }
-    std::vector<std::string> dataNames;
-    std::vector<TypePtr> dataTypes;
-    for (size_t i = 0; i < outputType_->size(); ++i) {
-      if (partitionIndices.count(i) == 0) {
-        dataNames.push_back(outputType_->nameOf(i));
-        dataTypes.push_back(outputType_->childAt(i));
-      }
-    }
-    dataOutputType_ = ROW(std::move(dataNames), std::move(dataTypes));
-  }
+  dataOutputType_ = outputType_;
 
   tableHandle_ =
       std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
@@ -802,39 +785,41 @@ CudfHybridScanReaderPtr CudfHiveDataSource::createExperimentalSplitReader() {
 RowVectorPtr CudfHiveDataSource::injectPartitionColumns(
     RowVectorPtr dataVector,
     vector_size_t nRows) {
-  if (partitionColumns_.empty()) {
+  // Only inject when partition columns exist AND the split actually carries
+  // partition key values.  When partitionKeys is empty the columns were read
+  // from the Parquet file directly (flat / non-Hive-partitioned data).
+  if (partitionColumns_.empty() || split_->partitionKeys.empty()) {
     return dataVector;
   }
 
   const size_t totalCols = outputType_->size();
   std::vector<VectorPtr> children(totalCols);
+  bool anyInjected = false;
 
-  // Fill partition-key positions with constant vectors.
   for (const auto& pc : partitionColumns_) {
     auto it = split_->partitionKeys.find(pc.name);
-    std::optional<std::string> value;
     if (it != split_->partitionKeys.end()) {
-      value = it->second;
+      auto constantSize1 = connector::hive::newConstantFromString(
+          pc.type,
+          it->second,
+          pool_,
+          false /*isLocalTimestamp*/,
+          false /*isDaysSinceEpoch*/);
+      children[pc.outputIndex] =
+          BaseVector::wrapInConstant(nRows, 0, constantSize1);
+      anyInjected = true;
     }
-    auto constantSize1 = connector::hive::newConstantFromString(
-        pc.type,
-        value,
-        pool_,
-        false /*isLocalTimestamp*/,
-        false /*isDaysSinceEpoch*/);
-    children[pc.outputIndex] =
-        BaseVector::wrapInConstant(nRows, 0, constantSize1);
   }
 
-  // Fill data-column positions from the reader output.
-  size_t dataIdx = 0;
+  if (!anyInjected) {
+    return dataVector;
+  }
+
+  // Replace only injected positions; all others come from the data vector
+  // at the same position (dataOutputType_ == outputType_).
   for (size_t i = 0; i < totalCols; ++i) {
     if (!children[i]) {
-      VELOX_CHECK_LT(
-          dataIdx,
-          dataVector->childrenSize(),
-          "Ran out of data columns while injecting partition columns");
-      children[i] = dataVector->childAt(dataIdx++);
+      children[i] = dataVector->childAt(i);
     }
   }
 
