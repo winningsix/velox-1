@@ -44,6 +44,7 @@
 #include <cudf/utilities/error.hpp>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -1858,7 +1859,9 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
         groupingKeyOutputChannels_,
         intermediateAggregators_,
         partialOutputStream);
-    partialOutput_ = compactedOutput;
+    if (compactedOutput) {
+      partialOutput_ = compactedOutput;
+    }
 
     // The concatenation (and groupby) on partialOutputStream asynchronously
     // reads from groupbyOnInput's device buffers, which were allocated on
@@ -2031,18 +2034,30 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
 
-  auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
-  // flatten the results
+  std::pair<std::unique_ptr<cudf::table>,
+            std::vector<cudf::groupby::aggregation_result>>
+      aggregateResult;
+  try {
+    aggregateResult = groupByOwner.aggregate(requests, stream);
+  } catch (const std::out_of_range&) {
+    return nullptr;
+  }
+  auto& [groupKeys, results] = aggregateResult;
+
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (results[i].results.empty()) {
+      return nullptr;
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
-  // first fill the grouping keys
   auto groupKeysColumns = groupKeys->release();
   resultColumns.insert(
       resultColumns.begin(),
       std::make_move_iterator(groupKeysColumns.begin()),
       std::make_move_iterator(groupKeysColumns.end()));
 
-  // then fill the aggregation results
   for (auto& aggregator : aggregators) {
     resultColumns.push_back(aggregator->makeOutputColumn(results, stream));
   }
@@ -2187,27 +2202,9 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  if (inputs_.empty() && noMoreInput_) {
-    finished_ = true;
-    if (isGlobal_) {
-      auto stream = cudfGlobalStreamPool().get_stream();
-      auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
-      return doGlobalAggregation(tbl->view(), stream);
-    }
-    return nullptr;
-  }
-
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  std::unique_ptr<cudf::table> tbl;
-  try {
-    tbl = getConcatenatedTable(inputs_, inputType_, stream);
-  } catch (const std::bad_alloc& e) {
-    VELOX_FAIL(
-        "CudfHashAggregation[{}]: GPU OOM concatenating inputs: {}",
-        planNodeId(),
-        e.what());
-  }
+  auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();
 
   if (noMoreInput_) {
@@ -2220,20 +2217,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  try {
-    if (isDistinct_) {
-      return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
-    } else if (isGlobal_) {
-      return doGlobalAggregation(tbl->view(), stream);
-    } else {
-      return doGroupByAggregation(
-          tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
-    }
-  } catch (const std::bad_alloc& e) {
-    VELOX_FAIL(
-        "CudfHashAggregation[{}]: GPU OOM in aggregation: {}",
-        planNodeId(),
-        e.what());
+  if (isDistinct_) {
+    return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+  } else if (isGlobal_) {
+    return doGlobalAggregation(tbl->view(), stream);
+  } else {
+    return doGroupByAggregation(
+        tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
   }
 }
 
