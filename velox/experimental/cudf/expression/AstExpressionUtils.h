@@ -621,6 +621,14 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       // these through FunctionExpression precompute which uses
       // cudf::binary_operation with automatic type alignment.
       bool isDecimalOp = (name.rfind("decimal_", 0) == 0);
+      if (!isDecimalOp && len == 2) {
+        for (const auto& inp : expr->inputs()) {
+          try {
+            auto dt = veloxToCudfDataType(inp->type());
+            if (cudf::is_fixed_point(dt)) { isDecimalOp = true; break; }
+          } catch (...) {}
+        }
+      }
       if (isDecimalOp && len == 2 && !allowPureAstOnly) {
         // Try single-side FunctionExpression precompute first.
         // Works for column-vs-literal and same-side comparisons.

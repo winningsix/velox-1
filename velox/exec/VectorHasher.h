@@ -180,6 +180,11 @@ class VectorHasher {
         type_ = vector.type();
         typeKind_ = type_->kind();
         typeProvidesCustomComparison_ = type_->providesCustomComparison();
+        // HUGEINT doesn't support value IDs; force hash-only mode.
+        if (!typeSupportsValueIds()) {
+          setRangeOverflow();
+          setDistinctOverflow();
+        }
       } else {
         VELOX_FAIL(
             "Type mismatch: {} vs. {}",

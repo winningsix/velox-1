@@ -199,6 +199,47 @@ cudf::table_view createExtendedTableView(
   return cudf::table_view(allViews);
 }
 
+// Cast probe-side key columns to match build-side types when decimal
+// precision/scale mismatches exist. Returns a new table view with
+// aligned key columns; 'castColumns' holds the casted column ownership.
+cudf::table_view alignProbeKeyTypes(
+    cudf::table_view probeView,
+    const std::vector<cudf::size_type>& probeKeyIndices,
+    cudf::table_view buildView,
+    const std::vector<cudf::size_type>& buildKeyIndices,
+    std::vector<std::unique_ptr<cudf::column>>& castColumns,
+    rmm::cuda_stream_view stream) {
+  bool needCast = false;
+  for (size_t k = 0; k < probeKeyIndices.size(); ++k) {
+    auto pType = probeView.column(probeKeyIndices[k]).type();
+    auto bType = buildView.column(buildKeyIndices[k]).type();
+    if (cudf::is_fixed_point(pType) && cudf::is_fixed_point(bType) &&
+        pType != bType) {
+      needCast = true;
+      break;
+    }
+  }
+  if (!needCast) return probeView;
+
+  std::vector<cudf::column_view> cols;
+  cols.reserve(probeView.num_columns());
+  for (cudf::size_type c = 0; c < probeView.num_columns(); ++c) {
+    cols.push_back(probeView.column(c));
+  }
+  for (size_t k = 0; k < probeKeyIndices.size(); ++k) {
+    auto pi = probeKeyIndices[k];
+    auto bType = buildView.column(buildKeyIndices[k]).type();
+    if (cudf::is_fixed_point(cols[pi].type()) &&
+        cudf::is_fixed_point(bType) && cols[pi].type() != bType) {
+      auto casted = cudf::cast(cols[pi], bType, stream,
+          cudf::get_current_device_resource_ref());
+      cols[pi] = casted->view();
+      castColumns.push_back(std::move(casted));
+    }
+  }
+  return cudf::table_view(cols);
+}
+
 } // namespace
 
 void CudfHashJoinProbe::close() {
@@ -1066,13 +1107,20 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
 
+    // Align decimal key types between probe and build to prevent
+    // "Both inputs must be of the same type" in cudf::hash_join.
+    std::vector<std::unique_ptr<cudf::column>> keyCastCols;
+    auto alignedProbeView = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        keyCastCols, stream);
+
     std::pair<
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
         joinResult;
     try {
       joinResult = hb->inner_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedProbeView.select(leftKeyIndices_),
           std::nullopt,
           buildStream_.has_value() ? buildStream_.value() : stream);
     } catch (const std::exception& e) {
@@ -1223,8 +1271,12 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
+    std::vector<std::unique_ptr<cudf::column>> leftKeyCastsLJ;
+    auto alignedLeftLJ = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        leftKeyCastsLJ, stream);
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
-        leftTableView.select(leftKeyIndices_),
+        alignedLeftLJ.select(leftKeyIndices_),
         std::nullopt,
         buildStream_.has_value() ? buildStream_.value() : stream);
     if (buildStream_.has_value()) {
@@ -1421,11 +1473,12 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
-    // Use left_join to get all probe rows (matched + unmatched).
-    // Track matched build rows in rightMatchedFlags_ for last driver to emit
-    // unmatched build rows at the end.
+    std::vector<std::unique_ptr<cudf::column>> keyCastsFJ;
+    auto alignedLeftFJ = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        keyCastsFJ, stream);
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
-        leftTableView.select(leftKeyIndices_),
+        alignedLeftFJ.select(leftKeyIndices_),
         std::nullopt,
         buildStream_.has_value() ? buildStream_.value() : stream);
     if (buildStream_.has_value()) {
