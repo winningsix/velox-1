@@ -2139,6 +2139,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
              << " nAgg=" << aggregators_.size()
              << " node=" << planNodeId();
   // #endregion
+  auto mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   try {
@@ -2152,7 +2153,14 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
                << " what=" << e.what()
                << " node=" << planNodeId();
     // #endregion
-    return nullptr;
+    // Global aggregation must always return exactly 1 row (SQL semantics).
+    // Build a 1-row result with all-null values for each output column.
+    resultColumns.clear();
+    for (size_t i = 0; i < outputType_->size(); i++) {
+      auto cudfType = cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
+      resultColumns.push_back(cudf::make_fixed_width_column(
+          cudfType, 1, cudf::mask_state::ALL_NULL, stream, mr));
+    }
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
