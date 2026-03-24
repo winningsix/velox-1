@@ -44,6 +44,7 @@
 #include <cudf/utilities/error.hpp>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -2031,7 +2032,17 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
 
-  auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
+  std::pair<std::unique_ptr<cudf::table>,
+            std::vector<cudf::groupby::aggregation_result>>
+      aggregateResult;
+  try {
+    aggregateResult = groupByOwner.aggregate(requests, stream);
+  } catch (const std::out_of_range&) {
+    // cuDF's aggregate() internally uses vector::at() which throws when
+    // the groupby produces zero groups for certain aggregation types.
+    return nullptr;
+  }
+  auto& [groupKeys, results] = aggregateResult;
 
   for (size_t i = 0; i < results.size(); ++i) {
     if (results[i].results.empty()) {
@@ -2059,7 +2070,6 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   auto numRows = resultTable->num_rows();
 
-  // velox expects nullptr instead of a table with 0 rows
   if (numRows == 0) {
     return nullptr;
   }
