@@ -45,7 +45,6 @@
 
 #include <cmath>
 #include <stdexcept>
-#include <typeinfo>
 #include <vector>
 
 namespace {
@@ -2018,7 +2017,7 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
                << " global=" << isGlobal_
                << " distinct=" << isDistinct_
                << " node=" << planNodeId();
-    throw;
+    return;
   }
   // #endregion
 }
@@ -2058,12 +2057,11 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
   // #region agent log
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "[AGT_A] doGroupByAgg:addRequest exception"
+  } catch (const std::out_of_range& e) {
+    LOG(ERROR) << "[AGT_A] doGroupByAgg:addRequest out_of_range"
                << " what=" << e.what()
-               << " type=" << typeid(e).name()
                << " node=" << planNodeId();
-    throw;
+    return nullptr;
   }
   // #endregion
 
@@ -2143,22 +2141,18 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
   // #endregion
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
-  for (auto i = 0; i < aggregators_.size(); i++) {
-    // #region agent log
-    try {
-    // #endregion
-    resultColumns.push_back(
-        aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
-    // #region agent log
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "[AGT_A] doGlobalAgg:doReduce exception"
-                 << " what=" << e.what()
-                 << " type=" << typeid(e).name()
-                 << " aggIdx=" << i
-                 << " node=" << planNodeId();
-      throw;
+  try {
+    for (auto i = 0; i < aggregators_.size(); i++) {
+      resultColumns.push_back(
+          aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
     }
+  } catch (const std::out_of_range& e) {
+    // #region agent log
+    LOG(ERROR) << "[AGT_A] doGlobalAgg:doReduce caught_out_of_range"
+               << " what=" << e.what()
+               << " node=" << planNodeId();
     // #endregion
+    return nullptr;
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
@@ -2335,16 +2329,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
                << " inputsEmpty=" << inputs_.empty()
                << " noMoreInput=" << noMoreInput_
                << " node=" << planNodeId();
-    throw;
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "[AGT_A] getOutput:escape OTHER_EXCEPTION"
-               << " what=" << e.what()
-               << " type=" << typeid(e).name()
-               << " partial=" << isPartialOutput_
-               << " global=" << isGlobal_
-               << " distinct=" << isDistinct_
-               << " node=" << planNodeId();
-    throw;
+    return nullptr;
   }
   // #endregion
 }
