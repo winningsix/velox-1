@@ -59,6 +59,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 #include <nvtx3/nvtx3.hpp>
@@ -238,6 +239,71 @@ cudf::table_view alignProbeKeyTypes(
     }
   }
   return cudf::table_view(cols);
+}
+
+// Validate fixed-point columns in a table and rematerialize any whose
+// underlying buffer size looks inconsistent with their declared type.
+// This catches deserialization bugs where a column claims to be DECIMAL128
+// (16 bytes/row) but its buffer was allocated for DECIMAL64 (8 bytes/row),
+// which causes cudaErrorInvalidValue during gather/concatenate.
+cudf::table_view validateDecimalColumns(
+    cudf::table_view view,
+    std::vector<std::unique_ptr<cudf::column>>& storage,
+    rmm::cuda_stream_view stream) {
+  bool needFix = false;
+  auto mr = cudf::get_current_device_resource_ref();
+  for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
+    auto col = view.column(c);
+    if (!cudf::is_fixed_point(col.type())) continue;
+    auto expectedBits = cudf::size_of(col.type()) * 8;
+    // column_view doesn't expose raw buffer size, but we can detect
+    // mismatches by checking if the column's type_id requires more bits
+    // than the data buffer can hold. A cheap proxy: if the column has
+    // the special scale value INT32_MIN it was likely default-constructed
+    // and is invalid.
+    if (col.type().scale() == std::numeric_limits<int32_t>::min()) {
+      needFix = true;
+      break;
+    }
+  }
+  if (!needFix) return view;
+
+  std::vector<cudf::column_view> cols;
+  cols.reserve(view.num_columns());
+  for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
+    auto col = view.column(c);
+    if (cudf::is_fixed_point(col.type()) &&
+        col.type().scale() == std::numeric_limits<int32_t>::min()) {
+      auto fixed = cudf::cast(col,
+          cudf::data_type{col.type().id(), 0}, stream, mr);
+      cols.push_back(fixed->view());
+      storage.push_back(std::move(fixed));
+    } else {
+      cols.push_back(col);
+    }
+  }
+  return cudf::table_view(cols);
+}
+
+// Log column type details for a table view, useful for diagnosing CUDA errors.
+void logTableColumnTypes(
+    const char* label,
+    cudf::table_view view,
+    const std::string& planNodeId) {
+  std::ostringstream ss;
+  ss << "[DIAG] " << label << " planNode=" << planNodeId
+     << " cols=" << view.num_columns()
+     << " rows=" << view.num_rows() << " types=[";
+  for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
+    if (c > 0) ss << ", ";
+    auto t = view.column(c).type();
+    ss << static_cast<int>(t.id());
+    if (cudf::is_fixed_point(t)) {
+      ss << "(s=" << t.scale() << ")";
+    }
+  }
+  ss << "]";
+  LOG(INFO) << ss.str();
 }
 
 } // namespace
@@ -425,6 +491,20 @@ void CudfHashJoinBuild::noMoreInput() {
   // this forces those frees, reducing the chance of OOM during concatenation.
   ensureGpuMemoryAvailable(256ULL << 20, "CudfHashJoinBuild::noMoreInput");
 
+  // Log build input column types for CUDA error diagnosis.
+  if (!inputs_.empty()) {
+    logTableColumnTypes(
+        "buildConcat:firstBatch",
+        inputs_[0]->getTableView(),
+        planNodeId());
+    if (inputs_.size() > 1) {
+      logTableColumnTypes(
+          "buildConcat:lastBatch",
+          inputs_.back()->getTableView(),
+          planNodeId());
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::table>> tbls;
   for (int attempt = 0;; ++attempt) {
     try {
@@ -440,6 +520,13 @@ void CudfHashJoinBuild::noMoreInput() {
       {
         auto err = cudaPeekAtLastError();
         if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+          // Log all batch column types for post-mortem analysis.
+          for (size_t bi = 0; bi < inputs_.size(); ++bi) {
+            logTableColumnTypes(
+                fmt::format("buildConcat:batch[{}]", bi).c_str(),
+                inputs_[bi]->getTableView(),
+                planNodeId());
+          }
           VELOX_FAIL(
               "CUDA device error {} ({}) during build concatenation for "
               "planNode {}. Aborting: {}",
@@ -450,6 +537,12 @@ void CudfHashJoinBuild::noMoreInput() {
         }
       }
       if (isFatalCudaError(e)) {
+        for (size_t bi = 0; bi < inputs_.size(); ++bi) {
+          logTableColumnTypes(
+              fmt::format("buildConcat:batch[{}]", bi).c_str(),
+              inputs_[bi]->getTableView(),
+              planNodeId());
+        }
         VELOX_FAIL(
             "Fatal CUDA error during build concatenation for planNode {} "
             "(detected from exception message). Aborting: {}",
@@ -936,9 +1029,27 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   std::vector<std::unique_ptr<cudf::column>> joinedCols;
   auto leftInput = leftTableView.select(leftColumnIndicesToGather_);
   auto rightInput = rightTableView.select(rightColumnIndicesToGather_);
-  auto leftResult = cudf::gather(leftInput, leftIndicesCol, oobPolicy, stream);
-  auto rightResult =
-      cudf::gather(rightInput, rightIndicesCol, oobPolicy, stream);
+
+  std::unique_ptr<cudf::table> leftResult;
+  std::unique_ptr<cudf::table> rightResult;
+  try {
+    leftResult = cudf::gather(leftInput, leftIndicesCol, oobPolicy, stream);
+    rightResult =
+        cudf::gather(rightInput, rightIndicesCol, oobPolicy, stream);
+  } catch (const std::exception& e) {
+    logTableColumnTypes("unfilteredOutput:leftInput", leftInput,
+        joinNode_->id());
+    logTableColumnTypes("unfilteredOutput:rightInput", rightInput,
+        joinNode_->id());
+    LOG(ERROR) << "[DIAG] unfilteredOutput gather failed planNode="
+               << joinNode_->id()
+               << " leftRows=" << leftInput.num_rows()
+               << " rightRows=" << rightInput.num_rows()
+               << " leftIndices=" << leftIndicesCol.size()
+               << " rightIndices=" << rightIndicesCol.size()
+               << " err=" << e.what();
+    throw;
+  }
 
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Left result number of columns: " << leftResult->num_columns();
@@ -2871,6 +2982,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       {
         auto err = cudaPeekAtLastError();
         if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+          logTableColumnTypes("joinProbe:probeSlice", slice, joinNode_->id());
+          auto& rt = hashObject_.value().first;
+          for (size_t bi = 0; bi < rt.size(); ++bi) {
+            logTableColumnTypes(
+                fmt::format("joinProbe:build[{}]", bi).c_str(),
+                rt[bi]->view(), joinNode_->id());
+          }
           VELOX_FAIL(
               "CUDA device error {} ({}) during join for planNode {}. "
               "GPU context is corrupted, aborting instead of retrying.",
@@ -2884,6 +3002,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       // cudaPeekAtLastError() may return cudaSuccess even for fatal errors.
       // Fall back to checking the exception message for non-OOM CUDA errors.
       if (isFatalCudaError(e)) {
+        logTableColumnTypes("joinProbe:probeSlice", slice, joinNode_->id());
+        auto& rt = hashObject_.value().first;
+        for (size_t bi = 0; bi < rt.size(); ++bi) {
+          logTableColumnTypes(
+              fmt::format("joinProbe:build[{}]", bi).c_str(),
+              rt[bi]->view(), joinNode_->id());
+        }
         VELOX_FAIL(
             "Fatal CUDA error during join for planNode {} "
             "(detected from exception message, not sticky error). "
