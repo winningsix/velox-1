@@ -45,6 +45,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <typeinfo>
 #include <vector>
 
 namespace {
@@ -1818,12 +1819,7 @@ void CudfHashAggregation::setupGroupingKeyChannelProjections(
 }
 
 void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
-  // For every input, we'll do a groupby and compact results with the existing
-  // intermediate groupby results.
-
   auto inputTableStream = tbl->stream();
-  // Use getTableView() to avoid expensive materialization for packed_table.
-  // tbl stays alive during this function call, keeping the view valid.
   auto groupbyOnInput = doGroupByAggregation(
       tbl->getTableView(),
       groupingKeyInputChannels_,
@@ -1831,29 +1827,35 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       inputTableStream);
 
   if (!groupbyOnInput) {
+    LOG(WARNING) << "[DIAG] computeIntermediateGroupbyPartial node="
+                 << planNodeId()
+                 << " initial groupby returned nullptr, inputRows="
+                 << tbl->size();
     return;
   }
 
-  // If we already have partial output, concatenate the new results with it.
   if (partialOutput_) {
-    // Create a vector of tables to concatenate
     std::vector<cudf::table_view> tablesToConcat;
     tablesToConcat.push_back(partialOutput_->getTableView());
     tablesToConcat.push_back(groupbyOnInput->getTableView());
 
     auto partialOutputStream = partialOutput_->stream();
-    // We need to join the input table stream on the partial output stream to
-    // make sure the intermediate results are available when we do the concat.
     cudf::detail::join_streams(
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
 
-    // Concatenate the tables
-    auto concatenatedTable =
-        cudf::concatenate(tablesToConcat, partialOutputStream);
+    std::unique_ptr<cudf::table> concatenatedTable;
+    try {
+      concatenatedTable =
+          cudf::concatenate(tablesToConcat, partialOutputStream);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[DIAG] computeIntermediateGroupbyPartial node="
+                 << planNodeId()
+                 << " concatenate failed: " << typeid(e).name()
+                 << " what=" << e.what();
+      return;
+    }
 
-    // Now we have to groupby again but this time with intermediate aggregators.
-    // Keep concatenatedTable alive while we use its view.
     auto compactedOutput = doGroupByAggregation(
         concatenatedTable->view(),
         groupingKeyOutputChannels_,
@@ -1861,18 +1863,11 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
         partialOutputStream);
     partialOutput_ = compactedOutput;
 
-    // The concatenation (and groupby) on partialOutputStream asynchronously
-    // reads from groupbyOnInput's device buffers, which were allocated on
-    // inputTableStream.  When groupbyOnInput goes out of scope the buffers
-    // are freed via cudaFreeAsync on inputTableStream.  Without this reverse
-    // join the free can race ahead of the read on partialOutputStream.
     if (inputTableStream != partialOutputStream) {
       cudf::detail::join_streams(
           std::vector<rmm::cuda_stream_view>{partialOutputStream}, inputTableStream);
     }
   } else {
-    // First time processing, just store the result of the input batch's groupby
-    // This means we're storing the stream from the first batch.
     partialOutput_ = groupbyOnInput;
   }
 }
@@ -1968,6 +1963,14 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  LOG(INFO) << "[DIAG] addInput node=" << planNodeId()
+            << " batchRows=" << input->size()
+            << " totalInputRows=" << numInputRows_
+            << " inputsSize=" << inputs_.size()
+            << " partial=" << isPartialOutput_
+            << " global=" << isGlobal_
+            << " distinct=" << isDistinct_;
+
   // #region agent log
   try {
   // #endregion
@@ -2009,17 +2012,19 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   // Handle final aggregation or global cases.
   inputs_.push_back(std::move(cudfInput));
 
-  // #region agent log
   } catch (const std::out_of_range& e) {
-    LOG(ERROR) << "[AGT_A] addInput:escape out_of_range"
+    LOG(ERROR) << "[DIAG] addInput:escape out_of_range node=" << planNodeId()
                << " what=" << e.what()
                << " partial=" << isPartialOutput_
                << " global=" << isGlobal_
-               << " distinct=" << isDistinct_
-               << " node=" << planNodeId();
+               << " distinct=" << isDistinct_;
+    return;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] addInput:escape exception node=" << planNodeId()
+               << " type=" << typeid(e).name()
+               << " what=" << e.what();
     return;
   }
-  // #endregion
 }
 
 CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
@@ -2027,16 +2032,23 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
-  // #region agent log
-  LOG(ERROR) << "[AGT_A] doGroupByAgg:entry"
-             << " rows=" << tableView.num_rows()
-             << " cols=" << tableView.num_columns()
-             << " nKeys=" << groupByKeys.size()
-             << " nAgg=" << aggregators.size()
-             << " node=" << planNodeId();
-  // #endregion
+  LOG(INFO) << "[DIAG] doGroupByAgg:entry node=" << planNodeId()
+            << " rows=" << tableView.num_rows()
+            << " cols=" << tableView.num_columns()
+            << " nKeys=" << groupByKeys.size()
+            << " nAgg=" << aggregators.size();
+
   if (tableView.num_rows() == 0) {
     return nullptr;
+  }
+
+  for (size_t k = 0; k < groupByKeys.size(); ++k) {
+    if (groupByKeys[k] >= tableView.num_columns()) {
+      LOG(ERROR) << "[DIAG] doGroupByAgg node=" << planNodeId()
+                 << " groupByKey[" << k << "]=" << groupByKeys[k]
+                 << " >= num_columns=" << tableView.num_columns();
+      return nullptr;
+    }
   }
 
   auto groupbyKeyView =
@@ -2050,20 +2062,30 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                       : cudf::null_policy::INCLUDE);
 
   std::vector<cudf::groupby::aggregation_request> requests;
-  // #region agent log
   try {
-  // #endregion
-  for (auto& aggregator : aggregators) {
-    aggregator->addGroupbyRequest(tableView, requests, stream);
-  }
-  // #region agent log
+    for (size_t ai = 0; ai < aggregators.size(); ++ai) {
+      auto& aggregator = aggregators[ai];
+      if (aggregator->inputIndex >= static_cast<uint32_t>(tableView.num_columns())) {
+        LOG(ERROR) << "[DIAG] doGroupByAgg node=" << planNodeId()
+                   << " aggregator[" << ai << "] inputIndex="
+                   << aggregator->inputIndex
+                   << " >= num_columns=" << tableView.num_columns()
+                   << " kind=" << static_cast<int>(aggregator->kind);
+        return nullptr;
+      }
+      aggregator->addGroupbyRequest(tableView, requests, stream);
+    }
   } catch (const std::out_of_range& e) {
-    LOG(ERROR) << "[AGT_A] doGroupByAgg:addRequest out_of_range"
-               << " what=" << e.what()
-               << " node=" << planNodeId();
+    LOG(ERROR) << "[DIAG] doGroupByAgg:addRequest out_of_range node="
+               << planNodeId() << " what=" << e.what()
+               << " nRequests=" << requests.size();
+    return nullptr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] doGroupByAgg:addRequest exception node="
+               << planNodeId() << " type=" << typeid(e).name()
+               << " what=" << e.what();
     return nullptr;
   }
-  // #endregion
 
   std::pair<std::unique_ptr<cudf::table>,
             std::vector<cudf::groupby::aggregation_result>>
@@ -2071,23 +2093,22 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   try {
     aggregateResult = groupByOwner.aggregate(requests, stream);
   } catch (const std::out_of_range& e) {
-    // #region agent log
-    LOG(ERROR) << "[AGT_A] doGroupByAgg:aggregate caught_out_of_range"
-               << " what=" << e.what()
-               << " node=" << planNodeId();
-    // #endregion
+    LOG(ERROR) << "[DIAG] doGroupByAgg:aggregate out_of_range node="
+               << planNodeId() << " what=" << e.what();
+    return nullptr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] doGroupByAgg:aggregate exception node="
+               << planNodeId() << " type=" << typeid(e).name()
+               << " what=" << e.what();
     return nullptr;
   }
   auto& [groupKeys, results] = aggregateResult;
 
   for (size_t i = 0; i < results.size(); ++i) {
     if (results[i].results.empty()) {
-      // #region agent log
-      LOG(ERROR) << "[AGT_A] doGroupByAgg:emptyGuard results_inner_empty"
-                 << " i=" << i
-                 << " resultsSize=" << results.size()
-                 << " node=" << planNodeId();
-      // #endregion
+      LOG(ERROR) << "[DIAG] doGroupByAgg:emptyGuard node=" << planNodeId()
+                 << " results[" << i << "].results is empty"
+                 << " totalResults=" << results.size();
       return nullptr;
     }
   }
@@ -2100,15 +2121,24 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         std::make_move_iterator(groupKeysColumns.begin()),
         std::make_move_iterator(groupKeysColumns.end()));
 
-    for (auto& aggregator : aggregators) {
-      resultColumns.push_back(aggregator->makeOutputColumn(results, stream));
+    for (size_t ai = 0; ai < aggregators.size(); ++ai) {
+      auto col = aggregators[ai]->makeOutputColumn(results, stream);
+      if (!col) {
+        LOG(ERROR) << "[DIAG] doGroupByAgg:makeOutput node=" << planNodeId()
+                   << " aggregator[" << ai << "] returned null column";
+        return nullptr;
+      }
+      resultColumns.push_back(std::move(col));
     }
   } catch (const std::out_of_range& e) {
-    // #region agent log
-    LOG(ERROR) << "[AGT_A] doGroupByAgg:makeOutput caught_out_of_range"
-               << " what=" << e.what()
-               << " node=" << planNodeId();
-    // #endregion
+    LOG(ERROR) << "[DIAG] doGroupByAgg:makeOutput out_of_range node="
+               << planNodeId() << " what=" << e.what()
+               << " resultColumnsBuilt=" << resultColumns.size();
+    return nullptr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] doGroupByAgg:makeOutput exception node="
+               << planNodeId() << " type=" << typeid(e).name()
+               << " what=" << e.what();
     return nullptr;
   }
 
@@ -2120,11 +2150,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     return nullptr;
   }
 
-  // #region agent log
-  LOG(ERROR) << "[AGT_A] doGroupByAgg:exit success"
-             << " numRows=" << numRows
-             << " node=" << planNodeId();
-  // #endregion
+  LOG(INFO) << "[DIAG] doGroupByAgg:exit node=" << planNodeId()
+            << " numRows=" << numRows;
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(resultTable), stream);
 }
@@ -2132,29 +2159,33 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
-  // #region agent log
-  LOG(ERROR) << "[AGT_A] doGlobalAgg:entry"
-             << " rows=" << tableView.num_rows()
-             << " cols=" << tableView.num_columns()
-             << " nAgg=" << aggregators_.size()
-             << " node=" << planNodeId();
-  // #endregion
+  LOG(INFO) << "[DIAG] doGlobalAgg:entry node=" << planNodeId()
+            << " rows=" << tableView.num_rows()
+            << " cols=" << tableView.num_columns()
+            << " nAgg=" << aggregators_.size();
   auto mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   try {
-    for (auto i = 0; i < aggregators_.size(); i++) {
+    for (size_t i = 0; i < aggregators_.size(); i++) {
       resultColumns.push_back(
           aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
     }
   } catch (const std::out_of_range& e) {
-    // #region agent log
-    LOG(ERROR) << "[AGT_A] doGlobalAgg:doReduce caught_out_of_range"
-               << " what=" << e.what()
-               << " node=" << planNodeId();
-    // #endregion
-    // Global aggregation must always return exactly 1 row (SQL semantics).
-    // Build a 1-row result with all-null values for each output column.
+    LOG(ERROR) << "[DIAG] doGlobalAgg:doReduce out_of_range node="
+               << planNodeId() << " what=" << e.what()
+               << " completedAggs=" << resultColumns.size()
+               << "/" << aggregators_.size();
+    resultColumns.clear();
+    for (size_t i = 0; i < outputType_->size(); i++) {
+      auto cudfType = cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
+      resultColumns.push_back(cudf::make_fixed_width_column(
+          cudfType, 1, cudf::mask_state::ALL_NULL, stream, mr));
+    }
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] doGlobalAgg:doReduce exception node="
+               << planNodeId() << " type=" << typeid(e).name()
+               << " what=" << e.what();
     resultColumns.clear();
     for (size_t i = 0; i < outputType_->size(); i++) {
       auto cudfType = cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
@@ -2271,6 +2302,8 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     }
     finished_ = true;
     if (isGlobal_) {
+      LOG(INFO) << "[DIAG] getOutput node=" << planNodeId()
+                << " emptyInputs globalAgg with makeEmptyTable";
       auto stream = cudfGlobalStreamPool().get_stream();
       auto tbl = makeEmptyTable(inputType_);
       return doGlobalAggregation(tbl->view(), stream);
@@ -2278,17 +2311,18 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  if (inputs_.empty() && noMoreInput_) {
-    finished_ = true;
-    if (isGlobal_) {
-      auto stream = cudfGlobalStreamPool().get_stream();
-      auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
-      return doGlobalAggregation(tbl->view(), stream);
-    }
-    return nullptr;
-  }
-
   auto stream = cudfGlobalStreamPool().get_stream();
+
+  size_t totalInputRows = 0;
+  for (const auto& inp : inputs_) {
+    totalInputRows += inp->size();
+  }
+  LOG(INFO) << "[DIAG] getOutput node=" << planNodeId()
+            << " inputsBatches=" << inputs_.size()
+            << " totalInputRows=" << totalInputRows
+            << " noMoreInput=" << noMoreInput_
+            << " global=" << isGlobal_
+            << " distinct=" << isDistinct_;
 
   std::unique_ptr<cudf::table> tbl;
   try {
@@ -2307,19 +2341,37 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
+  LOG(INFO) << "[DIAG] getOutput node=" << planNodeId()
+            << " concatenatedRows=" << tbl->num_rows()
+            << " concatenatedCols=" << tbl->num_columns();
+
   if (tbl->num_rows() == 0 && !isGlobal_) {
+    LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+                 << " concatenated table has 0 rows (non-global), returning nullptr";
     return nullptr;
   }
 
   try {
+    CudfVectorPtr result;
     if (isDistinct_) {
-      return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+      result = getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
     } else if (isGlobal_) {
-      return doGlobalAggregation(tbl->view(), stream);
+      result = doGlobalAggregation(tbl->view(), stream);
     } else {
-      return doGroupByAggregation(
+      result = doGroupByAggregation(
           tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
     }
+    if (!result) {
+      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+                   << " aggregation returned nullptr despite "
+                   << tbl->num_rows() << " input rows"
+                   << " (global=" << isGlobal_
+                   << " distinct=" << isDistinct_ << ")";
+    } else {
+      LOG(INFO) << "[DIAG] getOutput node=" << planNodeId()
+                << " aggregation produced " << result->size() << " rows";
+    }
+    return result;
   } catch (const std::bad_alloc& e) {
     VELOX_FAIL(
         "CudfHashAggregation[{}]: GPU OOM in aggregation: {}",
@@ -2327,26 +2379,39 @@ RowVectorPtr CudfHashAggregation::getOutput() {
         e.what());
   }
 
-  // #region agent log
   } catch (const std::out_of_range& e) {
-    LOG(ERROR) << "[AGT_A] getOutput:escape OUT_OF_RANGE"
+    LOG(ERROR) << "[DIAG] getOutput:escape out_of_range node=" << planNodeId()
                << " what=" << e.what()
                << " partial=" << isPartialOutput_
                << " global=" << isGlobal_
                << " distinct=" << isDistinct_
                << " inputsEmpty=" << inputs_.empty()
-               << " noMoreInput=" << noMoreInput_
-               << " node=" << planNodeId();
+               << " noMoreInput=" << noMoreInput_;
+    return nullptr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DIAG] getOutput:escape exception node=" << planNodeId()
+               << " type=" << typeid(e).name()
+               << " what=" << e.what()
+               << " partial=" << isPartialOutput_
+               << " global=" << isGlobal_;
     return nullptr;
   }
-  // #endregion
 }
 
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
   if (isPartialOutput_ && !isGlobal_) {
     GpuGuard gpuGuard;
-    processAccumulatedPartialInputs();
+    try {
+      processAccumulatedPartialInputs();
+    } catch (const std::out_of_range& e) {
+      LOG(ERROR) << "[DIAG] noMoreInput:processAccumulated out_of_range node="
+                 << planNodeId() << " what=" << e.what();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[DIAG] noMoreInput:processAccumulated exception node="
+                 << planNodeId() << " type=" << typeid(e).name()
+                 << " what=" << e.what();
+    }
   }
   if (isPartialOutput_ && inputs_.empty() &&
       accumulatedPartialInputs_.empty()) {
