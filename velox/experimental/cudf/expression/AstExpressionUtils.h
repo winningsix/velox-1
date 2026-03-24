@@ -54,6 +54,11 @@ const std::unordered_set<std::string> kFunctionExprNames = {
     "murmur3hash_with_seed",
     "isnull",
     "row_constructor",
+    "coalesce",
+    "substr",
+    "substring",
+    "unscaled_value",
+    "make_decimal",
 };
 
 cudf::ast::literal createLiteral(
