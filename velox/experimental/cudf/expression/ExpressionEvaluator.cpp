@@ -504,6 +504,26 @@ class BinaryFunction : public CudfFunction {
               lhsView, rhsView, op_, type_, stream, mr);
         }
       }
+      if (cudf::is_fixed_point(lhsView.type()) ||
+          cudf::is_fixed_point(rhsView.type())) {
+        auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+        std::unique_ptr<cudf::column> lhsConv, rhsConv;
+        if (cudf::is_fixed_point(lhsView.type())) {
+          lhsConv = cudf::cast(lhsView, f64, stream, mr);
+          lhsView = lhsConv->view();
+        }
+        if (cudf::is_fixed_point(rhsView.type())) {
+          rhsConv = cudf::cast(rhsView, f64, stream, mr);
+          rhsView = rhsConv->view();
+        }
+        auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+        auto result =
+            cudf::binary_operation(lhsView, rhsView, op_, outType, stream, mr);
+        if (cudf::is_fixed_point(type_)) {
+          return cudf::cast(result->view(), type_, stream, mr);
+        }
+        return result;
+      }
       return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
     } else if (left_ == nullptr) {
       if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
@@ -614,6 +634,30 @@ class BinaryFunction : public CudfFunction {
               lhsView, rhsView, op_, type_, stream, mr);
         }
       }
+      if (cudf::is_fixed_point(lhsView.type()) ||
+          cudf::is_fixed_point(right_->type())) {
+        auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+        std::unique_ptr<cudf::column> lhsConv;
+        if (cudf::is_fixed_point(lhsView.type())) {
+          lhsConv = cudf::cast(lhsView, f64, stream, mr);
+          lhsView = lhsConv->view();
+        }
+        auto rhsCol =
+            cudf::make_column_from_scalar(*right_, lhsView.size(), stream, mr);
+        std::unique_ptr<cudf::column> rhsConv;
+        cudf::column_view rhsView2 = rhsCol->view();
+        if (cudf::is_fixed_point(right_->type())) {
+          rhsConv = cudf::cast(rhsView2, f64, stream, mr);
+          rhsView2 = rhsConv->view();
+        }
+        auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+        auto result =
+            cudf::binary_operation(lhsView, rhsView2, op_, outType, stream, mr);
+        if (cudf::is_fixed_point(type_)) {
+          return cudf::cast(result->view(), type_, stream, mr);
+        }
+        return result;
+      }
       return cudf::binary_operation(lhsView, *right_, op_, type_, stream, mr);
     }
     if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
@@ -722,6 +766,29 @@ class BinaryFunction : public CudfFunction {
         return cudf::binary_operation(
             lhsView, rhsView, op_, type_, stream, mr);
       }
+    }
+    if (cudf::is_fixed_point(left_->type()) ||
+        cudf::is_fixed_point(rhsView.type())) {
+      auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
+      auto lhsCol =
+          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
+      cudf::column_view lhsView2 = lhsCol->view();
+      std::unique_ptr<cudf::column> lhsConv, rhsConv;
+      if (cudf::is_fixed_point(left_->type())) {
+        lhsConv = cudf::cast(lhsView2, f64, stream, mr);
+        lhsView2 = lhsConv->view();
+      }
+      if (cudf::is_fixed_point(rhsView.type())) {
+        rhsConv = cudf::cast(rhsView, f64, stream, mr);
+        rhsView = rhsConv->view();
+      }
+      auto outType = cudf::is_fixed_point(type_) ? f64 : type_;
+      auto result =
+          cudf::binary_operation(lhsView2, rhsView, op_, outType, stream, mr);
+      if (cudf::is_fixed_point(type_)) {
+        return cudf::cast(result->view(), type_, stream, mr);
+      }
+      return result;
     }
     return cudf::binary_operation(*left_, rhsView, op_, type_, stream, mr);
   }
@@ -869,40 +936,60 @@ class BetweenFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     // return (value >= min) && (value <= max)
+    // For decimal types, align both operands to a common type before
+    // comparison since cuDF requires identical fixed_point types.
+    auto alignedCompare =
+        [&](cudf::column_view valView,
+            cudf::column_view boundView,
+            cudf::binary_operator op) -> std::unique_ptr<cudf::column> {
+      std::unique_ptr<cudf::column> valCast, boundCast;
+      if (cudf::is_fixed_point(valView.type()) &&
+          cudf::is_fixed_point(boundView.type()) &&
+          valView.type() != boundView.type()) {
+        auto valScale = -valView.type().scale();
+        auto boundScale = -boundView.type().scale();
+        auto targetScale = valScale > boundScale ? valScale : boundScale;
+        auto targetTypeId =
+            (valView.type().id() == cudf::type_id::DECIMAL128 ||
+             boundView.type().id() == cudf::type_id::DECIMAL128)
+            ? cudf::type_id::DECIMAL128
+            : cudf::type_id::DECIMAL64;
+        auto targetType = cudf::data_type{
+            targetTypeId, numeric::scale_type{-targetScale}};
+        if (valView.type() != targetType) {
+          valCast = cudf::cast(valView, targetType, stream, mr);
+          valView = valCast->view();
+        }
+        if (boundView.type() != targetType) {
+          boundCast = cudf::cast(boundView, targetType, stream, mr);
+          boundView = boundCast->view();
+        }
+      }
+      return cudf::binary_operation(
+          valView, boundView, op, kBoolType, stream, mr);
+    };
+
+    auto valueView = asView(inputColumns[0]);
     std::unique_ptr<cudf::column> geResultColumn, leResultColumn;
     if (minLiteral_) {
-      geResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          *minLiteral_,
-          cudf::binary_operator::GREATER_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      auto minCol = cudf::make_column_from_scalar(
+          *minLiteral_, valueView.size(), stream, mr);
+      geResultColumn = alignedCompare(
+          valueView, minCol->view(), cudf::binary_operator::GREATER_EQUAL);
     } else {
-      geResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[1]),
-          cudf::binary_operator::GREATER_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      geResultColumn = alignedCompare(
+          valueView, asView(inputColumns[1]),
+          cudf::binary_operator::GREATER_EQUAL);
     }
     if (maxLiteral_) {
-      leResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          *maxLiteral_,
-          cudf::binary_operator::LESS_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      auto maxCol = cudf::make_column_from_scalar(
+          *maxLiteral_, valueView.size(), stream, mr);
+      leResultColumn = alignedCompare(
+          valueView, maxCol->view(), cudf::binary_operator::LESS_EQUAL);
     } else {
-      leResultColumn = cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[2]),
-          cudf::binary_operator::LESS_EQUAL,
-          kBoolType,
-          stream,
-          mr);
+      leResultColumn = alignedCompare(
+          valueView, asView(inputColumns[2]),
+          cudf::binary_operator::LESS_EQUAL);
     }
     return cudf::binary_operation(
         geResultColumn->view(),
