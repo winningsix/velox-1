@@ -43,30 +43,10 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
-#include <chrono>
 #include <cmath>
-#include <fstream>
 #include <stdexcept>
 #include <typeinfo>
 #include <vector>
-
-// #region agent log
-namespace {
-inline void dbgLog(const char* loc, const char* msg, const std::string& extra = "{}") {
-  try {
-    std::ofstream f("/home/ferdinandx/gtc/.cursor/debug-f8d699.log", std::ios::app);
-    if (f) {
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count();
-      f << "{\"sessionId\":\"f8d699\",\"location\":\"" << loc
-        << "\",\"message\":\"" << msg
-        << "\",\"data\":" << extra
-        << ",\"timestamp\":" << ms << "}\n";
-    }
-  } catch (...) {}
-}
-} // namespace
-// #endregion
 
 namespace {
 
@@ -2032,12 +2012,12 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
 
   // #region agent log
   } catch (const std::out_of_range& e) {
-    dbgLog("addInput:escape", "out_of_range_escaped_to_addInput",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
-        ",\"isGlobal\":" + std::to_string(isGlobal_) +
-        ",\"isDistinct\":" + std::to_string(isDistinct_) +
-        ",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] addInput:escape out_of_range"
+               << " what=" << e.what()
+               << " partial=" << isPartialOutput_
+               << " global=" << isGlobal_
+               << " distinct=" << isDistinct_
+               << " node=" << planNodeId();
     throw;
   }
   // #endregion
@@ -2049,12 +2029,12 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
   // #region agent log
-  dbgLog("doGroupByAgg:entry", "enter",
-      "{\"rows\":" + std::to_string(tableView.num_rows()) +
-      ",\"cols\":" + std::to_string(tableView.num_columns()) +
-      ",\"nKeys\":" + std::to_string(groupByKeys.size()) +
-      ",\"nAgg\":" + std::to_string(aggregators.size()) +
-      ",\"planNode\":\"" + planNodeId() + "\"}");
+  LOG(ERROR) << "[AGT_A] doGroupByAgg:entry"
+             << " rows=" << tableView.num_rows()
+             << " cols=" << tableView.num_columns()
+             << " nKeys=" << groupByKeys.size()
+             << " nAgg=" << aggregators.size()
+             << " node=" << planNodeId();
   // #endregion
   if (tableView.num_rows() == 0) {
     return nullptr;
@@ -2079,10 +2059,10 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
   // #region agent log
   } catch (const std::exception& e) {
-    dbgLog("doGroupByAgg:addRequest", "exception_in_addGroupbyRequest",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"type\":\"" + typeid(e).name() +
-        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] doGroupByAgg:addRequest exception"
+               << " what=" << e.what()
+               << " type=" << typeid(e).name()
+               << " node=" << planNodeId();
     throw;
   }
   // #endregion
@@ -2094,9 +2074,9 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     aggregateResult = groupByOwner.aggregate(requests, stream);
   } catch (const std::out_of_range& e) {
     // #region agent log
-    dbgLog("doGroupByAgg:aggregate", "caught_out_of_range_in_aggregate",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] doGroupByAgg:aggregate caught_out_of_range"
+               << " what=" << e.what()
+               << " node=" << planNodeId();
     // #endregion
     return nullptr;
   }
@@ -2105,10 +2085,10 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   for (size_t i = 0; i < results.size(); ++i) {
     if (results[i].results.empty()) {
       // #region agent log
-      dbgLog("doGroupByAgg:emptyGuard", "results_inner_empty",
-          "{\"i\":" + std::to_string(i) +
-          ",\"resultsSize\":" + std::to_string(results.size()) +
-          ",\"planNode\":\"" + planNodeId() + "\"}");
+      LOG(ERROR) << "[AGT_A] doGroupByAgg:emptyGuard results_inner_empty"
+                 << " i=" << i
+                 << " resultsSize=" << results.size()
+                 << " node=" << planNodeId();
       // #endregion
       return nullptr;
     }
@@ -2127,9 +2107,9 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     }
   } catch (const std::out_of_range& e) {
     // #region agent log
-    dbgLog("doGroupByAgg:makeOutput", "caught_out_of_range_in_makeOutput",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] doGroupByAgg:makeOutput caught_out_of_range"
+               << " what=" << e.what()
+               << " node=" << planNodeId();
     // #endregion
     return nullptr;
   }
@@ -2143,9 +2123,9 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
 
   // #region agent log
-  dbgLog("doGroupByAgg:exit", "success",
-      "{\"numRows\":" + std::to_string(numRows) +
-      ",\"planNode\":\"" + planNodeId() + "\"}");
+  LOG(ERROR) << "[AGT_A] doGroupByAgg:exit success"
+             << " numRows=" << numRows
+             << " node=" << planNodeId();
   // #endregion
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(resultTable), stream);
@@ -2155,11 +2135,11 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
   // #region agent log
-  dbgLog("doGlobalAgg:entry", "enter",
-      "{\"rows\":" + std::to_string(tableView.num_rows()) +
-      ",\"cols\":" + std::to_string(tableView.num_columns()) +
-      ",\"nAgg\":" + std::to_string(aggregators_.size()) +
-      ",\"planNode\":\"" + planNodeId() + "\"}");
+  LOG(ERROR) << "[AGT_A] doGlobalAgg:entry"
+             << " rows=" << tableView.num_rows()
+             << " cols=" << tableView.num_columns()
+             << " nAgg=" << aggregators_.size()
+             << " node=" << planNodeId();
   // #endregion
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
@@ -2171,11 +2151,11 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
         aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
     // #region agent log
     } catch (const std::exception& e) {
-      dbgLog("doGlobalAgg:doReduce", "exception_in_doReduce",
-          "{\"what\":\"" + std::string(e.what()) +
-          "\",\"type\":\"" + typeid(e).name() +
-          "\",\"aggIdx\":" + std::to_string(i) +
-          ",\"planNode\":\"" + planNodeId() + "\"}");
+      LOG(ERROR) << "[AGT_A] doGlobalAgg:doReduce exception"
+                 << " what=" << e.what()
+                 << " type=" << typeid(e).name()
+                 << " aggIdx=" << i
+                 << " node=" << planNodeId();
       throw;
     }
     // #endregion
@@ -2347,23 +2327,23 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   // #region agent log
   } catch (const std::out_of_range& e) {
-    dbgLog("getOutput:escape", "out_of_range_escaped_to_getOutput",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
-        ",\"isGlobal\":" + std::to_string(isGlobal_) +
-        ",\"isDistinct\":" + std::to_string(isDistinct_) +
-        ",\"inputsEmpty\":" + std::to_string(inputs_.empty()) +
-        ",\"noMoreInput\":" + std::to_string(noMoreInput_) +
-        ",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] getOutput:escape OUT_OF_RANGE"
+               << " what=" << e.what()
+               << " partial=" << isPartialOutput_
+               << " global=" << isGlobal_
+               << " distinct=" << isDistinct_
+               << " inputsEmpty=" << inputs_.empty()
+               << " noMoreInput=" << noMoreInput_
+               << " node=" << planNodeId();
     throw;
   } catch (const std::exception& e) {
-    dbgLog("getOutput:escape", "other_exception_escaped_to_getOutput",
-        "{\"what\":\"" + std::string(e.what()) +
-        "\",\"type\":\"" + typeid(e).name() +
-        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
-        ",\"isGlobal\":" + std::to_string(isGlobal_) +
-        ",\"isDistinct\":" + std::to_string(isDistinct_) +
-        ",\"planNode\":\"" + planNodeId() + "\"}");
+    LOG(ERROR) << "[AGT_A] getOutput:escape OTHER_EXCEPTION"
+               << " what=" << e.what()
+               << " type=" << typeid(e).name()
+               << " partial=" << isPartialOutput_
+               << " global=" << isGlobal_
+               << " distinct=" << isDistinct_
+               << " node=" << planNodeId();
     throw;
   }
   // #endregion
