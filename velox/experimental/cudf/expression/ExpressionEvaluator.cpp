@@ -434,6 +434,19 @@ class BinaryFunction : public CudfFunction {
       }
       auto lhsView = asView(inputColumns[0]);
       auto rhsView = asView(inputColumns[1]);
+      std::unique_ptr<cudf::column> lhsD32, rhsD32;
+      if (lhsView.type().id() == cudf::type_id::DECIMAL32) {
+        lhsD32 = cudf::cast(lhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, lhsView.type().scale()},
+            stream, mr);
+        lhsView = lhsD32->view();
+      }
+      if (rhsView.type().id() == cudf::type_id::DECIMAL32) {
+        rhsD32 = cudf::cast(rhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, rhsView.type().scale()},
+            stream, mr);
+        rhsView = rhsD32->view();
+      }
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(rhsView.type())) {
         auto lhsScale = -lhsView.type().scale();
@@ -531,6 +544,13 @@ class BinaryFunction : public CudfFunction {
         return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
       }
       auto lhsView = asView(inputColumns[0]);
+      std::unique_ptr<cudf::column> lhsD32b;
+      if (lhsView.type().id() == cudf::type_id::DECIMAL32) {
+        lhsD32b = cudf::cast(lhsView,
+            cudf::data_type{cudf::type_id::DECIMAL64, lhsView.type().scale()},
+            stream, mr);
+        lhsView = lhsD32b->view();
+      }
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(right_->type())) {
         auto rhsCol =
@@ -594,8 +614,7 @@ class BinaryFunction : public CudfFunction {
               lhsView, rhsView, op_, type_, stream, mr);
         }
       }
-      return cudf::binary_operation(
-          asView(inputColumns[0]), *right_, op_, type_, stream, mr);
+      return cudf::binary_operation(lhsView, *right_, op_, type_, stream, mr);
     }
     if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
       auto rhsView = asView(inputColumns[0]);
@@ -635,6 +654,13 @@ class BinaryFunction : public CudfFunction {
       return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
     }
     auto rhsView = asView(inputColumns[0]);
+    std::unique_ptr<cudf::column> rhsD32c;
+    if (rhsView.type().id() == cudf::type_id::DECIMAL32) {
+      rhsD32c = cudf::cast(rhsView,
+          cudf::data_type{cudf::type_id::DECIMAL64, rhsView.type().scale()},
+          stream, mr);
+      rhsView = rhsD32c->view();
+    }
     if (isComparisonOp(op_) && cudf::is_fixed_point(left_->type()) &&
         cudf::is_fixed_point(rhsView.type())) {
       auto lhsCol =
