@@ -2038,8 +2038,6 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   try {
     aggregateResult = groupByOwner.aggregate(requests, stream);
   } catch (const std::out_of_range&) {
-    // cuDF's aggregate() internally uses vector::at() which throws when
-    // the groupby produces zero groups for certain aggregation types.
     return nullptr;
   }
   auto& [groupKeys, results] = aggregateResult;
@@ -2050,22 +2048,26 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     }
   }
 
-  // flatten the results
+  // Flatten aggregate results into columns. The makeOutputColumn() calls
+  // access results[idx].results[0] which can throw std::out_of_range if
+  // the aggregator's index doesn't match what aggregate() produced (e.g.,
+  // multi-request aggregators like AVG where sumIdx_/countIdx_ reference
+  // entries that cuDF left empty for zero-group results).
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
+  try {
+    auto groupKeysColumns = groupKeys->release();
+    resultColumns.insert(
+        resultColumns.begin(),
+        std::make_move_iterator(groupKeysColumns.begin()),
+        std::make_move_iterator(groupKeysColumns.end()));
 
-  // first fill the grouping keys
-  auto groupKeysColumns = groupKeys->release();
-  resultColumns.insert(
-      resultColumns.begin(),
-      std::make_move_iterator(groupKeysColumns.begin()),
-      std::make_move_iterator(groupKeysColumns.end()));
-
-  // then fill the aggregation results
-  for (auto& aggregator : aggregators) {
-    resultColumns.push_back(aggregator->makeOutputColumn(results, stream));
+    for (auto& aggregator : aggregators) {
+      resultColumns.push_back(aggregator->makeOutputColumn(results, stream));
+    }
+  } catch (const std::out_of_range&) {
+    return nullptr;
   }
 
-  // make a cudf table out of columns
   auto resultTable = std::make_unique<cudf::table>(std::move(resultColumns));
 
   auto numRows = resultTable->num_rows();
