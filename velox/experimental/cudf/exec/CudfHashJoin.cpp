@@ -150,6 +150,34 @@ bool isCudaRelatedError(const std::exception& e) {
       what.find("out_of_memory") != std::string::npos;
 }
 
+// Detect fatal (non-OOM) CUDA errors from the exception message.
+// rmm::cuda_error clears the sticky error via cudaGetLastError() in its
+// constructor, so cudaPeekAtLastError() often returns cudaSuccess even when
+// the GPU context is corrupted. Checking the exception message is the only
+// reliable way to distinguish OOM (retriable) from fatal errors.
+bool isFatalCudaError(const std::exception& e) {
+  std::string what = e.what();
+  static const char* fatalPatterns[] = {
+      "cudaErrorInvalidValue",
+      "cudaErrorIllegalAddress",
+      "cudaErrorIllegalInstruction",
+      "cudaErrorMisalignedAddress",
+      "cudaErrorInvalidConfiguration",
+      "cudaErrorInvalidDevice",
+      "cudaErrorInvalidPitchValue",
+      "cudaErrorDevicesUnavailable",
+      "cudaErrorAssert",
+      "cudaErrorECCUncorrectable",
+      "cudaErrorUnknown",
+  };
+  for (const auto* pat : fatalPatterns) {
+    if (what.find(pat) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
     cudf::table_view originalView,
@@ -379,6 +407,13 @@ void CudfHashJoinBuild::noMoreInput() {
               planNodeId(),
               e.what());
         }
+      }
+      if (isFatalCudaError(e)) {
+        VELOX_FAIL(
+            "Fatal CUDA error during build concatenation for planNode {} "
+            "(detected from exception message). Aborting: {}",
+            planNodeId(),
+            e.what());
       }
       if (attempt >= kOomMaxRetries) {
         throw;
@@ -2569,6 +2604,14 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
                     e.what());
               }
             }
+            if (isFatalCudaError(e)) {
+              VELOX_FAIL(
+                  "Fatal CUDA error building hash table for planNode {} "
+                  "batch {} (detected from exception message). Aborting: {}",
+                  joinNode_->id(),
+                  i,
+                  e.what());
+            }
             if (attempt >= kOomMaxRetries) {
               throw;
             }
@@ -2724,6 +2767,18 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         }
       }
 
+      // rmm::cuda_error clears the sticky error in its constructor, so
+      // cudaPeekAtLastError() may return cudaSuccess even for fatal errors.
+      // Fall back to checking the exception message for non-OOM CUDA errors.
+      if (isFatalCudaError(e)) {
+        VELOX_FAIL(
+            "Fatal CUDA error during join for planNode {} "
+            "(detected from exception message, not sticky error). "
+            "Aborting instead of retrying: {}",
+            joinNode_->id(),
+            e.what());
+      }
+
       // Check cumulative retry time budget to prevent timeout from infinite
       // OOM retry/split loops (Q93-style: retries consume >600s).
       auto retryElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2768,6 +2823,12 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           } catch (const std::exception& retryErr) {
             if (!isCudaRelatedError(retryErr)) {
               throw;
+            }
+            if (isFatalCudaError(retryErr)) {
+              VELOX_FAIL(
+                  "Fatal CUDA error during join retry for planNode {}: {}",
+                  joinNode_->id(),
+                  retryErr.what());
             }
             recoverGpuMemory();
           }
