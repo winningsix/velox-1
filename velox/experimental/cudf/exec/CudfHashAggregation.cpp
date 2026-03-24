@@ -43,9 +43,30 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
+#include <typeinfo>
 #include <vector>
+
+// #region agent log
+namespace {
+inline void dbgLog(const char* loc, const char* msg, const std::string& extra = "{}") {
+  try {
+    std::ofstream f("/home/ferdinandx/gtc/.cursor/debug-f8d699.log", std::ios::app);
+    if (f) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      f << "{\"sessionId\":\"f8d699\",\"location\":\"" << loc
+        << "\",\"message\":\"" << msg
+        << "\",\"data\":" << extra
+        << ",\"timestamp\":" << ms << "}\n";
+    }
+  } catch (...) {}
+}
+} // namespace
+// #endregion
 
 namespace {
 
@@ -1968,6 +1989,10 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  // #region agent log
+  try {
+  // #endregion
+
   if (isPartialOutput_ && !isGlobal_) {
     const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
     const auto targetRows = CudfConfig::getInstance().gpuTargetBatchRows;
@@ -2004,6 +2029,18 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
 
   // Handle final aggregation or global cases.
   inputs_.push_back(std::move(cudfInput));
+
+  // #region agent log
+  } catch (const std::out_of_range& e) {
+    dbgLog("addInput:escape", "out_of_range_escaped_to_addInput",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
+        ",\"isGlobal\":" + std::to_string(isGlobal_) +
+        ",\"isDistinct\":" + std::to_string(isDistinct_) +
+        ",\"planNode\":\"" + planNodeId() + "\"}");
+    throw;
+  }
+  // #endregion
 }
 
 CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
@@ -2011,6 +2048,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
+  // #region agent log
+  dbgLog("doGroupByAgg:entry", "enter",
+      "{\"rows\":" + std::to_string(tableView.num_rows()) +
+      ",\"cols\":" + std::to_string(tableView.num_columns()) +
+      ",\"nKeys\":" + std::to_string(groupByKeys.size()) +
+      ",\"nAgg\":" + std::to_string(aggregators.size()) +
+      ",\"planNode\":\"" + planNodeId() + "\"}");
+  // #endregion
   if (tableView.num_rows() == 0) {
     return nullptr;
   }
@@ -2020,39 +2065,55 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   size_t const numGroupingKeys = groupbyKeyView.num_columns();
 
-  // TODO: All other args to groupby are related to sort groupby. We don't
-  // support optimizations related to it yet.
   cudf::groupby::groupby groupByOwner(
       groupbyKeyView,
       ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
                       : cudf::null_policy::INCLUDE);
 
   std::vector<cudf::groupby::aggregation_request> requests;
+  // #region agent log
+  try {
+  // #endregion
   for (auto& aggregator : aggregators) {
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
+  // #region agent log
+  } catch (const std::exception& e) {
+    dbgLog("doGroupByAgg:addRequest", "exception_in_addGroupbyRequest",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"type\":\"" + typeid(e).name() +
+        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    throw;
+  }
+  // #endregion
 
   std::pair<std::unique_ptr<cudf::table>,
             std::vector<cudf::groupby::aggregation_result>>
       aggregateResult;
   try {
     aggregateResult = groupByOwner.aggregate(requests, stream);
-  } catch (const std::out_of_range&) {
+  } catch (const std::out_of_range& e) {
+    // #region agent log
+    dbgLog("doGroupByAgg:aggregate", "caught_out_of_range_in_aggregate",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    // #endregion
     return nullptr;
   }
   auto& [groupKeys, results] = aggregateResult;
 
   for (size_t i = 0; i < results.size(); ++i) {
     if (results[i].results.empty()) {
+      // #region agent log
+      dbgLog("doGroupByAgg:emptyGuard", "results_inner_empty",
+          "{\"i\":" + std::to_string(i) +
+          ",\"resultsSize\":" + std::to_string(results.size()) +
+          ",\"planNode\":\"" + planNodeId() + "\"}");
+      // #endregion
       return nullptr;
     }
   }
 
-  // Flatten aggregate results into columns. The makeOutputColumn() calls
-  // access results[idx].results[0] which can throw std::out_of_range if
-  // the aggregator's index doesn't match what aggregate() produced (e.g.,
-  // multi-request aggregators like AVG where sumIdx_/countIdx_ reference
-  // entries that cuDF left empty for zero-group results).
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   try {
     auto groupKeysColumns = groupKeys->release();
@@ -2064,7 +2125,12 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     for (auto& aggregator : aggregators) {
       resultColumns.push_back(aggregator->makeOutputColumn(results, stream));
     }
-  } catch (const std::out_of_range&) {
+  } catch (const std::out_of_range& e) {
+    // #region agent log
+    dbgLog("doGroupByAgg:makeOutput", "caught_out_of_range_in_makeOutput",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"planNode\":\"" + planNodeId() + "\"}");
+    // #endregion
     return nullptr;
   }
 
@@ -2076,6 +2142,11 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     return nullptr;
   }
 
+  // #region agent log
+  dbgLog("doGroupByAgg:exit", "success",
+      "{\"numRows\":" + std::to_string(numRows) +
+      ",\"planNode\":\"" + planNodeId() + "\"}");
+  // #endregion
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(resultTable), stream);
 }
@@ -2083,11 +2154,31 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
+  // #region agent log
+  dbgLog("doGlobalAgg:entry", "enter",
+      "{\"rows\":" + std::to_string(tableView.num_rows()) +
+      ",\"cols\":" + std::to_string(tableView.num_columns()) +
+      ",\"nAgg\":" + std::to_string(aggregators_.size()) +
+      ",\"planNode\":\"" + planNodeId() + "\"}");
+  // #endregion
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   for (auto i = 0; i < aggregators_.size(); i++) {
+    // #region agent log
+    try {
+    // #endregion
     resultColumns.push_back(
         aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
+    // #region agent log
+    } catch (const std::exception& e) {
+      dbgLog("doGlobalAgg:doReduce", "exception_in_doReduce",
+          "{\"what\":\"" + std::string(e.what()) +
+          "\",\"type\":\"" + typeid(e).name() +
+          "\",\"aggIdx\":" + std::to_string(i) +
+          ",\"planNode\":\"" + planNodeId() + "\"}");
+      throw;
+    }
+    // #endregion
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
@@ -2164,17 +2255,18 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
 
+  // #region agent log
+  try {
+  // #endregion
+
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {
     if (partialOutput_ &&
         partialOutput_->estimateFlatSize() >
             maxPartialAggregationMemoryUsage_) {
-      // This is basically a flush of the partial output.
       return releaseAndResetPartialOutput();
     }
     if (not noMoreInput_) {
-      // Don't produce output if the partial output hasn't reached memory limit
-      // and there's more batches to come.
       return nullptr;
     }
     if (!partialOutput_ && finished_) {
@@ -2188,8 +2280,6 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   }
 
   if (!isPartialOutput_ && !noMoreInput_) {
-    // Final aggregation has to wait for all batches to arrive so we cannot
-    // return any results here.
     return nullptr;
   }
 
@@ -2254,6 +2344,29 @@ RowVectorPtr CudfHashAggregation::getOutput() {
         planNodeId(),
         e.what());
   }
+
+  // #region agent log
+  } catch (const std::out_of_range& e) {
+    dbgLog("getOutput:escape", "out_of_range_escaped_to_getOutput",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
+        ",\"isGlobal\":" + std::to_string(isGlobal_) +
+        ",\"isDistinct\":" + std::to_string(isDistinct_) +
+        ",\"inputsEmpty\":" + std::to_string(inputs_.empty()) +
+        ",\"noMoreInput\":" + std::to_string(noMoreInput_) +
+        ",\"planNode\":\"" + planNodeId() + "\"}");
+    throw;
+  } catch (const std::exception& e) {
+    dbgLog("getOutput:escape", "other_exception_escaped_to_getOutput",
+        "{\"what\":\"" + std::string(e.what()) +
+        "\",\"type\":\"" + typeid(e).name() +
+        "\",\"isPartial\":" + std::to_string(isPartialOutput_) +
+        ",\"isGlobal\":" + std::to_string(isGlobal_) +
+        ",\"isDistinct\":" + std::to_string(isDistinct_) +
+        ",\"planNode\":\"" + planNodeId() + "\"}");
+    throw;
+  }
+  // #endregion
 }
 
 void CudfHashAggregation::noMoreInput() {
