@@ -37,8 +37,6 @@
 
 #include "folly/Conv.h"
 #include "velox/exec/AssignUniqueId.h"
-#include "velox/expression/ConstantExpr.h"
-#include "velox/vector/ConstantVector.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/FilterProject.h"
@@ -54,10 +52,8 @@
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/logger.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda.h>
@@ -72,66 +68,6 @@ static const std::string kCudfAdapterName = "cuDF";
 namespace facebook::velox::cudf_velox {
 
 namespace {
-
-/// CudfFunction that implements Spark's make_decimal special form.
-/// make_decimal takes a BIGINT (unscaled value) and reinterprets it as
-/// DECIMAL(precision, scale).  The raw integer IS the stored fixed-point
-/// representation, so no arithmetic scaling is needed - only a type change.
-class MakeDecimalCudfFunction : public CudfFunction {
- public:
-  explicit MakeDecimalCudfFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr) {
-    auto outputType = expr->type();
-    VELOX_CHECK(outputType->isDecimal(), "make_decimal output must be decimal");
-    targetType_ = veloxToCudfDataType(outputType);
-
-    auto [precision, scale] = getDecimalPrecisionScale(*outputType);
-    precision_ = precision;
-
-    if (expr->inputs().size() > 1) {
-      auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-          expr->inputs()[1]);
-      if (constExpr && constExpr->value() && !constExpr->value()->isNullAt(0)) {
-        nullOnOverflow_ =
-            constExpr->value()
-                ->asUnchecked<ConstantVector<bool>>()
-                ->valueAt(0);
-      }
-    }
-  }
-
-  ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const override {
-    auto inputCol = asView(inputColumns[0]);
-
-    if (targetType_.id() == cudf::type_id::DECIMAL64) {
-      // INT64 and DECIMAL64 are both 8-byte types. Reinterpret directly.
-      cudf::column_view reinterpreted(
-          targetType_,
-          inputCol.size(),
-          inputCol.head(),
-          inputCol.null_mask(),
-          inputCol.null_count());
-      return std::make_unique<cudf::column>(reinterpreted, stream, mr);
-    }
-
-    // DECIMAL128: widen to 128-bit without scaling, then reinterpret.
-    auto d128NoScale =
-        cudf::data_type{cudf::type_id::DECIMAL128, numeric::scale_type{0}};
-    auto widened = cudf::cast(inputCol, d128NoScale, stream, mr);
-    auto wv = widened->view();
-    cudf::column_view reinterpreted(
-        targetType_, wv.size(), wv.head(), wv.null_mask(), wv.null_count());
-    return std::make_unique<cudf::column>(reinterpreted, stream, mr);
-  }
-
- private:
-  cudf::data_type targetType_;
-  uint8_t precision_;
-  bool nullOnOverflow_ = true;
-};
 
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
@@ -404,33 +340,6 @@ void registerCudf() {
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
   registerStepAwareBuiltinAggregationFunctions(prefix);
-
-  // make_decimal: Spark special form that reinterprets a BIGINT unscaled
-  // value as DECIMAL(p,s).  Register both the CudfFunction factory (used by
-  // FunctionExpression::create) and a CudfExpressionEvaluator (used by
-  // canBeEvaluatedByCudf).  Signatures are left empty because the output
-  // type is determined by the plan, not inferrable from input types alone.
-  registerCudfFunction(
-      "make_decimal",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<MakeDecimalCudfFunction>(expr);
-      },
-      {});
-
-  registerCudfExpressionEvaluator(
-      "make_decimal",
-      100,
-      [](std::shared_ptr<velox::exec::Expr> expr) {
-        return expr->name() == "make_decimal" && expr->type()->isDecimal() &&
-            !expr->inputs().empty() &&
-            expr->inputs()[0]->type()->kind() == TypeKind::BIGINT;
-      },
-      [](std::shared_ptr<velox::exec::Expr> expr,
-         const RowTypePtr& inputRowSchema) {
-        return FunctionExpression::create(expr, inputRowSchema);
-      },
-      /*overwrite=*/false);
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
