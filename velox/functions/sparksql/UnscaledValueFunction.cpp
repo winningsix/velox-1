@@ -20,6 +20,8 @@
 namespace facebook::velox::functions::sparksql {
 namespace {
 
+// Return the unscaled bigint value of a decimal, assuming it
+// fits in a bigint. Only short decimal input is accepted.
 class UnscaledValueFunction final : public exec::VectorFunction {
   void apply(
       const SelectivityVector& rows,
@@ -28,46 +30,25 @@ class UnscaledValueFunction final : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& result) const final {
     VELOX_USER_CHECK(
-        args[0]->type()->isDecimal(),
-        "Expect decimal type, but got: {}",
+        args[0]->type()->isShortDecimal(),
+        "Expect short decimal type, but got: {}",
         args[0]->type());
-
     VectorPtr localResult;
     const auto& arg = args[0];
-
-    if (arg->type()->isShortDecimal()) {
-      if (arg->isConstantEncoding()) {
-        auto value = arg->as<ConstantVector<int64_t>>()->valueAt(0);
-        localResult = std::make_shared<ConstantVector<int64_t>>(
-            context.pool(), rows.end(), false, BIGINT(), std::move(value));
-      } else {
-        auto flatInput = arg->asFlatVector<int64_t>();
-        localResult = std::make_shared<FlatVector<int64_t>>(
-            context.pool(),
-            BIGINT(),
-            nullptr,
-            rows.end(),
-            flatInput->values(),
-            std::vector<BufferPtr>());
-      }
+    if (arg->isConstantEncoding()) {
+      auto value = arg->as<ConstantVector<int64_t>>()->valueAt(0);
+      localResult = std::make_shared<ConstantVector<int64_t>>(
+          context.pool(), rows.end(), false, BIGINT(), std::move(value));
     } else {
-      // Long decimal (int128_t): narrow each value to int64_t.
-      auto flatResult = BaseVector::create(BIGINT(), rows.end(), context.pool());
-      auto rawResults = flatResult->as<FlatVector<int64_t>>()->mutableRawValues();
-
-      if (arg->isConstantEncoding()) {
-        auto value = arg->as<ConstantVector<int128_t>>()->valueAt(0);
-        auto narrowed = static_cast<int64_t>(value);
-        rows.applyToSelected([&](auto row) { rawResults[row] = narrowed; });
-      } else {
-        auto flatInput = arg->asFlatVector<int128_t>();
-        rows.applyToSelected([&](auto row) {
-          rawResults[row] = static_cast<int64_t>(flatInput->valueAt(row));
-        });
-      }
-      localResult = std::move(flatResult);
+      auto flatInput = arg->asFlatVector<int64_t>();
+      localResult = std::make_shared<FlatVector<int64_t>>(
+          context.pool(),
+          BIGINT(),
+          nullptr,
+          rows.end(),
+          flatInput->values(),
+          std::vector<BufferPtr>());
     }
-
     context.moveOrCopyResult(localResult, rows, result);
   }
 };
@@ -76,7 +57,8 @@ class UnscaledValueFunction final : public exec::VectorFunction {
 std::vector<std::shared_ptr<exec::FunctionSignature>>
 unscaledValueSignatures() {
   return {exec::FunctionSignatureBuilder()
-              .integerVariable("precision")
+              // precision <= 18.
+              .integerVariable("precision", "min(precision, 18)")
               .integerVariable("scale")
               .returnType("bigint")
               .argumentType("DECIMAL(precision, scale)")
