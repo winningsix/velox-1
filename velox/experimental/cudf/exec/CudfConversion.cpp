@@ -161,11 +161,14 @@ CudfFromVelox::CudfFromVelox(
 void CudfFromVelox::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input->size() > 0) {
-    // Materialize lazy vectors
-    for (auto& child : input->children()) {
-      child->loadedVector();
+    if (!std::dynamic_pointer_cast<CudfVector>(input)) {
+      // Materialize lazy vectors (only for regular RowVectors; CudfVector
+      // stores data in cudf::table without Velox child vectors).
+      for (auto& child : input->children()) {
+        child->loadedVector();
+      }
+      input->loadedVector();
     }
-    input->loadedVector();
 
     // Accumulate inputs
     currentOutputBytes_ += input->estimateFlatSize();
@@ -218,6 +221,29 @@ RowVectorPtr CudfFromVelox::getOutput() {
   // Early return if no input
   if (totalSize == 0) {
     return nullptr;
+  }
+
+  // If the input is already a CudfVector (already in cuDF format), pass it
+  // through without Velox→cuDF conversion. CudfVector has childrenSize_=0
+  // so toCudfTableBatched would crash trying to access child vectors.
+  if (std::dynamic_pointer_cast<CudfVector>(selectedInputs[0])) {
+    if (selectedInputs.size() == 1) {
+      return std::static_pointer_cast<CudfVector>(selectedInputs[0]);
+    }
+    std::vector<CudfVectorPtr> cudfInputs;
+    cudfInputs.reserve(selectedInputs.size());
+    for (auto& input : selectedInputs) {
+      auto cv = std::dynamic_pointer_cast<CudfVector>(input);
+      VELOX_CHECK_NOT_NULL(cv);
+      cudfInputs.push_back(std::move(cv));
+    }
+    auto stream = cudfInputs[0]->stream();
+    auto tbl = getConcatenatedTable(cudfInputs, outputType_, stream);
+    auto rows = tbl->num_rows();
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("numCoalescedBatches", RuntimeCounter(1));
+    return std::make_shared<CudfVector>(
+        pool(), outputType_, rows, std::move(tbl), stream);
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
