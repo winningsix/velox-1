@@ -1167,15 +1167,45 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     try {
       if (joinNode_->filter()) {
         if (useAstFilter_) {
-          cudfOutputs.push_back(filteredOutputIndices(
-              leftTableView,
-              leftIndicesCol,
-              rightTableView,
-              rightIndicesCol,
-              extendedLeftView,
-              extendedRightView,
-              cudf::join_kind::INNER_JOIN,
-              stream));
+          try {
+            cudfOutputs.push_back(filteredOutputIndices(
+                leftTableView,
+                leftIndicesCol,
+                rightTableView,
+                rightIndicesCol,
+                extendedLeftView,
+                extendedRightView,
+                cudf::join_kind::INNER_JOIN,
+                stream));
+          } catch (const std::bad_alloc&) {
+            throw;
+          } catch (const std::exception& astE) {
+            if (isCudaRelatedError(astE)) {
+              throw;
+            }
+            LOG(WARNING)
+                << "CudfHashJoinProbe::innerJoin: AST filter failed for "
+                << "planNode " << joinNode_->id()
+                << ", falling back to evaluator: " << astE.what();
+            useAstFilter_ = false;
+            auto filterFunc =
+                [stream](
+                    std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
+                    cudf::column_view filterColumn) {
+                  auto filterTable =
+                      std::make_unique<cudf::table>(std::move(joinedCols));
+                  auto filteredTable = cudf::apply_boolean_mask(
+                      *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
+                  return filteredTable->release();
+                };
+            cudfOutputs.push_back(filteredOutput(
+                leftTableView,
+                leftIndicesCol,
+                rightTableView,
+                rightIndicesCol,
+                filterFunc,
+                stream));
+          }
         } else {
           auto filterFunc =
               [stream](
@@ -1293,15 +1323,45 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
 
     if (joinNode_->filter()) {
       if (useAstFilter_) {
-        cudfOutputs.push_back(filteredOutputIndices(
-            leftTableView,
-            leftIndicesCol,
-            rightTableView,
-            rightIndicesCol,
-            extendedLeftView,
-            extendedRightView,
-            cudf::join_kind::LEFT_JOIN,
-            stream));
+        try {
+          cudfOutputs.push_back(filteredOutputIndices(
+              leftTableView,
+              leftIndicesCol,
+              rightTableView,
+              rightIndicesCol,
+              extendedLeftView,
+              extendedRightView,
+              cudf::join_kind::LEFT_JOIN,
+              stream));
+        } catch (const std::bad_alloc&) {
+          throw;
+        } catch (const std::exception& astE) {
+          if (isCudaRelatedError(astE)) {
+            throw;
+          }
+          LOG(WARNING)
+              << "CudfHashJoinProbe::leftJoin: AST filter failed for "
+              << "planNode " << joinNode_->id()
+              << ", falling back to evaluator: " << astE.what();
+          useAstFilter_ = false;
+          auto filterFunc =
+              [stream](
+                  std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
+                  cudf::column_view filterColumn) {
+                auto filterTable =
+                    std::make_unique<cudf::table>(std::move(joinedCols));
+                auto filteredTable = cudf::apply_boolean_mask(
+                    *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
+                return filteredTable->release();
+              };
+          cudfOutputs.push_back(filteredOutput(
+              leftTableView,
+              leftIndicesCol,
+              rightTableView,
+              rightIndicesCol,
+              filterFunc,
+              stream));
+        }
       } else {
         auto filterFunc =
             [stream](
