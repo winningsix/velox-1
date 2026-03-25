@@ -53,23 +53,6 @@ namespace {
 using namespace facebook::velox;
 using namespace facebook::velox::cudf_velox;
 
-// Safe accessor for cudf groupby aggregation results. Returns nullptr if the
-// requested index is out of bounds, preventing vector::_M_range_check crashes
-// when cudf returns fewer results than expected (e.g. from type mismatches
-// or empty input edge cases).
-inline std::unique_ptr<cudf::column>* safeResultPtr(
-    std::vector<cudf::groupby::aggregation_result>& results,
-    uint32_t outerIdx,
-    uint32_t innerIdx = 0) {
-  if (outerIdx >= results.size()) {
-    return nullptr;
-  }
-  if (innerIdx >= results[outerIdx].results.size()) {
-    return nullptr;
-  }
-  return &results[outerIdx].results[innerIdx];
-}
-
 #define DEFINE_SIMPLE_AGGREGATOR(Name, name, KIND)                            \
   struct Name##Aggregator : cudf_velox::CudfHashAggregation::Aggregator {     \
     Name##Aggregator(                                                         \
@@ -103,9 +86,7 @@ inline std::unique_ptr<cudf::column>* safeResultPtr(
     std::unique_ptr<cudf::column> makeOutputColumn(                           \
         std::vector<cudf::groupby::aggregation_result>& results,              \
         rmm::cuda_stream_view stream) override {                              \
-      auto* ptr = safeResultPtr(results, output_idx, 0);                      \
-      if (!ptr) return nullptr;                                               \
-      auto col = std::move(*ptr);                                             \
+      auto col = std::move(results[output_idx].results[0]);                   \
       auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);   \
       if (col->type() != cudfResType) {                                       \
         col = cudf::cast(*col, cudfResType, stream, cudf::get_current_device_resource_ref());         \
@@ -230,19 +211,13 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
-    auto* colPtr = safeResultPtr(results, sumIdx_, 0);
-    if (!colPtr) return nullptr;
-    auto col = std::move(*colPtr);
+    auto col = std::move(results[sumIdx_].results[0]);
     if (isAvg_ && step == core::AggregationNode::Step::kSingle) {
-      auto* cntPtr = safeResultPtr(results, sumIdx_, 1);
-      if (!cntPtr) return nullptr;
-      auto count = std::move(*cntPtr);
+      auto count = std::move(results[sumIdx_].results[1]);
       return computeAvgColumn(std::move(col), std::move(count), stream);
     }
     if (step == core::AggregationNode::Step::kPartial) {
-      auto* cntPtr = safeResultPtr(results, sumIdx_, 1);
-      if (!cntPtr) return nullptr;
-      auto count = std::move(*cntPtr);
+      auto count = std::move(results[sumIdx_].results[1]);
       if (count->type().id() != cudf::type_id::INT64) {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
@@ -267,9 +242,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           std::move(children));
     }
     if (step == core::AggregationNode::Step::kIntermediate) {
-      auto* cntPtr = safeResultPtr(results, countIdx_, 0);
-      if (!cntPtr) return nullptr;
-      auto count = std::move(*cntPtr);
+      auto count = std::move(results[countIdx_].results[0]);
       if (count->type().id() != cudf::type_id::INT64) {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
@@ -294,9 +267,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           std::move(children));
     }
     if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
-      auto* cntPtr = safeResultPtr(results, countIdx_, 0);
-      if (!cntPtr) return nullptr;
-      auto count = std::move(*cntPtr);
+      auto count = std::move(results[countIdx_].results[0]);
       return computeAvgColumn(std::move(col), std::move(count), stream);
     }
     auto const cudfResType = cudf_velox::veloxToCudfDataType(resultType);
@@ -519,9 +490,8 @@ struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
-    auto* ptr = safeResultPtr(results, outputIdx_, 0);
-    if (!ptr) return nullptr;
-    auto col = std::move(*ptr);
+    // cudf produces int32 for count(0) but velox expects int64
+    auto col = std::move(results[outputIdx_].results[0]);
     const auto cudfOutputType = cudf_velox::veloxToCudfDataType(resultType);
     if (col->type() != cudfOutputType) {
       col = cudf::cast(*col, cudfOutputType, stream);
@@ -602,17 +572,11 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       rmm::cuda_stream_view stream) override {
     const auto& outputType = asRowType(resultType);
     switch (step) {
-      case core::AggregationNode::Step::kSingle: {
-        auto* ptr = safeResultPtr(results, meanIdx_, 0);
-        if (!ptr) return nullptr;
-        return std::move(*ptr);
-      }
+      case core::AggregationNode::Step::kSingle:
+        return std::move(results[meanIdx_].results[0]);
       case core::AggregationNode::Step::kPartial: {
-        auto* sumPtr = safeResultPtr(results, sumIdx_, 0);
-        auto* cntPtr = safeResultPtr(results, sumIdx_, 1);
-        if (!sumPtr || !cntPtr) return nullptr;
-        auto sum = std::move(*sumPtr);
-        auto count = std::move(*cntPtr);
+        auto sum = std::move(results[sumIdx_].results[0]);
+        auto count = std::move(results[sumIdx_].results[1]);
 
         auto const size = sum->size();
         auto const cudfSumType =
@@ -630,6 +594,8 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         children.push_back(std::move(sum));
         children.push_back(std::move(count));
 
+        // TODO: Handle nulls. This can happen if all values are null in a
+        // group.
         return std::make_unique<cudf::column>(
             cudf::data_type(cudf::type_id::STRUCT),
             size,
@@ -639,11 +605,14 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             std::move(children));
       }
       case core::AggregationNode::Step::kIntermediate: {
-        auto* sumPtr = safeResultPtr(results, sumIdx_, 0);
-        auto* cntPtr = safeResultPtr(results, countIdx_, 0);
-        if (!sumPtr || !cntPtr) return nullptr;
-        auto sum = std::move(*sumPtr);
-        auto count = std::move(*cntPtr);
+        // The difference between intermediate and partial is in where the
+        // sum and count are coming from. In partial, since the input column is
+        // the same, the sum and count are in the same agg result. In
+        // intermediate, the input columns are different (it's the child
+        // columns of the input column) and so the sum and count are in
+        // different agg results.
+        auto sum = std::move(results[sumIdx_].results[0]);
+        auto count = std::move(results[countIdx_].results[0]);
 
         auto size = sum->size();
         auto const cudfSumType =
@@ -670,11 +639,8 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             std::move(children));
       }
       case core::AggregationNode::Step::kFinal: {
-        auto* sumPtr = safeResultPtr(results, sumIdx_, 0);
-        auto* cntPtr = safeResultPtr(results, countIdx_, 0);
-        if (!sumPtr || !cntPtr) return nullptr;
-        auto sum = std::move(*sumPtr);
-        auto count = std::move(*cntPtr);
+        auto sum = std::move(results[sumIdx_].results[0]);
+        auto count = std::move(results[countIdx_].results[0]);
         auto avg = cudf::binary_operation(
             *sum,
             *count,
@@ -1175,18 +1141,12 @@ struct VarianceAggregator : cudf_velox::CudfHashAggregation::Aggregator {
     auto mr = cudf::get_current_device_resource_ref();
     switch (step) {
       case core::AggregationNode::Step::kSingle: {
-        auto* ptr = safeResultPtr(results, singleIdx_, 0);
-        if (!ptr) return nullptr;
-        return std::move(*ptr);
+        return std::move(results[singleIdx_].results[0]);
       }
       case core::AggregationNode::Step::kPartial: {
-        auto* countPtr = safeResultPtr(results, partialIdx_, 0);
-        auto* meanPtr = safeResultPtr(results, partialIdx_, 1);
-        auto* m2Ptr = safeResultPtr(results, partialIdx_, 2);
-        if (!countPtr || !meanPtr || !m2Ptr) return nullptr;
-        auto count = std::move(*countPtr);
-        auto mean = std::move(*meanPtr);
-        auto m2 = std::move(*m2Ptr);
+        auto count = std::move(results[partialIdx_].results[0]);
+        auto mean = std::move(results[partialIdx_].results[1]);
+        auto m2 = std::move(results[partialIdx_].results[2]);
 
         auto const& rowType = asRowType(resultType);
         auto const cudfCountType =
@@ -1219,9 +1179,9 @@ struct VarianceAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             std::move(children));
       }
       case core::AggregationNode::Step::kIntermediate: {
-        auto* mergePtr = safeResultPtr(results, mergeIdx_, 0);
-        if (!mergePtr) return nullptr;
-        auto mergedStruct = std::move(*mergePtr);
+        // MERGE_M2 returns struct(count, mean, m2).
+        // The output count type matches the input count type (INT64).
+        auto mergedStruct = std::move(results[mergeIdx_].results[0]);
         auto const& rowType = asRowType(resultType);
         auto const cudfCountType =
             cudf_velox::veloxToCudfDataType(rowType->childAt(0));
@@ -1250,9 +1210,8 @@ struct VarianceAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         return mergedStruct;
       }
       case core::AggregationNode::Step::kFinal: {
-        auto* mergePtr = safeResultPtr(results, mergeIdx_, 0);
-        if (!mergePtr) return nullptr;
-        auto mergedStruct = std::move(*mergePtr);
+        // MERGE_M2 returns struct(count, mean, m2). Compute final result.
+        auto mergedStruct = std::move(results[mergeIdx_].results[0]);
         auto const countCol = mergedStruct->view().child(0);
         auto const m2Col = mergedStruct->view().child(2);
 

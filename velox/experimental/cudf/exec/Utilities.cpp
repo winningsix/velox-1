@@ -24,7 +24,6 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -182,13 +181,6 @@ uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
   }
   return totalBytes;
 }
-
-namespace {
-void alignDecimalColumnsForConcat(
-    std::vector<cudf::table_view>& tableViews,
-    std::vector<std::unique_ptr<cudf::table>>& castStorage,
-    rmm::cuda_stream_view stream);
-} // namespace
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
