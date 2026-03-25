@@ -2087,7 +2087,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   try {
     for (size_t ai = 0; ai < aggregators.size(); ++ai) {
       auto& aggregator = aggregators[ai];
-      if (aggregator->inputIndex >= static_cast<uint32_t>(tableView.num_columns())) {
+      if (aggregator->constant == nullptr &&
+          aggregator->inputIndex >= static_cast<uint32_t>(tableView.num_columns())) {
         LOG(ERROR) << "[DIAG] doGroupByAgg node=" << planNodeId()
                    << " aggregator[" << ai << "] inputIndex="
                    << aggregator->inputIndex
