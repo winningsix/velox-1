@@ -1093,6 +1093,10 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
 
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
+
     // Use cached precomputed columns for right (build) table
     cudf::table_view extendedRightView =
         (joinNode_->filter() && useAstFilter_ &&
@@ -1125,6 +1129,21 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
           buildStream_.has_value() ? buildStream_.value() : stream);
     } catch (const std::exception& e) {
       if (isCudaRelatedError(e)) {
+        LOG(ERROR)
+            << "CUDA error in inner_join for planNode " << joinNode_->id()
+            << ": probe=" << leftTableView.num_rows()
+            << " rows, build=" << rightTableView.num_rows()
+            << " rows, probeKeyCols=" << leftKeyIndices_.size()
+            << ", buildKeyCols=" << rightKeyIndices_.size()
+            << ". Key types: ";
+        for (size_t k = 0; k < leftKeyIndices_.size(); ++k) {
+          auto pType = leftTableView.column(leftKeyIndices_[k]).type();
+          auto bType = rightTableView.column(rightKeyIndices_[k]).type();
+          LOG(ERROR) << "  key[" << k << "]: probe=" << static_cast<int>(pType.id())
+                     << " (scale=" << pType.scale() << ")"
+                     << " build=" << static_cast<int>(bType.id())
+                     << " (scale=" << bType.scale() << ")";
+        }
         throw;
       }
       VELOX_FAIL(
@@ -1290,6 +1309,10 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
 
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
+
     // Use cached precomputed columns for right (build) table
     cudf::table_view extendedRightView =
         (joinNode_->filter() && useAstFilter_ &&
@@ -1405,12 +1428,20 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
 
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
+
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
     }
+    std::vector<std::unique_ptr<cudf::column>> keyCastsRJ;
+    auto alignedProbeRJ = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        keyCastsRJ, stream);
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
+        alignedProbeRJ.select(leftKeyIndices_),
         std::nullopt,
         buildStream_.has_value() ? buildStream_.value() : stream);
     if (buildStream_.has_value()) {
@@ -1528,6 +1559,10 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
+
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
 
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
@@ -1649,6 +1684,16 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
 
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
+
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> keyCastsLSF;
+    auto alignedLeft = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        keyCastsLSF, stream);
+
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
 
     if (joinNode_->filter()) {
@@ -1656,7 +1701,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
         VELOX_NYI("Join filter requires AST for semi joins");
       }
       leftJoinIndices = cudf::mixed_left_semi_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedLeft.select(leftKeyIndices_),
           rightTableView.select(rightKeyIndices_),
           leftTableView,
           rightTableView,
@@ -1671,7 +1716,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
           cudf::set_as_build_table::RIGHT,
           stream);
       leftJoinIndices = filter_join.semi_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedLeft.select(leftKeyIndices_),
           stream,
           cudf::get_current_device_resource_ref());
     }
@@ -1720,12 +1765,22 @@ CudfHashJoinProbe::leftSemiProjectJoin(
 
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
+
+    if (rightTableView.num_rows() == 0) {
+      continue;
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> keyCastsLSP;
+    auto alignedLeft = alignProbeKeyTypes(
+        leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+        keyCastsLSP, stream);
+
     std::unique_ptr<rmm::device_uvector<cudf::size_type>>
         leftJoinIndices;
 
     if (joinNode_->filter()) {
       leftJoinIndices = cudf::mixed_left_semi_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedLeft.select(leftKeyIndices_),
           rightTableView.select(rightKeyIndices_),
           leftTableView,
           rightTableView,
@@ -1740,7 +1795,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
           cudf::set_as_build_table::RIGHT,
           stream);
       leftJoinIndices = filter_join.semi_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedLeft.select(leftKeyIndices_),
           stream,
           cudf::get_current_device_resource_ref());
     }
@@ -1862,13 +1917,22 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       1,
       "Multiple right tables not yet supported for rightSemiFilterJoin");
 
+  if (rightTableView.num_rows() == 0 || leftTableView.num_rows() == 0) {
+    return cudfOutputs;
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> keyCastsRSF;
+  auto alignedRight = alignProbeKeyTypes(
+      rightTableView, rightKeyIndices_, leftTableView, leftKeyIndices_,
+      keyCastsRSF, stream);
+
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightJoinIndices;
   if (joinNode_->filter()) {
     if (!useAstFilter_) {
       VELOX_NYI("Join filter requires AST for semi joins");
     }
     rightJoinIndices = cudf::mixed_left_semi_join(
-        rightTableView.select(rightKeyIndices_),
+        alignedRight.select(rightKeyIndices_),
         leftTableView.select(leftKeyIndices_),
         rightTableView,
         leftTableView,
@@ -1883,7 +1947,7 @@ CudfHashJoinProbe::rightSemiFilterJoin(
         cudf::set_as_build_table::RIGHT,
         stream);
     rightJoinIndices = filter_join.semi_join(
-        rightTableView.select(rightKeyIndices_),
+        alignedRight.select(rightKeyIndices_),
         stream,
         cudf::get_current_device_resource_ref());
   }
@@ -1939,6 +2003,11 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
     }
   }
 
+  std::vector<std::unique_ptr<cudf::column>> keyCastsAnti;
+  auto alignedLeft = alignProbeKeyTypes(
+      leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
+      keyCastsAnti, stream);
+
   std::unique_ptr<rmm::device_uvector<cudf::size_type>>
       leftJoinIndices;
   if (joinNode_->filter()) {
@@ -1946,7 +2015,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       VELOX_NYI("Join filter requires AST for anti joins");
     }
     leftJoinIndices = cudf::mixed_left_anti_join(
-        leftTableView.select(leftKeyIndices_),
+        alignedLeft.select(leftKeyIndices_),
         rightTableView.select(rightKeyIndices_),
         leftTableView,
         rightTableView,
@@ -1969,7 +2038,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
           cudf::set_as_build_table::RIGHT,
           stream);
       leftJoinIndices = filter_join.anti_join(
-          leftTableView.select(leftKeyIndices_),
+          alignedLeft.select(leftKeyIndices_),
           stream,
           mr);
     }
@@ -2005,6 +2074,12 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
   auto buildHasNullKeys =
       cudf::has_nulls(rightTableView.select(rightKeyIndices_));
 
+  // Align DECIMAL key types between probe and build
+  std::vector<std::unique_ptr<cudf::column>> keyCastsNAAJ;
+  auto alignedLeftNonNull = alignProbeKeyTypes(
+      leftNonNull, leftKeyIndices_, rightTableView, rightKeyIndices_,
+      keyCastsNAAJ, stream);
+
   std::unique_ptr<cudf::column> rowIndices;
   std::unique_ptr<cudf::column> candidateMask;
   if (leftN > 0) {
@@ -2033,8 +2108,13 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
       auto rightNonNull = cudf::drop_nulls(
           rightTableView, rightKeyIndices_, stream);
       if (rightNonNull->num_rows() > 0) {
+        std::vector<std::unique_ptr<cudf::column>> keyCastsNNR;
+        auto alignedLeftNN = alignProbeKeyTypes(
+            leftNonNull, leftKeyIndices_,
+            rightNonNull->view(), rightKeyIndices_,
+            keyCastsNNR, stream);
         antiIndices = cudf::mixed_left_anti_join(
-            leftNonNull.select(leftKeyIndices_),
+            alignedLeftNN.select(leftKeyIndices_),
             rightNonNull->view().select(rightKeyIndices_),
             leftNonNull,
             rightNonNull->view(),
@@ -2045,7 +2125,7 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
       }
     } else {
       antiIndices = cudf::mixed_left_anti_join(
-          leftNonNull.select(leftKeyIndices_),
+          alignedLeftNonNull.select(leftKeyIndices_),
           rightTableView.select(rightKeyIndices_),
           leftNonNull,
           rightTableView,
@@ -2742,6 +2822,28 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  // Validate join key types between probe and build. Log mismatches for
+  // diagnostics — these are handled by alignProbeKeyTypes in each join
+  // method, but logging helps trace CUDA errors to specific type issues.
+  if (CudfConfig::getInstance().debugEnabled) {
+    auto& rightTables = hashObject_.value().first;
+    if (!rightTables.empty() && rightTables[0]->num_rows() > 0) {
+      auto buildView = rightTables[0]->view();
+      for (size_t k = 0; k < leftKeyIndices_.size(); ++k) {
+        auto pType = leftTableView.column(leftKeyIndices_[k]).type();
+        auto bType = buildView.column(rightKeyIndices_[k]).type();
+        if (pType != bType) {
+          VLOG(1) << "Key type mismatch at index " << k
+                  << " for planNode " << joinNode_->id()
+                  << ": probe=" << static_cast<int>(pType.id())
+                  << " (scale=" << pType.scale() << ")"
+                  << " build=" << static_cast<int>(bType.id())
+                  << " (scale=" << bType.scale() << ")";
+        }
+      }
+    }
+  }
+
   auto executeJoin = [&](cudf::table_view probeView)
       -> std::vector<std::unique_ptr<cudf::table>> {
     switch (joinNode_->joinType()) {
@@ -2864,6 +2966,28 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     } catch (const std::exception& e) {
       if (!isCudaRelatedError(e)) {
         throw;
+      }
+
+      // Log diagnostic info for CUDA errors to aid debugging.
+      {
+        auto& rt = hashObject_.value().first;
+        LOG(ERROR)
+            << "CUDA error during join for planNode " << joinNode_->id()
+            << " (joinType=" << static_cast<int>(joinNode_->joinType())
+            << ", probeRows=" << slice.num_rows()
+            << ", probeCols=" << slice.num_columns()
+            << ", buildBatches=" << rt.size()
+            << "): " << e.what();
+        for (size_t k = 0; k < leftKeyIndices_.size(); ++k) {
+          auto pType = slice.column(leftKeyIndices_[k]).type();
+          auto bType = rt[0]->view().column(rightKeyIndices_[k]).type();
+          LOG(ERROR)
+              << "  joinKey[" << k << "]: probeType="
+              << static_cast<int>(pType.id())
+              << " (scale=" << pType.scale() << ")"
+              << " buildType=" << static_cast<int>(bType.id())
+              << " (scale=" << bType.scale() << ")";
+        }
       }
 
       // Check if the CUDA context itself is corrupted (sticky error).
