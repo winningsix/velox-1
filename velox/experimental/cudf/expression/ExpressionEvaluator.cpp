@@ -237,6 +237,48 @@ class CastFunction : public CudfFunction {
   bool dateToString_{false};
 };
 
+// GPU implementation of Spark's make_decimal special form.
+// Takes an INT64 (unscaled value) and reinterprets it as a DECIMAL column
+// with the target precision and scale. Unlike cudf::cast (which applies
+// decimal rescaling), this preserves the raw integer as the unscaled
+// representation.
+class MakeDecimalCudfFunction : public CudfFunction {
+ public:
+  MakeDecimalCudfFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        expr->type()->isDecimal(),
+        "make_decimal result type must be decimal, got {}",
+        expr->type()->toString());
+    targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    // Reinterpret the INT64 data as DECIMAL64 with the target scale.
+    // Both INT64 and DECIMAL64 are 64-bit, so the memory layout is identical.
+    cudf::data_type dec64Type(
+        cudf::type_id::DECIMAL64, targetCudfType_.scale());
+    cudf::column_view dec64View(
+        dec64Type,
+        inputCol.size(),
+        inputCol.head(),
+        inputCol.null_mask(),
+        inputCol.null_count());
+    if (targetCudfType_.id() == cudf::type_id::DECIMAL64) {
+      return std::make_unique<cudf::column>(dec64View, stream, mr);
+    }
+    // DECIMAL128: widen from DECIMAL64. Same scale so cudf::cast preserves
+    // the unscaled value and only widens int64 → __int128.
+    return cudf::cast(dec64View, targetCudfType_, stream, mr);
+  }
+
+ private:
+  cudf::data_type targetCudfType_;
+};
+
 // Spark date_add function implementation.
 // For the presto date_add, the first value is unit string,
 // may need to get the function with prefix, if the prefix is "", it is Spark
@@ -2795,6 +2837,27 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("varchar")
            .argumentType("varchar")
            .variableArity("varchar")
+           .build()});
+
+  // make_decimal is a special form (no prefix).
+  registerCudfFunction(
+      "make_decimal",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<MakeDecimalCudfFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("bigint")
+           .constantArgumentType("boolean")
            .build()});
 
   return true;
