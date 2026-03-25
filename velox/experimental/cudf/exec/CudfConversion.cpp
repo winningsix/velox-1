@@ -416,16 +416,24 @@ RowVectorPtr CudfToVelox::getOutput() {
     finished_ = noMoreInput_ && inputs_.empty();
     if (output->type()->kindEquals(outputType_)) {
       output->setType(outputType_);
+    } else if (outputType_->size() == 0) {
+      // Zero-column output (e.g. COUNT(*) without GROUP BY).
+      // CudfFromVelox added a dummy column to carry the row count through cuDF;
+      // strip it so the RowVector matches the expected 0-column type.
+      output = std::make_shared<RowVector>(
+          pool(), outputType_, output->nulls(), output->size(),
+          std::vector<VectorPtr>{});
     } else {
+      auto numOutputCols = outputType_->size();
       for (column_index_t i = 0; i < output->childrenSize(); ++i) {
-        if (i < outputType_->size()) {
+        if (i < numOutputCols) {
           fixStringBinaryMismatch(
               output->childAt(i), outputType_->childAt(i));
         }
       }
       std::vector<VectorPtr> children;
-      children.reserve(output->childrenSize());
-      for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+      children.reserve(numOutputCols);
+      for (column_index_t i = 0; i < numOutputCols && i < output->childrenSize(); ++i) {
         children.push_back(output->childAt(i));
       }
       output = std::make_shared<RowVector>(
@@ -511,16 +519,24 @@ RowVectorPtr CudfToVelox::getOutput() {
   finished_ = noMoreInput_ && inputs_.empty();
   if (output->type()->kindEquals(outputType_)) {
     output->setType(outputType_);
+  } else if (outputType_->size() == 0) {
+    // Zero-column output (e.g. COUNT(*) without GROUP BY).
+    // CudfFromVelox added a dummy column to carry the row count through cuDF;
+    // strip it so the RowVector matches the expected 0-column type.
+    output = std::make_shared<RowVector>(
+        pool(), outputType_, output->nulls(), output->size(),
+        std::vector<VectorPtr>{});
   } else {
+    auto numOutputCols = outputType_->size();
     for (column_index_t i = 0; i < output->childrenSize(); ++i) {
-      if (i < outputType_->size()) {
+      if (i < numOutputCols) {
         fixStringBinaryMismatch(
             output->childAt(i), outputType_->childAt(i));
       }
     }
     std::vector<VectorPtr> children;
-    children.reserve(output->childrenSize());
-    for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+    children.reserve(numOutputCols);
+    for (column_index_t i = 0; i < numOutputCols && i < output->childrenSize(); ++i) {
       children.push_back(output->childAt(i));
     }
     output = std::make_shared<RowVector>(
