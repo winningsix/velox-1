@@ -288,15 +288,21 @@ size_t computeMaxGatherRows(
 // independently. This catches and handles errors INSIDE the operator before
 // they propagate to Velox's error framework (where they become non-retriable).
 // Accumulates results from all successful sub-joins.
-template <typename JoinFunc>
+//
+// When the probe can't be split further (1 row or max depth) and retries
+// fail, invokes buildChunkFallbackFn if provided. This splits the BUILD
+// table into smaller chunks and joins each independently -- essential when
+// a single probe row matches millions of build rows.
+template <typename JoinFunc, typename FallbackFunc>
 std::vector<std::unique_ptr<cudf::table>> joinWithAdaptiveSplit(
     cudf::table_view probeView,
     rmm::cuda_stream_view stream,
     JoinFunc&& joinFn,
     const std::string& context,
+    FallbackFunc&& buildChunkFallbackFn,
     int depth = 0) {
   static constexpr int kMaxSplitDepth = 30;
-  static constexpr int kMaxLeafRetries = 5;
+  static constexpr int kMaxLeafRetries = 3;
 
   try {
     return joinFn(probeView);
@@ -345,6 +351,28 @@ std::vector<std::unique_ptr<cudf::table>> joinWithAdaptiveSplit(
           recoverGpuMemory();
         }
       }
+
+      // All retries exhausted -- try build-side chunking as last resort.
+      // A single probe row can match millions of build rows (e.g. TPC-DS
+      // Q4/Q11 on low-cardinality keys), producing output that exceeds
+      // GPU memory in the gather map allocation. Splitting the BUILD table
+      // into smaller chunks bounds the per-chunk output size.
+      try {
+        auto fallbackResult = buildChunkFallbackFn(probeView, stream);
+        if (!fallbackResult.empty()) {
+          LOG(INFO) << context
+                    << ": build-side chunking succeeded for "
+                    << probeView.num_rows() << " probe rows"
+                    << " (depth=" << depth << ")";
+          return fallbackResult;
+        }
+      } catch (const std::exception& fbErr) {
+        LOG(WARNING) << context
+                     << ": build-side chunking also failed: "
+                     << fbErr.what();
+        recoverGpuMemory();
+      }
+
       throw;
     }
 
@@ -360,10 +388,12 @@ std::vector<std::unique_ptr<cudf::table>> joinWithAdaptiveSplit(
 
     auto results = joinWithAdaptiveSplit(
         splits[0], stream, std::forward<JoinFunc>(joinFn),
-        context, depth + 1);
+        context, std::forward<FallbackFunc>(buildChunkFallbackFn),
+        depth + 1);
     auto results2 = joinWithAdaptiveSplit(
         splits[1], stream, std::forward<JoinFunc>(joinFn),
-        context, depth + 1);
+        context, std::forward<FallbackFunc>(buildChunkFallbackFn),
+        depth + 1);
     results.insert(results.end(),
         std::make_move_iterator(results2.begin()),
         std::make_move_iterator(results2.end()));
@@ -1653,10 +1683,24 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     auto alignedProbeRJ = alignProbeKeyTypes(
         leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
         keyCastsRJ, stream);
+
+    auto rightJoinStream =
+        buildStream_.has_value() ? buildStream_.value() : stream;
+    std::optional<std::size_t> estRightSize;
+    try {
+      estRightSize = hb->inner_join_size(
+          alignedProbeRJ.select(leftKeyIndices_), rightJoinStream);
+    } catch (const std::exception& sizeErr) {
+      LOG(WARNING) << "inner_join_size (right) failed for planNode "
+                   << joinNode_->id() << " batch " << i << ": "
+                   << sizeErr.what();
+      recoverGpuMemory();
+    }
+
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         alignedProbeRJ.select(leftKeyIndices_),
-        std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
+        estRightSize,
+        rightJoinStream);
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
@@ -1788,10 +1832,24 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
     auto alignedLeftFJ = alignProbeKeyTypes(
         leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
         keyCastsFJ, stream);
+
+    auto fullJoinStream =
+        buildStream_.has_value() ? buildStream_.value() : stream;
+    std::optional<std::size_t> estFullSize;
+    try {
+      estFullSize = hb->left_join_size(
+          alignedLeftFJ.select(leftKeyIndices_), fullJoinStream);
+    } catch (const std::exception& sizeErr) {
+      LOG(WARNING) << "left_join_size (full) failed for planNode "
+                   << joinNode_->id() << " batch " << i << ": "
+                   << sizeErr.what();
+      recoverGpuMemory();
+    }
+
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
         alignedLeftFJ.select(leftKeyIndices_),
-        std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
+        estFullSize,
+        fullJoinStream);
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
