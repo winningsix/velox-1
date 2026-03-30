@@ -279,6 +279,49 @@ class MakeDecimalCudfFunction : public CudfFunction {
   cudf::data_type targetCudfType_;
 };
 
+// GPU implementation of Spark's unscaled_value special form.
+// Extracts the raw unscaled integer from a DECIMAL column.
+// E.g. unscaled_value(DECIMAL(7,2) 123.45) = BIGINT 12345.
+// Since cuDF stores decimals as their unscaled integer representation,
+// this is a zero-copy reinterpretation (DECIMAL64 → INT64) or a widening
+// cast (DECIMAL32 → INT32 → INT64).
+class UnscaledValueFunction : public CudfFunction {
+ public:
+  UnscaledValueFunction(
+      const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    cudf::type_id intType;
+    switch (inputCol.type().id()) {
+      case cudf::type_id::DECIMAL32:
+        intType = cudf::type_id::INT32;
+        break;
+      case cudf::type_id::DECIMAL64:
+        intType = cudf::type_id::INT64;
+        break;
+      default:
+        VELOX_FAIL(
+            "unscaled_value expects DECIMAL32/DECIMAL64 input, got type_id {}",
+            static_cast<int>(inputCol.type().id()));
+    }
+    cudf::column_view intView(
+        cudf::data_type{intType},
+        inputCol.size(),
+        inputCol.head(),
+        inputCol.null_mask(),
+        inputCol.null_count());
+    if (intType == cudf::type_id::INT64) {
+      return std::make_unique<cudf::column>(intView, stream, mr);
+    }
+    return cudf::cast(
+        intView, cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  }
+};
+
 // Spark date_add function implementation.
 // For the presto date_add, the first value is unit string,
 // may need to get the function with prefix, if the prefix is "", it is Spark
@@ -2872,6 +2915,20 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("varchar")
            .argumentType("varchar")
            .variableArity("varchar")
+           .build()});
+
+  // unscaled_value is a special form (no prefix).
+  registerCudfFunction(
+      "unscaled_value",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<UnscaledValueFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("bigint")
+           .argumentType("decimal(p,s)")
            .build()});
 
   // make_decimal is a special form (no prefix).
