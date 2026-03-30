@@ -467,7 +467,24 @@ void CudfHashJoinBuild::noMoreInput() {
             e.what());
       }
       if (attempt >= kOomMaxRetries) {
-        throw;
+        LOG(WARNING)
+            << "CudfHashJoinBuild: concatenation failed after "
+            << kOomMaxRetries << " attempts for planNode "
+            << planNodeId() << ". Falling back to per-batch build tables ("
+            << inputs_.size() << " batches): " << e.what();
+        recoverGpuMemory();
+        for (auto& inp : inputs_) {
+          if (inp && inp->size() > 0) {
+            inp->stream().synchronize();
+            tbls.push_back(inp->release());
+          }
+        }
+        VELOX_CHECK(
+            !tbls.empty(),
+            "No valid build batches after concatenation fallback "
+            "for planNode {}",
+            planNodeId());
+        break;
       }
       LOG(WARNING)
           << "CudfHashJoinBuild OOM during concatenation for planNode "
@@ -2930,7 +2947,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   bool const canSplitProbe =
       joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
       joinNode_->isLeftSemiFilterJoin() ||
-      joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin();
+      joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin() ||
+      joinNode_->isRightJoin() || joinNode_->isFullJoin();
   static constexpr cudf::size_type kMinSplitRows = 1024;
 
   std::vector<cudf::table_view> probeSlices;
@@ -2954,11 +2972,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         buildBytesEstimate +=
             static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
       }
-      // Adaptive amplification: base 20x, scale up with build size.
-      // For builds > 10M rows, amplification can be 100x+.
+      // Adaptive amplification: base 50x, scale up with build size.
+      // TPC-DS multi-way joins can produce 500x+ amplification.
       size_t amplification = std::min(
-          size_t(200),
-          std::max(size_t(20), totalBuildRows / 50000));
+          size_t(500),
+          std::max(size_t(50), totalBuildRows / 20000));
       size_t costPerProbeRow = (8 + outputRowBytes) * amplification;
 
       // Subtract estimated hash table footprint (build table bytes * ~2x
@@ -2968,8 +2986,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       size_t usableFree =
           (freeMem > hashTableFootprint) ? (freeMem - hashTableFootprint) : (freeMem / 4);
 
-      // Allow each join call to use at most 15% of usable free GPU memory.
-      size_t maxAlloc = usableFree * 15 / 100;
+      // Allow each join call to use at most 10% of usable free GPU memory.
+      // Conservative to avoid cudaErrorInvalidValue from oversized allocs.
+      size_t maxAlloc = usableFree * 10 / 100;
       auto maxRows = static_cast<cudf::size_type>(std::min(
           static_cast<size_t>(leftTableView.num_rows()),
           std::max(
