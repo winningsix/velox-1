@@ -87,11 +87,15 @@ static constexpr double kLargeJoinMemoryFraction = 0.30;
 void recoverGpuMemory() {
   auto syncErr = cudaDeviceSynchronize();
   auto lastErr = cudaGetLastError();
-  // OOM errors are expected and recoverable. Fatal errors (illegal address,
-  // assert, device unavailable) mean the context is corrupted -- fail fast
-  // instead of proceeding to corrupt the RMM pool further.
+  // OOM and invalid-value errors are expected and recoverable.
+  // cudaErrorInvalidValue typically indicates an oversized allocation request
+  // (e.g. join output exceeding GPU memory), NOT device corruption.
+  // Fatal errors (illegal address, assert, device unavailable) mean the
+  // context is corrupted -- fail fast instead of proceeding to corrupt the
+  // RMM pool further.
   auto err = (syncErr != cudaSuccess) ? syncErr : lastErr;
-  if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+  if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
+      err != cudaErrorInvalidValue) {
     VELOX_FAIL(
         "Fatal CUDA error during GPU memory recovery: {} ({}). "
         "Device context is corrupted.",
@@ -105,16 +109,20 @@ void recoverGpuMemory() {
 // before they corrupt the RMM pool during subsequent deallocations.
 void checkCudaHealth(const char* context) {
   auto err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    auto msg = cudaGetErrorString(err);
-    VELOX_FAIL(
-        "CUDA device error detected at {}: {} ({}). "
-        "GPU context may be corrupted -- failing fast to prevent "
-        "RMM pool metadata corruption.",
-        context,
-        msg,
-        static_cast<int>(err));
+  if (err == cudaSuccess || err == cudaErrorInvalidValue) {
+    // cudaErrorInvalidValue is NOT device corruption — it indicates an
+    // oversized or invalid allocation parameter. Clearing it here prevents
+    // stale errors from cascading to subsequent operations.
+    return;
   }
+  auto msg = cudaGetErrorString(err);
+  VELOX_FAIL(
+      "CUDA device error detected at {}: {} ({}). "
+      "GPU context may be corrupted -- failing fast to prevent "
+      "RMM pool metadata corruption.",
+      context,
+      msg,
+      static_cast<int>(err));
 }
 
 size_t freeGpuMemoryBytes() {
@@ -474,16 +482,22 @@ void CudfHashJoinBuild::noMoreInput() {
             << inputs_.size() << " batches): " << e.what();
         recoverGpuMemory();
         for (auto& inp : inputs_) {
-          if (inp && inp->size() > 0) {
+          if (!inp || inp->size() == 0) {
+            continue;
+          }
+          try {
             inp->stream().synchronize();
             tbls.push_back(inp->release());
+          } catch (const std::exception& releaseErr) {
+            LOG(WARNING)
+                << "CudfHashJoinBuild: failed to release build batch for "
+                << "planNode " << planNodeId() << ": " << releaseErr.what();
           }
         }
-        VELOX_CHECK(
-            !tbls.empty(),
-            "No valid build batches after concatenation fallback "
-            "for planNode {}",
-            planNodeId());
+        if (tbls.empty()) {
+          tbls.push_back(makeEmptyTable(
+              joinNode_->sources()[1]->outputType()));
+        }
         break;
       }
       LOG(WARNING)
@@ -2508,14 +2522,27 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       } else {
         auto stream = accumulatedProbeInputs_[0]->stream();
         auto probeType = joinNode_->sources()[0]->outputType();
-        auto tbl =
-            getConcatenatedTable(accumulatedProbeInputs_, probeType, stream);
-        input_ = std::make_shared<CudfVector>(
-            operatorCtx_->pool(),
-            probeType,
-            tbl->num_rows(),
-            std::move(tbl),
-            stream);
+        try {
+          auto tbl =
+              getConcatenatedTable(accumulatedProbeInputs_, probeType, stream);
+          input_ = std::make_shared<CudfVector>(
+              operatorCtx_->pool(),
+              probeType,
+              tbl->num_rows(),
+              std::move(tbl),
+              stream);
+        } catch (const std::exception& e) {
+          if (!isCudaRelatedError(e)) {
+            throw;
+          }
+          LOG(WARNING)
+              << "CudfHashJoinProbe: probe coalescing failed for planNode "
+              << joinNode_->id() << " (" << accumulatedProbeInputs_.size()
+              << " batches, " << accumulatedProbeRows_ << " rows): "
+              << e.what() << ". Processing first batch only.";
+          recoverGpuMemory();
+          input_ = std::move(accumulatedProbeInputs_[0]);
+        }
       }
       accumulatedProbeInputs_.clear();
       accumulatedProbeRows_ = 0;
@@ -2649,13 +2676,24 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   {
     auto n = leftTableView.num_rows();
     if (n > 0) {
-      auto nonNull =
-          cudf::drop_nulls(leftTableView, leftKeyIndices_, stream);
-      auto nullKeyRows =
-          static_cast<int64_t>(n - nonNull->num_rows());
-      if (nullKeyRows > 0) {
-        auto lockedStats = stats_.wlock();
-        lockedStats->numNullKeys += nullKeyRows;
+      try {
+        auto nonNull =
+            cudf::drop_nulls(leftTableView, leftKeyIndices_, stream);
+        auto nullKeyRows =
+            static_cast<int64_t>(n - nonNull->num_rows());
+        if (nullKeyRows > 0) {
+          auto lockedStats = stats_.wlock();
+          lockedStats->numNullKeys += nullKeyRows;
+        }
+      } catch (const std::exception& e) {
+        if (!isCudaRelatedError(e)) {
+          throw;
+        }
+        LOG(WARNING)
+            << "CudfHashJoinProbe: null key counting failed for planNode "
+            << joinNode_->id() << " (probe=" << n << " rows): " << e.what()
+            << ". Skipping null key stats.";
+        recoverGpuMemory();
       }
     }
   }
@@ -2949,7 +2987,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       joinNode_->isLeftSemiFilterJoin() ||
       joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin() ||
       joinNode_->isRightJoin() || joinNode_->isFullJoin();
-  static constexpr cudf::size_type kMinSplitRows = 1024;
+  static constexpr cudf::size_type kMinSplitRows = 128;
 
   std::vector<cudf::table_view> probeSlices;
 
@@ -2972,11 +3010,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         buildBytesEstimate +=
             static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
       }
-      // Adaptive amplification: base 50x, scale up with build size.
-      // TPC-DS multi-way joins can produce 500x+ amplification.
+      // Adaptive amplification: scale up aggressively with build size.
+      // TPC-DS multi-way joins with skewed keys can produce 2000x+
+      // amplification. Be conservative to prevent cudaErrorInvalidValue
+      // from oversized gather map allocations inside libcudf.
       size_t amplification = std::min(
-          size_t(500),
-          std::max(size_t(50), totalBuildRows / 20000));
+          size_t(2000),
+          std::max(size_t(50), totalBuildRows / 5000));
       size_t costPerProbeRow = (8 + outputRowBytes) * amplification;
 
       // Subtract estimated hash table footprint (build table bytes * ~2x
