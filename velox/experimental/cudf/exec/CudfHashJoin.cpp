@@ -67,11 +67,10 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
-static constexpr int kOomMaxRetries = 5;
+static constexpr int kOomMaxRetries = 10;
 
 // Maximum cumulative time (ms) spent on OOM retries per getOutput() call.
-// Prevents infinite retry loops from causing timeouts (Q93-style).
-static constexpr int64_t kMaxRetryTotalMs = 30000;
+static constexpr int64_t kMaxRetryTotalMs = 300000;
 
 // Serialization for large hash joins. When a join's estimated memory
 // footprint (build table + hash table + join output) exceeds this
@@ -502,24 +501,35 @@ void CudfHashJoinBuild::noMoreInput() {
             planNodeId(),
             e.what());
       }
-      if (attempt >= kOomMaxRetries) {
+      // For cudaErrorInvalidValue the batch is too large (not transient OOM);
+      // retrying just corrupts CUDA state further. Fall back immediately.
+      bool isInvalidValue = std::string(e.what()).find(
+          "cudaErrorInvalidValue") != std::string::npos;
+      if (isInvalidValue || attempt >= kOomMaxRetries) {
         LOG(WARNING)
-            << "CudfHashJoinBuild: concatenation failed after "
-            << kOomMaxRetries << " attempts for planNode "
-            << planNodeId() << ". Falling back to per-batch build tables ("
+            << "CudfHashJoinBuild: concatenation failed"
+            << (isInvalidValue ? " (cudaErrorInvalidValue, immediate fallback)"
+                               : " after retries")
+            << " for planNode " << planNodeId()
+            << ". Falling back to per-batch build tables ("
             << inputs_.size() << " batches): " << e.what();
-        recoverGpuMemory();
+        // Full CUDA state recovery: synchronize device, then clear any
+        // sticky error BEFORE touching per-batch streams. Without this,
+        // a pending error from the failed concatenation can cause SIGSEGV
+        // in stream.synchronize() during the per-batch release below.
+        cudaDeviceSynchronize();
+        cudaGetLastError();
         for (auto& inp : inputs_) {
           if (!inp || inp->size() == 0) {
             continue;
           }
           try {
-            inp->stream().synchronize();
             tbls.push_back(inp->release());
           } catch (const std::exception& releaseErr) {
             LOG(WARNING)
                 << "CudfHashJoinBuild: failed to release build batch for "
                 << "planNode " << planNodeId() << ": " << releaseErr.what();
+            cudaGetLastError();
           }
         }
         if (tbls.empty()) {
@@ -2958,7 +2968,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       joinNode_->isLeftSemiFilterJoin() ||
       joinNode_->isLeftSemiProjectJoin() || joinNode_->isAntiJoin() ||
       joinNode_->isRightJoin() || joinNode_->isFullJoin();
-  static constexpr cudf::size_type kMinSplitRows = 128;
+  static constexpr cudf::size_type kMinSplitRows = 1;
 
   std::vector<cudf::table_view> probeSlices;
 
@@ -2982,24 +2992,20 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
       }
       // Adaptive amplification: scale up aggressively with build size.
-      // TPC-DS multi-way joins with skewed keys can produce 2000x+
-      // amplification. Be conservative to prevent cudaErrorInvalidValue
-      // from oversized gather map allocations inside libcudf.
+      // TPC-DS multi-way joins with skewed keys can produce 50000x+
+      // amplification on SF100+. Be very conservative to prevent
+      // cudaErrorInvalidValue from oversized gather map allocations.
       size_t amplification = std::min(
-          size_t(2000),
-          std::max(size_t(50), totalBuildRows / 5000));
+          size_t(50000),
+          std::max(size_t(100), totalBuildRows / 500));
       size_t costPerProbeRow = (8 + outputRowBytes) * amplification;
 
-      // Subtract estimated hash table footprint (build table bytes * ~2x
-      // for hash buckets + overhead) from free memory to get realistic
-      // available memory for the join output.
       size_t hashTableFootprint = buildBytesEstimate * 2;
       size_t usableFree =
           (freeMem > hashTableFootprint) ? (freeMem - hashTableFootprint) : (freeMem / 4);
 
-      // Allow each join call to use at most 10% of usable free GPU memory.
-      // Conservative to avoid cudaErrorInvalidValue from oversized allocs.
-      size_t maxAlloc = usableFree * 10 / 100;
+      // Allow each join call to use at most 3% of usable free GPU memory.
+      size_t maxAlloc = usableFree * 3 / 100;
       auto maxRows = static_cast<cudf::size_type>(std::min(
           static_cast<size_t>(leftTableView.num_rows()),
           std::max(
@@ -3031,11 +3037,32 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     probeSlices.push_back(leftTableView);
   }
 
+  // Track the maximum probe size known to fail. After a failure, all
+  // remaining slices larger than this limit are pre-split immediately,
+  // avoiding redundant failures that burn the retry budget.
+  cudf::size_type maxSafeProbeRows = std::numeric_limits<cudf::size_type>::max();
+
   auto retryBudgetStart = std::chrono::steady_clock::now();
 
   while (!probeSlices.empty()) {
     auto slice = probeSlices.back();
     probeSlices.pop_back();
+
+    // Pre-split oversized slices based on previous failures.
+    if (canSplitProbe && maxSafeProbeRows < slice.num_rows() &&
+        maxSafeProbeRows > 0 && slice.num_rows() > 1) {
+      std::vector<cudf::size_type> preSplitPts;
+      for (cudf::size_type idx = maxSafeProbeRows;
+           idx < slice.num_rows();
+           idx += maxSafeProbeRows) {
+        preSplitPts.push_back(idx);
+      }
+      auto subSlices = cudf::split(slice, preSplitPts, stream);
+      for (int j = static_cast<int>(subSlices.size()) - 1; j > 0; --j) {
+        probeSlices.push_back(subSlices[j]);
+      }
+      slice = subSlices[0];
+    }
 
     // Pre-join memory check: if memory is tight, reclaim before attempting.
     // This is cheap (~0.1ms) and prevents OOM cascades.
@@ -3193,11 +3220,17 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         continue;
       }
 
+      // Record that this size failed so all future slices are pre-split.
+      maxSafeProbeRows = std::max(
+          cudf::size_type(1),
+          static_cast<cudf::size_type>(slice.num_rows() / 2));
+
       LOG(WARNING)
           << "GPU join CUDA error with " << slice.num_rows()
           << " probe rows for planNode " << joinNode_->id()
           << ": " << e.what()
-          << ". Splitting probe in half and retrying.";
+          << ". Splitting probe in half and retrying"
+          << " (maxSafeProbeRows=" << maxSafeProbeRows << ").";
 
       try {
         auto half = static_cast<cudf::size_type>(slice.num_rows() / 2);
