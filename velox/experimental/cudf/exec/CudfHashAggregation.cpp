@@ -2175,6 +2175,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     if (isGlobal_) {
       auto stream = cudfGlobalStreamPool().get_stream();
       auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
+      if (tbl->num_columns() == 0) {
+        auto mr = cudf::get_current_device_resource_ref();
+        std::vector<std::unique_ptr<cudf::column>> cols;
+        cols.push_back(cudf::make_numeric_column(
+            cudf::data_type(cudf::type_id::INT8),
+            0,
+            cudf::mask_state::UNALLOCATED,
+            stream,
+            mr));
+        tbl = std::make_unique<cudf::table>(std::move(cols));
+      }
       return doGlobalAggregation(tbl->view(), stream);
     }
     return nullptr;
