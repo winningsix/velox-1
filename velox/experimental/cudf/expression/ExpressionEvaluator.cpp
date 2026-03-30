@@ -1681,7 +1681,8 @@ class RowConstructorFunction : public CudfFunction {
 
 class CoalesceFunction : public CudfFunction {
  public:
-  CoalesceFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  CoalesceFunction(const std::shared_ptr<velox::exec::Expr>& expr)
+      : type_(cudf_velox::veloxToCudfDataType(expr->type())) {
     using velox::exec::ConstantExpr;
 
     // Storing the first literal that appears in inputs because we don't need to
@@ -1704,9 +1705,7 @@ class CoalesceFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    // Coalesce is practically a cudf::replace_nulls over multiple columns.
-    // Starting from first column, we keep calling replace nulls with
-    // subsequent cols until we get an all valid col or run out of columns
+    castHolders_.clear();
 
     // If a literal comes before any column input, fill the result with it.
     if (literalScalar_ && numColumnsBeforeLiteral_ == 0) {
@@ -1715,29 +1714,65 @@ class CoalesceFunction : public CudfFunction {
         VELOX_NYI("coalesce with only literal inputs is not supported");
       }
       auto size = asView(inputColumns[0]).size();
-      return cudf::make_column_from_scalar(*literalScalar_, size, stream, mr);
+      auto aligned = alignScalarToColumn(*literalScalar_, asView(inputColumns[0]).type(), stream, mr);
+      const auto& scalarRef = aligned ? *aligned : *literalScalar_;
+      return cudf::make_column_from_scalar(scalarRef, size, stream, mr);
     }
 
     VELOX_CHECK(
         !inputColumns.empty(),
         "coalesce requires at least one non-literal input");
     ColumnOrView result = asView(inputColumns[0]);
+    alignColumnToType(result, stream, mr);
     size_t stop = std::min(numColumnsBeforeLiteral_, inputColumns.size());
     for (size_t i = 1; i < stop && asView(result).has_nulls(); ++i) {
+      alignColumnToType(inputColumns[i], stream, mr);
       result = cudf::replace_nulls(
           asView(result), asView(inputColumns[i]), stream, mr);
     }
 
     if (literalScalar_ && asView(result).has_nulls()) {
-      result = cudf::replace_nulls(asView(result), *literalScalar_, stream, mr);
+      auto aligned = alignScalarToColumn(*literalScalar_, asView(result).type(), stream, mr);
+      const auto& scalarRef = aligned ? *aligned : *literalScalar_;
+      result = cudf::replace_nulls(asView(result), scalarRef, stream, mr);
     }
 
     return result;
   }
 
  private:
+  void alignColumnToType(
+      ColumnOrView& col,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    auto view = asView(col);
+    if (cudf::is_fixed_point(view.type()) &&
+        cudf::is_fixed_point(type_) &&
+        view.type() != type_) {
+      castHolders_.push_back(cudf::cast(view, type_, stream, mr));
+      col = castHolders_.back()->view();
+    }
+  }
+
+  std::unique_ptr<cudf::scalar> alignScalarToColumn(
+      const cudf::scalar& s,
+      cudf::data_type colType,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    if (cudf::is_fixed_point(s.type()) &&
+        cudf::is_fixed_point(colType) &&
+        s.type() != colType) {
+      auto col = cudf::make_column_from_scalar(s, 1, stream, mr);
+      auto casted = cudf::cast(col->view(), colType, stream, mr);
+      return cudf::get_element(*casted, 0, stream, mr);
+    }
+    return nullptr;
+  }
+
+  const cudf::data_type type_;
   size_t numColumnsBeforeLiteral_;
   std::unique_ptr<cudf::scalar> literalScalar_;
+  mutable std::vector<std::unique_ptr<cudf::column>> castHolders_;
 };
 
 class HashFunction : public CudfFunction {
