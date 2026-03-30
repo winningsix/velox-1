@@ -190,6 +190,46 @@ bool isFatalCudaError(const std::exception& e) {
   return false;
 }
 
+// Lightweight null-key row counting using bitmask operations.
+// Much cheaper than cudf::drop_nulls which allocates a full table copy.
+// Returns the number of rows where ANY key column contains a null.
+// Only allocates O(N/8) bytes for the combined bitmask vs. O(N * total_cols *
+// bytes_per_col) for drop_nulls. Returns -1 on failure (caller should skip).
+int64_t countNullKeyRows(
+    cudf::table_view const& table,
+    std::vector<cudf::size_type> const& keyIndices,
+    rmm::cuda_stream_view stream) {
+  if (table.num_rows() == 0 || keyIndices.empty()) {
+    return 0;
+  }
+
+  // Fast path: check if any key column has nulls at all.
+  bool anyNulls = false;
+  int nullableKeyCount = 0;
+  cudf::size_type singleNullableIdx = -1;
+  for (auto idx : keyIndices) {
+    if (table.column(idx).has_nulls()) {
+      anyNulls = true;
+      nullableKeyCount++;
+      singleNullableIdx = idx;
+    }
+  }
+  if (!anyNulls) {
+    return 0;
+  }
+
+  // Single nullable key: use its null_count() directly (free metadata).
+  if (nullableKeyCount == 1) {
+    return static_cast<int64_t>(table.column(singleNullableIdx).null_count());
+  }
+
+  // Multiple nullable keys: use bitmask_and on the key columns to compute
+  // the combined validity mask. This allocates only a single bitmask buffer.
+  auto keyTable = table.select(keyIndices);
+  auto [combinedMask, nullCount] = cudf::bitmask_and(keyTable, stream);
+  return static_cast<int64_t>(nullCount);
+}
+
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
     cudf::table_view originalView,
@@ -411,12 +451,55 @@ size_t computeMaxSafeJoinOutputRows(rmm::cuda_stream_view stream) {
   size_t freeMem = freeGpuMemoryBytes();
   if (freeMem > 0) {
     // Each output row costs 8 bytes for the gather map pair (2 × int32).
-    // Reserve at most 15% of free memory for gather maps, leaving room
-    // for output table materialization and concurrent operations.
-    size_t memLimit = (freeMem * 15 / 100) / 8;
+    // Reserve at most 5% of free memory for gather maps. Conservative
+    // because output table materialization also needs substantial memory
+    // and concurrent GPU tasks compete for the RMM pool.
+    size_t memLimit = (freeMem / 20) / 8;
     return std::min(maxInt, std::max(memLimit, size_t(1024)));
   }
   return maxInt;
+}
+
+// Throw a recognizable overflow exception if the estimated join output
+// exceeds safe GPU memory limits. The message contains "exceeds
+// cudf::size_type limit" to trigger the probe-splitting path in
+// joinWithAdaptiveSplit WITHOUT going through CUDA error handling.
+void throwIfJoinOutputTooLarge(
+    size_t estimatedRows,
+    cudf::table_view probeView,
+    cudf::table_view buildView,
+    const std::string& context) {
+  size_t bytesPerRow = 8; // gather map pair (2 x int32)
+  for (cudf::size_type c = 0; c < probeView.num_columns(); ++c) {
+    auto dt = probeView.column(c).type();
+    bytesPerRow += cudf::is_fixed_width(dt) ? cudf::size_of(dt) : 32;
+  }
+  for (cudf::size_type c = 0; c < buildView.num_columns(); ++c) {
+    auto dt = buildView.column(c).type();
+    bytesPerRow += cudf::is_fixed_width(dt) ? cudf::size_of(dt) : 32;
+  }
+  bytesPerRow = std::max(bytesPerRow, size_t(16));
+
+  auto maxInt =
+      static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+  size_t maxRows = maxInt;
+  size_t freeMem = freeGpuMemoryBytes();
+  if (freeMem > 0) {
+    size_t memLimit = (freeMem / 10) / bytesPerRow;
+    maxRows = std::min(maxInt, std::max(memLimit, size_t(1024)));
+  }
+
+  if (estimatedRows > maxRows) {
+    VELOX_FAIL(
+        "{}: estimated join output {} rows exceeds safe limit {} rows "
+        "(exceeds cudf::size_type limit). "
+        "bytesPerRow={}, freeMem={}MB",
+        context,
+        estimatedRows,
+        maxRows,
+        bytesPerRow,
+        freeMem >> 20);
+  }
 }
 
 } // namespace
@@ -735,13 +818,24 @@ void CudfHashJoinBuild::noMoreInput() {
   {
     int64_t totalNullKeyRows = 0;
     for (const auto& tbl : tbls) {
-      auto n = tbl->num_rows();
-      if (n == 0) {
+      if (tbl->num_rows() == 0) {
         continue;
       }
-      auto nonNull =
-          cudf::drop_nulls(*tbl, buildKeyIndices, stream);
-      totalNullKeyRows += n - nonNull->num_rows();
+      try {
+        auto nullRows = countNullKeyRows(tbl->view(), buildKeyIndices, stream);
+        if (nullRows > 0) {
+          totalNullKeyRows += nullRows;
+        }
+      } catch (const std::exception& e) {
+        if (!isCudaRelatedError(e)) {
+          throw;
+        }
+        LOG(WARNING)
+            << "CudfHashJoinBuild: null key counting failed for planNode "
+            << planNodeId() << " (" << tbl->num_rows() << " rows): "
+            << e.what() << ". Skipping null key stats.";
+        cudaGetLastError();
+      }
     }
     auto lockedStats = stats_.wlock();
     lockedStats->numNullKeys += totalNullKeyRows;
@@ -1371,6 +1465,15 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
       recoverGpuMemory();
     }
 
+    if (estInnerSize.has_value()) {
+      throwIfJoinOutputTooLarge(
+          estInnerSize.value(),
+          leftTableView,
+          rightTableView,
+          fmt::format(
+              "innerJoin planNode {} batch {}", joinNode_->id(), i));
+    }
+
     std::pair<
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
@@ -1577,10 +1680,40 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
       recoverGpuMemory();
     }
 
-    auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
-        alignedLeftLJ.select(leftKeyIndices_),
-        estLeftSize,
-        leftJoinStream);
+    if (estLeftSize.has_value()) {
+      throwIfJoinOutputTooLarge(
+          estLeftSize.value(),
+          leftTableView,
+          rightTableView,
+          fmt::format(
+              "leftJoin planNode {} batch {}", joinNode_->id(), i));
+    }
+
+    std::pair<
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+        leftJoinResult;
+    try {
+      leftJoinResult = hb->left_join(
+          alignedLeftLJ.select(leftKeyIndices_),
+          estLeftSize,
+          leftJoinStream);
+    } catch (const std::exception& e) {
+      if (isCudaRelatedError(e)) {
+        LOG(ERROR) << "CUDA error in left_join for planNode "
+                   << joinNode_->id() << ": probe="
+                   << leftTableView.num_rows()
+                   << " build=" << rightTableView.num_rows()
+                   << " estOutput="
+                   << (estLeftSize.has_value()
+                           ? std::to_string(estLeftSize.value())
+                           : "unknown");
+        cudaGetLastError();
+        throw;
+      }
+      throw;
+    }
+    auto& [leftJoinIndices, rightJoinIndices] = leftJoinResult;
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
@@ -1697,10 +1830,40 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
       recoverGpuMemory();
     }
 
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        alignedProbeRJ.select(leftKeyIndices_),
-        estRightSize,
-        rightJoinStream);
+    if (estRightSize.has_value()) {
+      throwIfJoinOutputTooLarge(
+          estRightSize.value(),
+          leftTableView,
+          rightTableView,
+          fmt::format(
+              "rightJoin planNode {} batch {}", joinNode_->id(), i));
+    }
+
+    std::pair<
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+        rightJoinResult;
+    try {
+      rightJoinResult = hb->inner_join(
+          alignedProbeRJ.select(leftKeyIndices_),
+          estRightSize,
+          rightJoinStream);
+    } catch (const std::exception& e) {
+      if (isCudaRelatedError(e)) {
+        LOG(ERROR) << "CUDA error in inner_join (right) for planNode "
+                   << joinNode_->id() << ": probe="
+                   << leftTableView.num_rows()
+                   << " build=" << rightTableView.num_rows()
+                   << " estOutput="
+                   << (estRightSize.has_value()
+                           ? std::to_string(estRightSize.value())
+                           : "unknown");
+        cudaGetLastError();
+        throw;
+      }
+      throw;
+    }
+    auto& [leftJoinIndices, rightJoinIndices] = rightJoinResult;
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
@@ -3016,10 +3179,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     auto n = leftTableView.num_rows();
     if (n > 0) {
       try {
-        auto nonNull =
-            cudf::drop_nulls(leftTableView, leftKeyIndices_, stream);
-        auto nullKeyRows =
-            static_cast<int64_t>(n - nonNull->num_rows());
+        auto nullKeyRows = countNullKeyRows(
+            leftTableView, leftKeyIndices_, stream);
         if (nullKeyRows > 0) {
           auto lockedStats = stats_.wlock();
           lockedStats->numNullKeys += nullKeyRows;
@@ -3032,7 +3193,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             << "CudfHashJoinProbe: null key counting failed for planNode "
             << joinNode_->id() << " (probe=" << n << " rows): " << e.what()
             << ". Skipping null key stats.";
-        recoverGpuMemory();
+        cudaGetLastError();
       }
     }
   }
@@ -3357,17 +3518,86 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
   std::vector<cudf::table_view> probeSlices;
 
-  // Proactive probe splitting: when GPU memory is under pressure from
-  // concurrent tasks, pre-split large probes to bound peak per-join
-  // allocation and prevent cudaErrorIllegalAddress from memory corruption.
-  if (canSplitProbe && leftTableView.num_rows() > kMinSplitRows) {
+  // Phase 1: Exact size-based proactive probe splitting.
+  // Uses cudf::hash_join::*_join_size() on the FULL probe to compute the
+  // precise output row count before any allocation. This prevents
+  // cudaErrorInvalidValue from oversized gather map allocations.
+  if (needHashJoin && canSplitProbe &&
+      leftTableView.num_rows() > kMinSplitRows) {
+    auto& sizeRT = hashObject_.value().first;
+    auto& sizeHbs = hashObject_.value().second;
+
+    size_t totalEstOutput = 0;
+    bool sizeOK = false;
+    try {
+      for (size_t bi = 0; bi < sizeRT.size(); ++bi) {
+        if (!sizeHbs[bi] || sizeRT[bi]->num_rows() == 0) {
+          continue;
+        }
+        std::vector<std::unique_ptr<cudf::column>> tmpCasts;
+        auto aligned = alignProbeKeyTypes(
+            leftTableView, leftKeyIndices_,
+            sizeRT[bi]->view(), rightKeyIndices_,
+            tmpCasts, stream);
+        auto probeKeys = aligned.select(leftKeyIndices_);
+
+        if (joinNode_->isInnerJoin() || joinNode_->isRightJoin()) {
+          totalEstOutput +=
+              sizeHbs[bi]->inner_join_size(probeKeys, stream);
+        } else if (joinNode_->isLeftJoin() || joinNode_->isFullJoin()) {
+          totalEstOutput +=
+              sizeHbs[bi]->left_join_size(probeKeys, stream);
+        }
+      }
+      sizeOK = true;
+    } catch (const std::exception& sizeErr) {
+      LOG(WARNING) << "Join size estimation failed for planNode "
+                   << joinNode_->id() << ": " << sizeErr.what()
+                   << ". Falling back to heuristic.";
+      recoverGpuMemory();
+    }
+
+    if (sizeOK && totalEstOutput > 0) {
+      auto maxSafe = computeMaxSafeJoinOutputRows(stream);
+      if (totalEstOutput > maxSafe) {
+        // Add 50% extra chunks to handle key-value skew.
+        auto numChunks = static_cast<cudf::size_type>(std::max(
+            size_t(2),
+            (totalEstOutput + maxSafe - 1) / maxSafe * 3 / 2));
+        auto rowsPerChunk = std::max(
+            cudf::size_type(1),
+            leftTableView.num_rows() / numChunks);
+
+        LOG(INFO)
+            << "Exact-size probe split for planNode " << joinNode_->id()
+            << ": estOutput=" << totalEstOutput << ", maxSafe=" << maxSafe
+            << ", probeRows=" << leftTableView.num_rows()
+            << ", chunks=" << numChunks
+            << ", rowsPerChunk=" << rowsPerChunk;
+
+        std::vector<cudf::size_type> splitPts;
+        for (cudf::size_type si = rowsPerChunk;
+             si < leftTableView.num_rows();
+             si += rowsPerChunk) {
+          splitPts.push_back(si);
+        }
+        auto chunks = cudf::split(leftTableView, splitPts, stream);
+        for (int j = static_cast<int>(chunks.size()) - 1; j >= 0; --j) {
+          probeSlices.push_back(chunks[j]);
+        }
+      }
+    }
+  }
+
+  // Phase 2: Heuristic-based fallback when exact estimation is unavailable
+  // (non-hash joins, estimation failed, etc.).
+  if (probeSlices.empty() && canSplitProbe &&
+      leftTableView.num_rows() > kMinSplitRows) {
     size_t freeMem = 0, totalMem = 0;
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && totalMem > 0) {
       size_t outputRowBytes =
           std::max(size_t(16), static_cast<size_t>(outputType_->size()) * 8);
 
-      // Estimate build-side size to compute a realistic amplification factor.
-      // Large build tables cause higher amplification (more matches per row).
       auto& rightTables = hashObject_.value().first;
       size_t totalBuildRows = 0;
       size_t buildBytesEstimate = 0;
@@ -3376,11 +3606,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         buildBytesEstimate +=
             static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
       }
-      // Adaptive amplification: scale up aggressively with build size.
-      // TPC-DS multi-way joins with skewed keys can produce extreme
-      // amplification on SF100+ (e.g. 10M+ per probe row with low-
-      // cardinality keys). The cap of 1M and /50 denominator ensure
-      // even relatively small build tables trigger meaningful splitting.
       size_t amplification = std::min(
           size_t(1000000),
           std::max(size_t(1000), totalBuildRows / 50));
@@ -3388,11 +3613,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
       size_t hashTableFootprint = buildBytesEstimate * 2;
       size_t usableFree =
-          (freeMem > hashTableFootprint) ? (freeMem - hashTableFootprint) : (freeMem / 4);
-
-      // Allow each join call to use at most 1% of usable free GPU memory.
-      // With concurrent GPU tasks, even 3% caused cudaErrorInvalidValue
-      // on TPC-DS SF100 queries with high fan-out joins.
+          (freeMem > hashTableFootprint)
+          ? (freeMem - hashTableFootprint)
+          : (freeMem / 4);
       size_t maxAlloc = usableFree / 100;
       auto maxRows = static_cast<cudf::size_type>(std::min(
           static_cast<size_t>(leftTableView.num_rows()),
@@ -3400,15 +3623,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
               static_cast<size_t>(kMinSplitRows),
               maxAlloc / std::max(costPerProbeRow, size_t(1)))));
       if (maxRows < leftTableView.num_rows()) {
-        LOG(INFO) << "Proactive probe split for planNode " << joinNode_->id()
-                  << ": " << leftTableView.num_rows() << " rows -> chunks of "
-                  << maxRows << " (freeMem=" << (freeMem >> 20) << "MB"
-                  << ", totalMem=" << (totalMem >> 20) << "MB"
-                  << ", buildRows=" << totalBuildRows
-                  << ", buildEstMB=" << (buildBytesEstimate >> 20)
-                  << ", hashTableEstMB=" << (hashTableFootprint >> 20)
-                  << ", usableFreeMB=" << (usableFree >> 20)
-                  << ", amplification=" << amplification << "x)";
+        LOG(INFO)
+            << "Heuristic probe split for planNode " << joinNode_->id()
+            << ": " << leftTableView.num_rows() << " rows -> chunks of "
+            << maxRows << " (freeMem=" << (freeMem >> 20) << "MB"
+            << ", totalMem=" << (totalMem >> 20) << "MB"
+            << ", buildRows=" << totalBuildRows
+            << ", amplification=" << amplification << "x)";
         std::vector<cudf::size_type> splitIndices;
         for (cudf::size_type i = maxRows; i < leftTableView.num_rows();
              i += maxRows) {
@@ -3423,107 +3644,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   }
   if (probeSlices.empty()) {
     probeSlices.push_back(leftTableView);
-  }
-
-  // Exact output size estimation below may further re-split probeSlices.
-
-  // Exact output size estimation: use cudf's *_join_size() methods to compute
-  // the actual number of output rows BEFORE attempting the join. If the output
-  // would be too large, pre-split the probe to a safe chunk size.
-  // This avoids cudaErrorInvalidValue from oversized gather map allocations.
-  if (needHashJoin && canSplitProbe && !probeSlices.empty()) {
-    auto& sizeEstHbs = hashObject_.value().second;
-    auto& sizeEstRT = hashObject_.value().first;
-
-    auto sampleSlice = probeSlices.back();
-    if (sampleSlice.num_rows() > 1) {
-      std::vector<std::unique_ptr<cudf::column>> sizeKeyCasts;
-      try {
-        auto sizeAligned = alignProbeKeyTypes(
-            sampleSlice,
-            leftKeyIndices_,
-            sizeEstRT[0]->view(),
-            rightKeyIndices_,
-            sizeKeyCasts,
-            stream);
-
-        size_t totalOutput = 0;
-        auto joinStream =
-            buildStream_.has_value() ? buildStream_.value() : stream;
-        for (size_t i = 0; i < sizeEstRT.size(); ++i) {
-          if (!sizeEstHbs[i] || sizeEstRT[i]->num_rows() == 0) {
-            continue;
-          }
-          if (joinNode_->isInnerJoin() || joinNode_->isRightJoin()) {
-            totalOutput += sizeEstHbs[i]->inner_join_size(
-                sizeAligned.select(leftKeyIndices_), joinStream);
-          } else if (joinNode_->isLeftJoin() || joinNode_->isFullJoin()) {
-            totalOutput += sizeEstHbs[i]->left_join_size(
-                sizeAligned.select(leftKeyIndices_), joinStream);
-          }
-        }
-
-        // Max safe output: gather maps must fit in 25% of free GPU memory
-        // and must not exceed cudf::size_type / 4 to leave headroom.
-        size_t freeMem = freeGpuMemoryBytes();
-        size_t maxGatherMapBytes =
-            freeMem > 0 ? freeMem / 4 : size_t(2) << 30;
-        size_t maxSafe = std::min(
-            static_cast<size_t>(
-                std::numeric_limits<cudf::size_type>::max()) /
-                4,
-            maxGatherMapBytes / (2 * sizeof(cudf::size_type)));
-        maxSafe = std::max(maxSafe, size_t(1024));
-
-        if (totalOutput > maxSafe) {
-          auto sampleRows = sampleSlice.num_rows();
-          auto outputPerRow =
-              totalOutput /
-              std::max(static_cast<size_t>(sampleRows), size_t(1));
-          auto targetMaxRows = std::max(
-              cudf::size_type(1),
-              static_cast<cudf::size_type>(
-                  maxSafe / std::max(outputPerRow, size_t(1))));
-
-          LOG(INFO) << "Exact-size probe re-split for planNode "
-                    << joinNode_->id()
-                    << ": sampleRows=" << sampleRows
-                    << ", totalOutput=" << totalOutput
-                    << ", outputPerRow=" << outputPerRow
-                    << ", maxSafe=" << maxSafe
-                    << ", targetMaxRows=" << targetMaxRows;
-
-          std::vector<cudf::table_view> newSlices;
-          while (!probeSlices.empty()) {
-            auto s = probeSlices.back();
-            probeSlices.pop_back();
-            if (s.num_rows() <= targetMaxRows) {
-              newSlices.push_back(s);
-            } else {
-              std::vector<cudf::size_type> pts;
-              for (cudf::size_type idx = targetMaxRows;
-                   idx < s.num_rows();
-                   idx += targetMaxRows) {
-                pts.push_back(idx);
-              }
-              auto chunks = cudf::split(s, pts, stream);
-              for (auto& c : chunks) {
-                newSlices.push_back(c);
-              }
-            }
-          }
-          for (auto it = newSlices.rbegin(); it != newSlices.rend(); ++it) {
-            probeSlices.push_back(*it);
-          }
-        }
-      } catch (const std::exception& e) {
-        LOG(WARNING)
-            << "Output size estimation failed for planNode "
-            << joinNode_->id() << ": " << e.what()
-            << ". Proceeding with heuristic-based splitting.";
-        recoverGpuMemory();
-      }
-    }
   }
 
   // Process probe slices with recursive adaptive splitting. On CUDA error
