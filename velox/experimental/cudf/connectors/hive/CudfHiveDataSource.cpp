@@ -399,6 +399,24 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
 
+  // When no data columns are needed (e.g. SELECT count(*)), keep the full
+  // cudf table so that the downstream CudfHashAggregation receives a valid
+  // CudfVector with correct num_rows(). The type has 0 children but the
+  // underlying GPU data preserves the row count for count(*) operations.
+  if (dataOutputType_->size() == 0) {
+    RowVectorPtr output;
+    if (cudfIsRegistered()) {
+      output = std::make_shared<CudfVector>(
+          pool_, dataOutputType_, nRows, std::move(cudfTable), stream_);
+    } else {
+      output = RowVector::createEmpty(dataOutputType_, pool_);
+      output->resize(nRows);
+    }
+    output = injectPartitionColumns(std::move(output), nRows);
+    completedRows_ += nRows;
+    return output;
+  }
+
   // Keep only dataOutputType_.size() columns (data columns; filter-only extras
   // are trimmed).
   if (dataOutputType_->size() < cudfTable->num_columns()) {
@@ -1135,6 +1153,20 @@ RowVectorPtr CudfHiveDataSource::flushAccumulated() {
   const auto nRows = cudfTable->num_rows();
   if (nRows == 0) {
     return nullptr;
+  }
+
+  if (dataOutputType_->size() == 0) {
+    RowVectorPtr output;
+    if (cudfIsRegistered()) {
+      output = std::make_shared<CudfVector>(
+          pool_, dataOutputType_, nRows, std::move(cudfTable), stream_);
+    } else {
+      output = RowVector::createEmpty(dataOutputType_, pool_);
+      output->resize(nRows);
+    }
+    output = injectPartitionColumns(std::move(output), nRows);
+    completedRows_ += nRows;
+    return output;
   }
 
   // Keep only dataOutputType_.size() columns

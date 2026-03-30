@@ -377,7 +377,9 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   std::vector<std::unique_ptr<cudf::table>> castStorage;
   alignDecimalColumnsForConcat(tableViews, castStorage, stream);
 
-  // Estimate bytes per row from the first table's schema.
+  // Estimate bytes per row from the first table's schema. Multiply by 2 to
+  // account for null bitmasks, alignment padding, string offset arrays, and
+  // the fact that cudf::concatenate holds both input + output simultaneously.
   size_t bytesPerRow = 0;
   {
     auto tv0 = tableViews[0];
@@ -386,23 +388,22 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
       if (cudf::is_fixed_width(dt)) {
         bytesPerRow += cudf::size_of(dt);
       } else {
-        bytesPerRow += 32; // estimate for variable-width types
+        bytesPerRow += 64;
       }
     }
-    bytesPerRow = std::max(bytesPerRow, size_t(1));
+    bytesPerRow = std::max(bytesPerRow * 2, size_t(2));
   }
 
-  // Limit batches by both row count and byte size. Query free GPU memory
-  // and cap each batch to ~1% of free memory to avoid oversized allocations
-  // that trigger cudaErrorInvalidValue. Very conservative because concurrent
-  // GPU tasks (maxConcurrentGpuTasks=3) compete for memory and the RMM pool
-  // may already be heavily fragmented. With 22 GB pool and 3 tasks, each
-  // task effectively has ~7 GB; 1% = ~70 MB per batch which is safe.
-  size_t maxBatchBytes = std::numeric_limits<size_t>::max();
+  // Limit batches by byte size. Use the lesser of 0.5% of free GPU memory
+  // and a hard cap (256 MB) to avoid oversized allocations that trigger
+  // cudaErrorInvalidValue. Conservative because concurrent GPU tasks compete
+  // for memory and the RMM pool may be heavily fragmented.
+  static constexpr size_t kMaxBatchBytesCap = 256ULL << 20; // 256 MB
+  size_t maxBatchBytes = kMaxBatchBytesCap;
   {
     size_t freeMem = 0, totalMem = 0;
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
-      maxBatchBytes = freeMem / 100;
+      maxBatchBytes = std::min(kMaxBatchBytesCap, freeMem / 200);
     }
   }
 
@@ -426,8 +427,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
           << "getConcatenatedTableBatched: concatenate failed for range ["
           << begin << "," << end << ") (" << (end - begin) << " tables): "
           << e.what() << ". Falling back to individual table copies.";
-      auto err = cudaGetLastError();
-      (void)err;
+      cudaDeviceSynchronize();
+      cudaGetLastError();
       for (size_t j = begin; j < end; ++j) {
         try {
           out.push_back(std::make_unique<cudf::table>(
