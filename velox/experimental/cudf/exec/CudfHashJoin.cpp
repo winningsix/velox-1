@@ -252,6 +252,34 @@ cudf::table_view alignProbeKeyTypes(
   return cudf::table_view(cols);
 }
 
+// Compute the maximum number of output rows that can be safely gathered
+// in a single cudf::gather() call. Prevents cudaErrorInvalidValue from
+// oversized device_buffer allocations and respects cudf::size_type limits.
+size_t computeMaxGatherRows(
+    cudf::table_view leftTableView,
+    cudf::table_view rightTableView) {
+  size_t bytesPerRow = 0;
+  for (cudf::size_type c = 0; c < leftTableView.num_columns(); ++c) {
+    auto dt = leftTableView.column(c).type();
+    bytesPerRow += cudf::is_fixed_width(dt) ? cudf::size_of(dt) : 32;
+  }
+  for (cudf::size_type c = 0; c < rightTableView.num_columns(); ++c) {
+    auto dt = rightTableView.column(c).type();
+    bytesPerRow += cudf::is_fixed_width(dt) ? cudf::size_of(dt) : 32;
+  }
+  bytesPerRow = std::max(bytesPerRow, size_t(8));
+
+  auto maxRows =
+      static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+
+  size_t freeMem = freeGpuMemoryBytes();
+  if (freeMem > 0) {
+    size_t memBased = (freeMem / 5) / bytesPerRow;
+    maxRows = std::min(maxRows, std::max(memBased, size_t(1024)));
+  }
+  return maxRows;
+}
+
 } // namespace
 
 void CudfHashJoinProbe::close() {
@@ -1202,105 +1230,83 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
 
-    auto joinOutputRows =
-        static_cast<int64_t>(leftJoinIndices->size());
-    auto outputCols = static_cast<int64_t>(outputType_->size());
-    VELOX_CHECK_LE(
-        joinOutputRows,
-        static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
-        "Inner join output ({} rows) exceeds cudf::size_type limit. "
-        "Probe={} rows, build={} rows, planNode={}. "
-        "Consider increasing shuffle partitions to reduce data skew.",
-        joinOutputRows,
-        leftTableView.num_rows(),
-        rightTableView.num_rows(),
-        joinNode_->id());
-
-    auto leftIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*leftJoinIndices};
-    auto rightIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
-    auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
-    auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
-    std::vector<std::unique_ptr<cudf::column>> joinedCols;
+    auto joinOutputRows = leftJoinIndices->size();
+    auto maxBatchRows = computeMaxGatherRows(leftTableView, rightTableView);
+    if (joinOutputRows > maxBatchRows) {
+      LOG(INFO) << "Batching inner join gather for planNode " << joinNode_->id()
+                << ": " << joinOutputRows << " output rows -> batches of "
+                << maxBatchRows;
+    }
 
     try {
-      if (joinNode_->filter()) {
-        if (useAstFilter_) {
-          try {
-            cudfOutputs.push_back(filteredOutputIndices(
-                leftTableView,
-                leftIndicesCol,
-                rightTableView,
-                rightIndicesCol,
-                extendedLeftView,
-                extendedRightView,
-                cudf::join_kind::INNER_JOIN,
-                stream));
-          } catch (const std::bad_alloc&) {
-            throw;
-          } catch (const std::exception& astE) {
-            if (isCudaRelatedError(astE)) {
+      for (size_t off = 0; off < joinOutputRows; off += maxBatchRows) {
+        auto batchSz = std::min(maxBatchRows, joinOutputRows - off);
+        auto leftSpan = cudf::device_span<cudf::size_type const>(
+            leftJoinIndices->data() + off, batchSz);
+        auto rightSpan = cudf::device_span<cudf::size_type const>(
+            rightJoinIndices->data() + off, batchSz);
+        auto leftBatchCol = cudf::column_view{leftSpan};
+        auto rightBatchCol = cudf::column_view{rightSpan};
+
+        if (joinNode_->filter()) {
+          if (useAstFilter_) {
+            try {
+              cudfOutputs.push_back(filteredOutputIndices(
+                  leftTableView, leftBatchCol,
+                  rightTableView, rightBatchCol,
+                  extendedLeftView, extendedRightView,
+                  cudf::join_kind::INNER_JOIN, stream));
+            } catch (const std::bad_alloc&) {
               throw;
+            } catch (const std::exception& astE) {
+              if (isCudaRelatedError(astE)) throw;
+              LOG(WARNING)
+                  << "CudfHashJoinProbe::innerJoin: AST filter failed for "
+                  << "planNode " << joinNode_->id()
+                  << ", falling back to evaluator: " << astE.what();
+              useAstFilter_ = false;
+              auto filterFunc =
+                  [stream](
+                      std::vector<std::unique_ptr<cudf::column>>&& jc,
+                      cudf::column_view fc) {
+                    auto ft = std::make_unique<cudf::table>(std::move(jc));
+                    auto res = cudf::apply_boolean_mask(
+                        *ft, fc, stream, cudf::get_current_device_resource_ref());
+                    return res->release();
+                  };
+              cudfOutputs.push_back(filteredOutput(
+                  leftTableView, leftBatchCol,
+                  rightTableView, rightBatchCol,
+                  filterFunc, stream));
             }
-            LOG(WARNING)
-                << "CudfHashJoinProbe::innerJoin: AST filter failed for "
-                << "planNode " << joinNode_->id()
-                << ", falling back to evaluator: " << astE.what();
-            useAstFilter_ = false;
+          } else {
             auto filterFunc =
                 [stream](
-                    std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-                    cudf::column_view filterColumn) {
-                  auto filterTable =
-                      std::make_unique<cudf::table>(std::move(joinedCols));
-                  auto filteredTable = cudf::apply_boolean_mask(
-                      *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
-                  return filteredTable->release();
+                    std::vector<std::unique_ptr<cudf::column>>&& jc,
+                    cudf::column_view fc) {
+                  auto ft = std::make_unique<cudf::table>(std::move(jc));
+                  auto res = cudf::apply_boolean_mask(
+                      *ft, fc, stream, cudf::get_current_device_resource_ref());
+                  return res->release();
                 };
             cudfOutputs.push_back(filteredOutput(
-                leftTableView,
-                leftIndicesCol,
-                rightTableView,
-                rightIndicesCol,
-                filterFunc,
-                stream));
+                leftTableView, leftBatchCol,
+                rightTableView, rightBatchCol,
+                filterFunc, stream));
           }
         } else {
-          auto filterFunc =
-              [stream](
-                  std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-                  cudf::column_view filterColumn) {
-                auto filterTable =
-                    std::make_unique<cudf::table>(std::move(joinedCols));
-                auto filteredTable = cudf::apply_boolean_mask(
-                    *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
-                return filteredTable->release();
-              };
-          cudfOutputs.push_back(filteredOutput(
-              leftTableView,
-              leftIndicesCol,
-              rightTableView,
-              rightIndicesCol,
-              filterFunc,
+          cudfOutputs.push_back(unfilteredOutput(
+              leftTableView, leftBatchCol,
+              rightTableView, rightBatchCol,
               stream));
         }
-      } else {
-        cudfOutputs.push_back(unfilteredOutput(
-            leftTableView,
-            leftIndicesCol,
-            rightTableView,
-            rightIndicesCol,
-            stream));
       }
     } catch (const std::bad_alloc&) {
       throw;
     } catch (const std::exception& e) {
-      if (isCudaRelatedError(e)) {
-        throw;
-      }
+      if (isCudaRelatedError(e)) throw;
       VELOX_FAIL(
-          "GPU join gather/filter failed (joinOutput={} rows, "
+          "GPU inner join gather/filter failed (joinOutput={} rows, "
           "probe={} rows, build={} rows, planNode={}): {}",
           joinOutputRows,
           leftTableView.num_rows(),
@@ -1377,94 +1383,75 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
 
-    auto joinOutputRows =
-        static_cast<int64_t>(leftJoinIndices->size());
-    VELOX_CHECK_LE(
-        joinOutputRows,
-        static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
-        "Left join output ({} rows) exceeds cudf::size_type limit. "
-        "Probe={} rows, build={} rows, planNode={}. "
-        "Consider increasing shuffle partitions to reduce data skew.",
-        joinOutputRows,
-        leftTableView.num_rows(),
-        rightTableView.num_rows(),
-        joinNode_->id());
+    auto joinOutputRows = leftJoinIndices->size();
+    auto maxBatchRows = computeMaxGatherRows(leftTableView, rightTableView);
+    if (joinOutputRows > maxBatchRows) {
+      LOG(INFO) << "Batching left join gather for planNode " << joinNode_->id()
+                << ": " << joinOutputRows << " output rows -> batches of "
+                << maxBatchRows;
+    }
 
-    auto leftIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*leftJoinIndices};
-    auto rightIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
-    auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
-    auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
-    std::vector<std::unique_ptr<cudf::column>> joinedCols;
+    for (size_t off = 0; off < joinOutputRows; off += maxBatchRows) {
+      auto batchSz = std::min(maxBatchRows, joinOutputRows - off);
+      auto leftSpan = cudf::device_span<cudf::size_type const>(
+          leftJoinIndices->data() + off, batchSz);
+      auto rightSpan = cudf::device_span<cudf::size_type const>(
+          rightJoinIndices->data() + off, batchSz);
+      auto leftBatchCol = cudf::column_view{leftSpan};
+      auto rightBatchCol = cudf::column_view{rightSpan};
 
-    if (joinNode_->filter()) {
-      if (useAstFilter_) {
-        try {
-          cudfOutputs.push_back(filteredOutputIndices(
-              leftTableView,
-              leftIndicesCol,
-              rightTableView,
-              rightIndicesCol,
-              extendedLeftView,
-              extendedRightView,
-              cudf::join_kind::LEFT_JOIN,
-              stream));
-        } catch (const std::bad_alloc&) {
-          throw;
-        } catch (const std::exception& astE) {
-          if (isCudaRelatedError(astE)) {
+      if (joinNode_->filter()) {
+        if (useAstFilter_) {
+          try {
+            cudfOutputs.push_back(filteredOutputIndices(
+                leftTableView, leftBatchCol,
+                rightTableView, rightBatchCol,
+                extendedLeftView, extendedRightView,
+                cudf::join_kind::LEFT_JOIN, stream));
+          } catch (const std::bad_alloc&) {
             throw;
+          } catch (const std::exception& astE) {
+            if (isCudaRelatedError(astE)) throw;
+            LOG(WARNING)
+                << "CudfHashJoinProbe::leftJoin: AST filter failed for "
+                << "planNode " << joinNode_->id()
+                << ", falling back to evaluator: " << astE.what();
+            useAstFilter_ = false;
+            auto filterFunc =
+                [stream](
+                    std::vector<std::unique_ptr<cudf::column>>&& jc,
+                    cudf::column_view fc) {
+                  auto ft = std::make_unique<cudf::table>(std::move(jc));
+                  auto res = cudf::apply_boolean_mask(
+                      *ft, fc, stream, cudf::get_current_device_resource_ref());
+                  return res->release();
+                };
+            cudfOutputs.push_back(filteredOutput(
+                leftTableView, leftBatchCol,
+                rightTableView, rightBatchCol,
+                filterFunc, stream));
           }
-          LOG(WARNING)
-              << "CudfHashJoinProbe::leftJoin: AST filter failed for "
-              << "planNode " << joinNode_->id()
-              << ", falling back to evaluator: " << astE.what();
-          useAstFilter_ = false;
+        } else {
           auto filterFunc =
               [stream](
-                  std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-                  cudf::column_view filterColumn) {
-                auto filterTable =
-                    std::make_unique<cudf::table>(std::move(joinedCols));
-                auto filteredTable = cudf::apply_boolean_mask(
-                    *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
-                return filteredTable->release();
+                  std::vector<std::unique_ptr<cudf::column>>&& jc,
+                  cudf::column_view fc) {
+                auto ft = std::make_unique<cudf::table>(std::move(jc));
+                auto res = cudf::apply_boolean_mask(
+                    *ft, fc, stream, cudf::get_current_device_resource_ref());
+                return res->release();
               };
           cudfOutputs.push_back(filteredOutput(
-              leftTableView,
-              leftIndicesCol,
-              rightTableView,
-              rightIndicesCol,
-              filterFunc,
-              stream));
+              leftTableView, leftBatchCol,
+              rightTableView, rightBatchCol,
+              filterFunc, stream));
         }
       } else {
-        auto filterFunc =
-            [stream](
-                std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-                cudf::column_view filterColumn) {
-              auto filterTable =
-                  std::make_unique<cudf::table>(std::move(joinedCols));
-              auto filteredTable = cudf::apply_boolean_mask(
-                  *filterTable, filterColumn, stream, cudf::get_current_device_resource_ref());
-              return filteredTable->release();
-            };
-        cudfOutputs.push_back(filteredOutput(
-            leftTableView,
-            leftIndicesCol,
-            rightTableView,
-            rightIndicesCol,
-            filterFunc,
+        cudfOutputs.push_back(unfilteredOutput(
+            leftTableView, leftBatchCol,
+            rightTableView, rightBatchCol,
             stream));
       }
-    } else {
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          stream));
     }
   }
   return cudfOutputs;
@@ -1502,24 +1489,17 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
 
-    {
-      auto joinOutputRows =
-          static_cast<int64_t>(leftJoinIndices->size());
-      VELOX_CHECK_LE(
-          joinOutputRows,
-          static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
-          "Right join output ({} rows) exceeds cudf::size_type limit. "
-          "Probe={} rows, build={} rows, planNode={}. "
-          "Consider increasing shuffle partitions to reduce data skew.",
-          joinOutputRows,
-          leftTableView.num_rows(),
-          rightTableView.num_rows(),
-          joinNode_->id());
+    auto joinOutputRows = leftJoinIndices->size();
+    auto maxBatchRows = computeMaxGatherRows(leftTableView, rightTableView);
+    if (joinOutputRows > maxBatchRows) {
+      LOG(INFO) << "Batching right join gather for planNode " << joinNode_->id()
+                << ": " << joinOutputRows << " output rows -> batches of "
+                << maxBatchRows;
     }
 
-    // cudf::scatter is async: it enqueues a device memcpy of the old flags
-    // (the target) plus a thrust::scatter kernel onto `stream`, then returns
-    // immediately. The old rightMatchedFlags_[i] column must stay alive until
+    // Update matched flags with FULL indices before batching the gather.
+    // cudf::contains operates on the full index array which is lightweight
+    // (no column materialization), so it doesn't trigger oversized allocs.
     if (!joinNode_->filter() && rightTableView.num_rows() > 0) {
       auto rightIdxCol = cudf::column_view{
           cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
@@ -1544,75 +1524,69 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
       rightMatchedFlags_[i] = std::move(updatedFlags);
     }
 
-    auto leftIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*leftJoinIndices};
-    auto rightIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
-    auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
-    auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
-    std::vector<std::unique_ptr<cudf::column>> joinedCols;
+    for (size_t off = 0; off < joinOutputRows; off += maxBatchRows) {
+      auto batchSz = std::min(maxBatchRows, joinOutputRows - off);
+      auto leftSpan = cudf::device_span<cudf::size_type const>(
+          leftJoinIndices->data() + off, batchSz);
+      auto rightSpan = cudf::device_span<cudf::size_type const>(
+          rightJoinIndices->data() + off, batchSz);
+      auto leftBatchCol = cudf::column_view{leftSpan};
+      auto rightBatchCol = cudf::column_view{rightSpan};
 
-    if (joinNode_->filter()) {
-      auto& rightMatchedFlags = rightMatchedFlags_[i];
-      auto numBuildRows = rightTableView.num_rows();
-      auto filterFunc =
-          [&rightMatchedFlags, rightIndicesSpan, numBuildRows, stream](
-              std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
-              cudf::column_view filterColumn) {
-            // apply the filter
-            auto filterTable =
-                std::make_unique<cudf::table>(std::move(joinedCols));
-            auto filteredTable =
-                cudf::apply_boolean_mask(*filterTable, filterColumn, stream);
-            joinedCols = filteredTable->release();
+      if (joinNode_->filter()) {
+        auto& rightMatchedFlags = rightMatchedFlags_[i];
+        auto numBuildRows = rightTableView.num_rows();
+        auto batchRightSpan = rightSpan;
+        auto filterFunc =
+            [&rightMatchedFlags, batchRightSpan, numBuildRows, stream](
+                std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
+                cudf::column_view filterColumn) {
+              auto filterTable =
+                  std::make_unique<cudf::table>(std::move(joinedCols));
+              auto filteredTable =
+                  cudf::apply_boolean_mask(*filterTable, filterColumn, stream);
+              joinedCols = filteredTable->release();
 
-            // For streaming right join, after applying filter, we record
-            // matched right indices filter rightJoinIndices with the same mask
-            // to update matched flags
-            auto rightIdxCol = cudf::column_view{rightIndicesSpan};
-            auto filteredIdxTable = cudf::apply_boolean_mask(
-                cudf::table_view{std::vector<cudf::column_view>{rightIdxCol}},
-                filterColumn,
-                stream);
-            auto filteredCols = filteredIdxTable->release();
-            auto filteredRightIdxCol = std::move(filteredCols[0]);
+              auto rightIdxCol = cudf::column_view{batchRightSpan};
+              auto filteredIdxTable = cudf::apply_boolean_mask(
+                  cudf::table_view{std::vector<cudf::column_view>{rightIdxCol}},
+                  filterColumn,
+                  stream);
+              auto filteredCols = filteredIdxTable->release();
+              auto filteredRightIdxCol = std::move(filteredCols[0]);
 
-            if (numBuildRows > 0) {
-              auto rowIndices = cudf::sequence(
-                  numBuildRows,
-                  cudf::numeric_scalar<cudf::size_type>(0, true, stream),
-                  cudf::numeric_scalar<cudf::size_type>(1, true, stream),
-                  stream,
-                  cudf::get_current_device_resource_ref());
+              if (numBuildRows > 0) {
+                auto rowIndices = cudf::sequence(
+                    numBuildRows,
+                    cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+                    cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+                    stream,
+                    cudf::get_current_device_resource_ref());
 
-              auto matchedInBatch = cudf::contains(
-                  filteredRightIdxCol->view(), rowIndices->view());
+                auto matchedInBatch = cudf::contains(
+                    filteredRightIdxCol->view(), rowIndices->view());
 
-              auto updatedFlags = cudf::binary_operation(
-                  rightMatchedFlags->view(),
-                  matchedInBatch->view(),
-                  cudf::binary_operator::BITWISE_OR,
-                  cudf::data_type{cudf::type_id::BOOL8},
-                  stream,
-                  cudf::get_current_device_resource_ref());
-              rightMatchedFlags = std::move(updatedFlags);
-            }
-            return std::move(joinedCols);
-          };
-      cudfOutputs.push_back(filteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          filterFunc,
-          stream));
-    } else {
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          stream));
+                auto updatedFlags = cudf::binary_operation(
+                    rightMatchedFlags->view(),
+                    matchedInBatch->view(),
+                    cudf::binary_operator::BITWISE_OR,
+                    cudf::data_type{cudf::type_id::BOOL8},
+                    stream,
+                    cudf::get_current_device_resource_ref());
+                rightMatchedFlags = std::move(updatedFlags);
+              }
+              return std::move(joinedCols);
+            };
+        cudfOutputs.push_back(filteredOutput(
+            leftTableView, leftBatchCol,
+            rightTableView, rightBatchCol,
+            filterFunc, stream));
+      } else {
+        cudfOutputs.push_back(unfilteredOutput(
+            leftTableView, leftBatchCol,
+            rightTableView, rightBatchCol,
+            stream));
+      }
     }
   }
   return cudfOutputs;
@@ -1650,21 +1624,15 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
 
-    {
-      auto joinOutputRows =
-          static_cast<int64_t>(leftJoinIndices->size());
-      VELOX_CHECK_LE(
-          joinOutputRows,
-          static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
-          "Full join output ({} rows) exceeds cudf::size_type limit. "
-          "Probe={} rows, build={} rows, planNode={}. "
-          "Consider increasing shuffle partitions to reduce data skew.",
-          joinOutputRows,
-          leftTableView.num_rows(),
-          rightTableView.num_rows(),
-          joinNode_->id());
+    auto joinOutputRows = leftJoinIndices->size();
+    auto maxBatchRows = computeMaxGatherRows(leftTableView, rightTableView);
+    if (joinOutputRows > maxBatchRows) {
+      LOG(INFO) << "Batching full join gather for planNode " << joinNode_->id()
+                << ": " << joinOutputRows << " output rows -> batches of "
+                << maxBatchRows;
     }
 
+    // Update matched flags with FULL indices before batching the gather.
     if (!joinNode_->filter() && rightTableView.num_rows() > 0) {
       auto rightIdxCol = cudf::column_view{
           cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
@@ -1689,73 +1657,76 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
       rightMatchedFlags_[i] = std::move(updatedFlags);
     }
 
-    auto leftIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*leftJoinIndices};
-    auto rightIndicesSpan =
-        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
-    auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
-    auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
-
     if (joinNode_->filter()) {
-      // Use filter_join_indices with LEFT_JOIN to get proper full join probe
-      // semantics: all probe rows are kept, build columns are NULL when filter
-      // fails or no match.
-      auto [filteredLeftJoinIndices, filteredRightJoinIndices] =
-          cudf::filter_join_indices(
-              leftTableView,
-              rightTableView,
-              leftIndicesCol,
-              rightIndicesCol,
-              tree_.back(),
-              cudf::join_kind::LEFT_JOIN,
-              stream);
+      // Process filter + gather in batches over the raw join indices.
+      for (size_t off = 0; off < joinOutputRows; off += maxBatchRows) {
+        auto batchSz = std::min(maxBatchRows, joinOutputRows - off);
+        auto leftSpan = cudf::device_span<cudf::size_type const>(
+            leftJoinIndices->data() + off, batchSz);
+        auto rightSpan = cudf::device_span<cudf::size_type const>(
+            rightJoinIndices->data() + off, batchSz);
+        auto leftBatchCol = cudf::column_view{leftSpan};
+        auto rightBatchCol = cudf::column_view{rightSpan};
 
-      auto& rightMatchedFlags = rightMatchedFlags_[i];
-      auto filteredRightIndicesSpan =
-          cudf::device_span<cudf::size_type const>{*filteredRightJoinIndices};
-      auto filteredRightIdxCol = cudf::column_view{filteredRightIndicesSpan};
+        auto [filteredLeftJoinIndices, filteredRightJoinIndices] =
+            cudf::filter_join_indices(
+                leftTableView, rightTableView,
+                leftBatchCol, rightBatchCol,
+                tree_.back(), cudf::join_kind::LEFT_JOIN, stream);
 
-      if (rightTableView.num_rows() > 0) {
-        auto n = rightTableView.num_rows();
-        auto rowIndices = cudf::sequence(
-            n,
-            cudf::numeric_scalar<cudf::size_type>(0, true, stream),
-            cudf::numeric_scalar<cudf::size_type>(1, true, stream),
-            stream,
-            cudf::get_current_device_resource_ref());
+        auto& rightMatchedFlags = rightMatchedFlags_[i];
+        auto filteredRightIndicesSpan =
+            cudf::device_span<cudf::size_type const>{
+                *filteredRightJoinIndices};
+        auto filteredRightIdxCol =
+            cudf::column_view{filteredRightIndicesSpan};
 
-        auto matchedInBatch =
-            cudf::contains(filteredRightIdxCol, rowIndices->view());
+        if (rightTableView.num_rows() > 0) {
+          auto n = rightTableView.num_rows();
+          auto rowIndices = cudf::sequence(
+              n,
+              cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+              cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+              stream,
+              cudf::get_current_device_resource_ref());
 
-        auto updatedFlags = cudf::binary_operation(
-            rightMatchedFlags->view(),
-            matchedInBatch->view(),
-            cudf::binary_operator::BITWISE_OR,
-            cudf::data_type{cudf::type_id::BOOL8},
-            stream,
-            cudf::get_current_device_resource_ref());
-        rightMatchedFlags = std::move(updatedFlags);
+          auto matchedInBatch =
+              cudf::contains(filteredRightIdxCol, rowIndices->view());
+
+          auto updatedFlags = cudf::binary_operation(
+              rightMatchedFlags->view(),
+              matchedInBatch->view(),
+              cudf::binary_operator::BITWISE_OR,
+              cudf::data_type{cudf::type_id::BOOL8},
+              stream,
+              cudf::get_current_device_resource_ref());
+          rightMatchedFlags = std::move(updatedFlags);
+        }
+
+        auto filteredLeftIndicesSpan =
+            cudf::device_span<cudf::size_type const>{
+                *filteredLeftJoinIndices};
+        auto filteredLeftIndicesCol =
+            cudf::column_view{filteredLeftIndicesSpan};
+        auto filteredRightIndicesCol =
+            cudf::column_view{filteredRightIndicesSpan};
+        cudfOutputs.push_back(unfilteredOutput(
+            leftTableView, filteredLeftIndicesCol,
+            rightTableView, filteredRightIndicesCol,
+            stream));
       }
-
-      // Build output using filtered indices
-      auto filteredLeftIndicesSpan =
-          cudf::device_span<cudf::size_type const>{*filteredLeftJoinIndices};
-      auto filteredLeftIndicesCol = cudf::column_view{filteredLeftIndicesSpan};
-      auto filteredRightIndicesCol =
-          cudf::column_view{filteredRightIndicesSpan};
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          filteredLeftIndicesCol,
-          rightTableView,
-          filteredRightIndicesCol,
-          stream));
     } else {
-      cudfOutputs.push_back(unfilteredOutput(
-          leftTableView,
-          leftIndicesCol,
-          rightTableView,
-          rightIndicesCol,
-          stream));
+      for (size_t off = 0; off < joinOutputRows; off += maxBatchRows) {
+        auto batchSz = std::min(maxBatchRows, joinOutputRows - off);
+        auto leftSpan = cudf::device_span<cudf::size_type const>(
+            leftJoinIndices->data() + off, batchSz);
+        auto rightSpan = cudf::device_span<cudf::size_type const>(
+            rightJoinIndices->data() + off, batchSz);
+        cudfOutputs.push_back(unfilteredOutput(
+            leftTableView, cudf::column_view{leftSpan},
+            rightTableView, cudf::column_view{rightSpan},
+            stream));
+      }
     }
   }
   return cudfOutputs;

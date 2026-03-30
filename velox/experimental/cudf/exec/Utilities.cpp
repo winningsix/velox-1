@@ -393,16 +393,52 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   }
 
   // Limit batches by both row count and byte size. Query free GPU memory
-  // and cap each batch to ~25% of free memory to avoid oversized allocations
+  // and cap each batch to ~15% of free memory to avoid oversized allocations
   // that trigger cudaErrorInvalidValue. Conservative limit accounts for
   // concurrent GPU tasks competing for the same memory pool.
   size_t maxBatchBytes = std::numeric_limits<size_t>::max();
   {
     size_t freeMem = 0, totalMem = 0;
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
-      maxBatchBytes = freeMem * 25 / 100;
+      maxBatchBytes = freeMem * 15 / 100;
     }
   }
+
+  // Helper: try to concatenate a range of table views. On CUDA/OOM failure,
+  // fall back to copying each table individually (no concatenation).
+  auto safeConcatenate = [&](size_t begin, size_t end,
+      std::vector<std::unique_ptr<cudf::table>>& out) {
+    if (begin >= end) return;
+    if (end - begin == 1) {
+      out.push_back(std::make_unique<cudf::table>(
+          tableViews[begin], stream, cudf::get_current_device_resource_ref()));
+      return;
+    }
+    try {
+      out.push_back(cudf::concatenate(
+          std::vector<cudf::table_view>(
+              tableViews.begin() + begin, tableViews.begin() + end),
+          stream, cudf::get_current_device_resource_ref()));
+    } catch (const std::exception& e) {
+      LOG(WARNING)
+          << "getConcatenatedTableBatched: concatenate failed for range ["
+          << begin << "," << end << ") (" << (end - begin) << " tables): "
+          << e.what() << ". Falling back to individual table copies.";
+      auto err = cudaGetLastError();
+      (void)err;
+      for (size_t j = begin; j < end; ++j) {
+        try {
+          out.push_back(std::make_unique<cudf::table>(
+              tableViews[j], stream,
+              cudf::get_current_device_resource_ref()));
+        } catch (const std::exception& copyErr) {
+          LOG(WARNING) << "getConcatenatedTableBatched: table copy failed "
+                       << "for index " << j << ": " << copyErr.what();
+          cudaGetLastError();
+        }
+      }
+    }
+  };
 
   std::vector<std::unique_ptr<cudf::table>> outputTables;
   auto const maxRows =
@@ -413,17 +449,10 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   for (size_t i = 0; i < tableViews.size(); ++i) {
     auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
     auto const numBytes = numRows * bytesPerRow;
-    // If adding this table would exceed either limit, flush current batch
-    // [startpos, i).
     if (runningRows > 0 &&
         (runningRows + numRows > maxRows ||
          runningBytes + numBytes > maxBatchBytes)) {
-      outputTables.push_back(
-          cudf::concatenate(
-              std::vector<cudf::table_view>(
-                  tableViews.begin() + startpos, tableViews.begin() + i),
-              stream,
-              cudf::get_current_device_resource_ref()));
+      safeConcatenate(startpos, i, outputTables);
       startpos = i;
       runningRows = 0;
       runningBytes = 0;
@@ -431,14 +460,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     runningRows += numRows;
     runningBytes += numBytes;
   }
-  // Flush the final batch [startpos, end).
   if (startpos < tableViews.size()) {
-    outputTables.push_back(
-        cudf::concatenate(
-            std::vector<cudf::table_view>(
-                tableViews.begin() + startpos, tableViews.end()),
-            stream,
-            cudf::get_current_device_resource_ref()));
+    safeConcatenate(startpos, tableViews.size(), outputTables);
   }
   stream.synchronize();
   return outputTables;
