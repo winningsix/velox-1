@@ -3197,10 +3197,15 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
                     ? innerJoin(pv, stream)
                     : leftJoin(pv, stream);
               };
+              auto noFallback = [](cudf::table_view, rmm::cuda_stream_view)
+                  -> std::vector<std::unique_ptr<cudf::table>> {
+                return {};
+              };
               auto partResults = joinWithAdaptiveSplit(
                   pPart, stream, partJoinFn,
                   fmt::format("Grace partition {} planNode {}",
-                              p, joinNode_->id()));
+                              p, joinNode_->id()),
+                  noFallback);
               for (auto& r : partResults) {
                 cudfOutputs.push_back(std::move(r));
               }
@@ -3542,8 +3547,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
 
     if (canSplitProbe) {
+      auto buildChunkFallback =
+          [this](cudf::table_view pv, rmm::cuda_stream_view s)
+              -> std::vector<std::unique_ptr<cudf::table>> {
+        return joinWithChunkedBuild(pv, s);
+      };
       auto results = joinWithAdaptiveSplit(
-          slice, stream, executeJoin, joinContext);
+          slice, stream, executeJoin, joinContext, buildChunkFallback);
       for (auto& r : results) {
         cudfOutputs.push_back(std::move(r));
       }
