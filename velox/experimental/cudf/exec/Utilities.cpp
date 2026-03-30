@@ -24,6 +24,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -43,6 +44,8 @@
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 
 #include <common/base/Exceptions.h>
+
+#include <cuda_runtime_api.h>
 
 #include <cstdlib>
 #include <limits>
@@ -181,6 +184,13 @@ uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
   }
   return totalBytes;
 }
+
+namespace {
+void alignDecimalColumnsForConcat(
+    std::vector<cudf::table_view>& tableViews,
+    std::vector<std::unique_ptr<cudf::table>>& castStorage,
+    rmm::cuda_stream_view stream);
+} // namespace
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -367,16 +377,46 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   std::vector<std::unique_ptr<cudf::table>> castStorage;
   alignDecimalColumnsForConcat(tableViews, castStorage, stream);
 
+  // Estimate bytes per row from the first table's schema.
+  size_t bytesPerRow = 0;
+  {
+    auto tv0 = tableViews[0];
+    for (cudf::size_type c = 0; c < tv0.num_columns(); ++c) {
+      auto dt = tv0.column(c).type();
+      if (cudf::is_fixed_width(dt)) {
+        bytesPerRow += cudf::size_of(dt);
+      } else {
+        bytesPerRow += 32; // estimate for variable-width types
+      }
+    }
+    bytesPerRow = std::max(bytesPerRow, size_t(1));
+  }
+
+  // Limit batches by both row count and byte size. Query free GPU memory
+  // and cap each batch to ~40% of free memory to avoid oversized allocations
+  // that trigger cudaErrorInvalidValue.
+  size_t maxBatchBytes = std::numeric_limits<size_t>::max();
+  {
+    size_t freeMem = 0, totalMem = 0;
+    if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
+      maxBatchBytes = freeMem * 40 / 100;
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::table>> outputTables;
   auto const maxRows =
       static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
   size_t startpos = 0;
   size_t runningRows = 0;
+  size_t runningBytes = 0;
   for (size_t i = 0; i < tableViews.size(); ++i) {
     auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
-    // If adding this table would exceed the limit, flush current batch
+    auto const numBytes = numRows * bytesPerRow;
+    // If adding this table would exceed either limit, flush current batch
     // [startpos, i).
-    if (runningRows > 0 && runningRows + numRows > maxRows) {
+    if (runningRows > 0 &&
+        (runningRows + numRows > maxRows ||
+         runningBytes + numBytes > maxBatchBytes)) {
       outputTables.push_back(
           cudf::concatenate(
               std::vector<cudf::table_view>(
@@ -385,8 +425,10 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
               cudf::get_current_device_resource_ref()));
       startpos = i;
       runningRows = 0;
+      runningBytes = 0;
     }
     runningRows += numRows;
+    runningBytes += numBytes;
   }
   // Flush the final batch [startpos, end).
   if (startpos < tableViews.size()) {

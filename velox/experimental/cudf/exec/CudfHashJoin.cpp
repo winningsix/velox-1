@@ -157,8 +157,12 @@ bool isCudaRelatedError(const std::exception& e) {
 // reliable way to distinguish OOM (retriable) from fatal errors.
 bool isFatalCudaError(const std::exception& e) {
   std::string what = e.what();
+  // cudaErrorInvalidValue is intentionally NOT in this list. It typically
+  // indicates an oversized allocation request (e.g., when join output exceeds
+  // INT32_MAX rows and buffer size wraps). The GPU context is NOT corrupted,
+  // so the retry/split mechanism in getOutput() can recover by processing
+  // smaller probe chunks.
   static const char* fatalPatterns[] = {
-      "cudaErrorInvalidValue",
       "cudaErrorIllegalAddress",
       "cudaErrorIllegalInstruction",
       "cudaErrorMisalignedAddress",
@@ -435,11 +439,14 @@ void CudfHashJoinBuild::noMoreInput() {
       if (!isCudaRelatedError(e)) {
         throw;
       }
-      // If the device has a sticky error (not just OOM), retrying is futile
-      // and will only cause timeouts or RMM corruption.
+      // If the device has a sticky error (not just OOM or invalid-value),
+      // retrying is futile and will only cause timeouts or RMM corruption.
+      // cudaErrorInvalidValue is NOT device corruption — it means an
+      // allocation request had invalid parameters (typically oversized).
       {
         auto err = cudaPeekAtLastError();
-        if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+        if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
+            err != cudaErrorInvalidValue) {
           VELOX_FAIL(
               "CUDA device error {} ({}) during build concatenation for "
               "planNode {}. Aborting: {}",
@@ -447,6 +454,9 @@ void CudfHashJoinBuild::noMoreInput() {
               cudaGetErrorString(err),
               planNodeId(),
               e.what());
+        }
+        if (err == cudaErrorInvalidValue) {
+          cudaGetLastError(); // clear the non-sticky error
         }
       }
       if (isFatalCudaError(e)) {
@@ -1336,6 +1346,19 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
 
+    auto joinOutputRows =
+        static_cast<int64_t>(leftJoinIndices->size());
+    VELOX_CHECK_LE(
+        joinOutputRows,
+        static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
+        "Left join output ({} rows) exceeds cudf::size_type limit. "
+        "Probe={} rows, build={} rows, planNode={}. "
+        "Consider increasing shuffle partitions to reduce data skew.",
+        joinOutputRows,
+        leftTableView.num_rows(),
+        rightTableView.num_rows(),
+        joinNode_->id());
+
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
     auto rightIndicesSpan =
@@ -1447,6 +1470,22 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
+
+    {
+      auto joinOutputRows =
+          static_cast<int64_t>(leftJoinIndices->size());
+      VELOX_CHECK_LE(
+          joinOutputRows,
+          static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
+          "Right join output ({} rows) exceeds cudf::size_type limit. "
+          "Probe={} rows, build={} rows, planNode={}. "
+          "Consider increasing shuffle partitions to reduce data skew.",
+          joinOutputRows,
+          leftTableView.num_rows(),
+          rightTableView.num_rows(),
+          joinNode_->id());
+    }
+
     // cudf::scatter is async: it enqueues a device memcpy of the old flags
     // (the target) plus a thrust::scatter kernel onto `stream`, then returns
     // immediately. The old rightMatchedFlags_[i] column must stay alive until
@@ -1579,6 +1618,22 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
+
+    {
+      auto joinOutputRows =
+          static_cast<int64_t>(leftJoinIndices->size());
+      VELOX_CHECK_LE(
+          joinOutputRows,
+          static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()),
+          "Full join output ({} rows) exceeds cudf::size_type limit. "
+          "Probe={} rows, build={} rows, planNode={}. "
+          "Consider increasing shuffle partitions to reduce data skew.",
+          joinOutputRows,
+          leftTableView.num_rows(),
+          rightTableView.num_rows(),
+          joinNode_->id());
+    }
+
     if (!joinNode_->filter() && rightTableView.num_rows() > 0) {
       auto rightIdxCol = cudf::column_view{
           cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
@@ -2786,7 +2841,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             }
             {
               auto err = cudaPeekAtLastError();
-              if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
+              if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
+                  err != cudaErrorInvalidValue) {
                 VELOX_FAIL(
                     "CUDA device error {} ({}) building hash table for "
                     "planNode {} batch {}. Aborting: {}",
@@ -2795,6 +2851,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
                     joinNode_->id(),
                     i,
                     e.what());
+              }
+              if (err == cudaErrorInvalidValue) {
+                cudaGetLastError();
               }
             }
             if (isFatalCudaError(e)) {
@@ -2964,7 +3023,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         cudfOutputs.push_back(std::move(r));
       }
     } catch (const std::exception& e) {
-      if (!isCudaRelatedError(e)) {
+      // Treat both CUDA errors and join output overflow (size_type limit)
+      // as recoverable via probe splitting. Overflow indicates the join
+      // produced more rows than cudf can address in a single table;
+      // splitting the probe reduces output cardinality per chunk.
+      bool isOverflow = std::string(e.what()).find(
+          "exceeds cudf::size_type limit") != std::string::npos;
+      if (!isOverflow && !isCudaRelatedError(e)) {
         throw;
       }
 
@@ -2972,7 +3037,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       {
         auto& rt = hashObject_.value().first;
         LOG(ERROR)
-            << "CUDA error during join for planNode " << joinNode_->id()
+            << (isOverflow ? "Join output overflow" : "CUDA error")
+            << " during join for planNode " << joinNode_->id()
             << " (joinType=" << static_cast<int>(joinNode_->joinType())
             << ", probeRows=" << slice.num_rows()
             << ", probeCols=" << slice.num_columns()
@@ -2990,30 +3056,38 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         }
       }
 
-      // Check if the CUDA context itself is corrupted (sticky error).
-      // If so, further retries will only waste time and cause timeouts.
-      {
-        auto err = cudaPeekAtLastError();
-        if (err != cudaSuccess && err != cudaErrorMemoryAllocation) {
-          VELOX_FAIL(
-              "CUDA device error {} ({}) during join for planNode {}. "
-              "GPU context is corrupted, aborting instead of retrying.",
-              static_cast<int>(err),
-              cudaGetErrorString(err),
-              joinNode_->id());
+      if (!isOverflow) {
+        // Check if the CUDA context itself is corrupted (sticky error).
+        // cudaErrorInvalidValue is NOT a sticky/corruption error — it means
+        // an invalid parameter was passed (typically oversized allocation).
+        // Allow retry for both OOM and invalid-value errors.
+        {
+          auto err = cudaPeekAtLastError();
+          if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
+              err != cudaErrorInvalidValue) {
+            VELOX_FAIL(
+                "CUDA device error {} ({}) during join for planNode {}. "
+                "GPU context is corrupted, aborting instead of retrying.",
+                static_cast<int>(err),
+                cudaGetErrorString(err),
+                joinNode_->id());
+          }
+          if (err == cudaErrorInvalidValue) {
+            cudaGetLastError(); // clear the non-sticky error
+          }
         }
-      }
 
-      // rmm::cuda_error clears the sticky error in its constructor, so
-      // cudaPeekAtLastError() may return cudaSuccess even for fatal errors.
-      // Fall back to checking the exception message for non-OOM CUDA errors.
-      if (isFatalCudaError(e)) {
-        VELOX_FAIL(
-            "Fatal CUDA error during join for planNode {} "
-            "(detected from exception message, not sticky error). "
-            "Aborting instead of retrying: {}",
-            joinNode_->id(),
-            e.what());
+        // rmm::cuda_error clears the sticky error in its constructor, so
+        // cudaPeekAtLastError() may return cudaSuccess even for fatal errors.
+        // Fall back to checking the exception message for non-OOM CUDA errors.
+        if (isFatalCudaError(e)) {
+          VELOX_FAIL(
+              "Fatal CUDA error during join for planNode {} "
+              "(detected from exception message, not sticky error). "
+              "Aborting instead of retrying: {}",
+              joinNode_->id(),
+              e.what());
+        }
       }
 
       // Check cumulative retry time budget to prevent timeout from infinite
@@ -3058,10 +3132,12 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             retried = true;
             break;
           } catch (const std::exception& retryErr) {
-            if (!isCudaRelatedError(retryErr)) {
+            bool retryIsOverflow = std::string(retryErr.what()).find(
+                "exceeds cudf::size_type limit") != std::string::npos;
+            if (!retryIsOverflow && !isCudaRelatedError(retryErr)) {
               throw;
             }
-            if (isFatalCudaError(retryErr)) {
+            if (!retryIsOverflow && isFatalCudaError(retryErr)) {
               VELOX_FAIL(
                   "Fatal CUDA error during join retry for planNode {}: {}",
                   joinNode_->id(),
