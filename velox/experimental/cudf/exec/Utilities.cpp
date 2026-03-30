@@ -393,14 +393,16 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   }
 
   // Limit batches by both row count and byte size. Query free GPU memory
-  // and cap each batch to ~8% of free memory to avoid oversized allocations
-  // that trigger cudaErrorInvalidValue. Conservative limit accounts for
-  // concurrent GPU tasks competing for the same memory pool.
+  // and cap each batch to ~1% of free memory to avoid oversized allocations
+  // that trigger cudaErrorInvalidValue. Very conservative because concurrent
+  // GPU tasks (maxConcurrentGpuTasks=3) compete for memory and the RMM pool
+  // may already be heavily fragmented. With 22 GB pool and 3 tasks, each
+  // task effectively has ~7 GB; 1% = ~70 MB per batch which is safe.
   size_t maxBatchBytes = std::numeric_limits<size_t>::max();
   {
     size_t freeMem = 0, totalMem = 0;
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
-      maxBatchBytes = freeMem * 8 / 100;
+      maxBatchBytes = freeMem / 100;
     }
   }
 

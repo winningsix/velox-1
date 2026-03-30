@@ -327,6 +327,17 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**
+   * @brief Falls back to build-side chunking when probe can't be split further.
+   * Splits each build table into smaller chunks, builds a temporary hash table
+   * for each chunk, and joins the probe against each chunk independently.
+   * Used when even a single probe row produces output exceeding GPU memory.
+   * Only supports inner join semantics; other join types should use the
+   * standard retry/split path.
+   */
+  std::vector<std::unique_ptr<cudf::table>> joinWithChunkedBuild(
+      cudf::table_view probeSlice,
+      rmm::cuda_stream_view stream);
+  /**
    * @brief Constructs join output table without applying filter conditions.
    * @param leftTableView Input probe table view
    * @param leftIndicesCol Column of indices into left table

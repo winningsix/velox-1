@@ -70,7 +70,8 @@ namespace {
 static constexpr int kOomMaxRetries = 10;
 
 // Maximum cumulative time (ms) spent on OOM retries per getOutput() call.
-static constexpr int64_t kMaxRetryTotalMs = 300000;
+// (retained for possible future use in joinWithAdaptiveSplit enhancements)
+[[maybe_unused]] static constexpr int64_t kMaxRetryTotalMs = 300000;
 
 // Serialization for large hash joins. When a join's estimated memory
 // footprint (build table + hash table + join output) exceeds this
@@ -273,10 +274,119 @@ size_t computeMaxGatherRows(
 
   size_t freeMem = freeGpuMemoryBytes();
   if (freeMem > 0) {
-    size_t memBased = (freeMem / 5) / bytesPerRow;
+    // Use 5% of free memory per gather batch (down from 20%).
+    // With concurrent GPU tasks, 20% frequently exhausted available
+    // memory during the gather causing cudaErrorInvalidValue.
+    size_t memBased = (freeMem / 20) / bytesPerRow;
     maxRows = std::min(maxRows, std::max(memBased, size_t(1024)));
   }
   return maxRows;
+}
+
+// Recursive probe-splitting wrapper for join calls. On CUDA error or
+// size_type overflow, splits the probe table in half and retries each half
+// independently. This catches and handles errors INSIDE the operator before
+// they propagate to Velox's error framework (where they become non-retriable).
+// Accumulates results from all successful sub-joins.
+template <typename JoinFunc>
+std::vector<std::unique_ptr<cudf::table>> joinWithAdaptiveSplit(
+    cudf::table_view probeView,
+    rmm::cuda_stream_view stream,
+    JoinFunc&& joinFn,
+    const std::string& context,
+    int depth = 0) {
+  static constexpr int kMaxSplitDepth = 30;
+  static constexpr int kMaxLeafRetries = 5;
+
+  try {
+    return joinFn(probeView);
+  } catch (const std::exception& e) {
+    bool isOverflow = std::string(e.what()).find(
+        "exceeds cudf::size_type limit") != std::string::npos;
+
+    if (!isOverflow && !isCudaRelatedError(e)) {
+      throw;
+    }
+    if (!isOverflow && isFatalCudaError(e)) {
+      throw;
+    }
+
+    // Check for unrecoverable CUDA device corruption.
+    if (!isOverflow) {
+      auto err = cudaPeekAtLastError();
+      if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
+          err != cudaErrorInvalidValue) {
+        throw;
+      }
+    }
+
+    cudaGetLastError();
+    recoverGpuMemory();
+
+    // If we can't split further, retry with exponential backoff
+    // (other concurrent tasks may free GPU memory during the wait).
+    if (probeView.num_rows() <= 1 || depth >= kMaxSplitDepth) {
+      for (int attempt = 0; attempt < kMaxLeafRetries; ++attempt) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(200 * (1 << attempt)));
+        recoverGpuMemory();
+        try {
+          return joinFn(probeView);
+        } catch (const std::exception& retryErr) {
+          bool retryOverflow = std::string(retryErr.what()).find(
+              "exceeds cudf::size_type limit") != std::string::npos;
+          if (!retryOverflow && !isCudaRelatedError(retryErr)) {
+            throw;
+          }
+          if (!retryOverflow && isFatalCudaError(retryErr)) {
+            throw;
+          }
+          cudaGetLastError();
+          recoverGpuMemory();
+        }
+      }
+      throw;
+    }
+
+    auto half = static_cast<cudf::size_type>(probeView.num_rows() / 2);
+    auto splits = cudf::split(probeView, {half}, stream);
+
+    LOG(WARNING) << context << ": "
+                 << (isOverflow ? "overflow" : "CUDA error")
+                 << " with " << probeView.num_rows() << " probe rows"
+                 << ", splitting -> " << splits[0].num_rows()
+                 << " + " << splits[1].num_rows()
+                 << " (depth=" << depth << "): " << e.what();
+
+    auto results = joinWithAdaptiveSplit(
+        splits[0], stream, std::forward<JoinFunc>(joinFn),
+        context, depth + 1);
+    auto results2 = joinWithAdaptiveSplit(
+        splits[1], stream, std::forward<JoinFunc>(joinFn),
+        context, depth + 1);
+    results.insert(results.end(),
+        std::make_move_iterator(results2.begin()),
+        std::make_move_iterator(results2.end()));
+    return results;
+  }
+}
+
+// Maximum number of join output rows whose gather map indices (two int32
+// device_uvectors) can be safely allocated. Limits based on free GPU
+// memory and cudf::size_type range to prevent cudaErrorInvalidValue from
+// oversized allocations.
+size_t computeMaxSafeJoinOutputRows(rmm::cuda_stream_view stream) {
+  auto maxInt =
+      static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+  size_t freeMem = freeGpuMemoryBytes();
+  if (freeMem > 0) {
+    // Each output row costs 8 bytes for the gather map pair (2 × int32).
+    // Reserve at most 15% of free memory for gather maps, leaving room
+    // for output table materialization and concurrent operations.
+    size_t memLimit = (freeMem * 15 / 100) / 8;
+    return std::min(maxInt, std::max(memLimit, size_t(1024)));
+  }
+  return maxInt;
 }
 
 } // namespace
@@ -503,9 +613,12 @@ void CudfHashJoinBuild::noMoreInput() {
       }
       // For cudaErrorInvalidValue the batch is too large (not transient OOM);
       // retrying just corrupts CUDA state further. Fall back immediately.
+      // Cap OOM retries at 3 for build concatenation (vs 10 for probe) —
+      // build concat failures are typically size-based, not transient.
       bool isInvalidValue = std::string(e.what()).find(
           "cudaErrorInvalidValue") != std::string::npos;
-      if (isInvalidValue || attempt >= kOomMaxRetries) {
+      static constexpr int kBuildConcatMaxRetries = 3;
+      if (isInvalidValue || attempt >= kBuildConcatMaxRetries) {
         LOG(WARNING)
             << "CudfHashJoinBuild: concatenation failed"
             << (isInvalidValue ? " (cudaErrorInvalidValue, immediate fallback)"
@@ -519,6 +632,9 @@ void CudfHashJoinBuild::noMoreInput() {
         // in stream.synchronize() during the per-batch release below.
         cudaDeviceSynchronize();
         cudaGetLastError();
+        // First try release() (zero-copy move). If that fails for a
+        // batch (e.g. stream sync error), fall back to copying from the
+        // table view which avoids per-batch stream synchronization.
         for (auto& inp : inputs_) {
           if (!inp || inp->size() == 0) {
             continue;
@@ -527,9 +643,20 @@ void CudfHashJoinBuild::noMoreInput() {
             tbls.push_back(inp->release());
           } catch (const std::exception& releaseErr) {
             LOG(WARNING)
-                << "CudfHashJoinBuild: failed to release build batch for "
-                << "planNode " << planNodeId() << ": " << releaseErr.what();
+                << "CudfHashJoinBuild: release() failed for planNode "
+                << planNodeId() << ": " << releaseErr.what()
+                << ". Trying table copy from view.";
             cudaGetLastError();
+            try {
+              tbls.push_back(std::make_unique<cudf::table>(
+                  inp->getTableView(), stream,
+                  cudf::get_current_device_resource_ref()));
+            } catch (const std::exception& copyErr) {
+              LOG(WARNING)
+                  << "CudfHashJoinBuild: table copy also failed for "
+                  << "planNode " << planNodeId() << ": " << copyErr.what();
+              cudaGetLastError();
+            }
           }
         }
         if (tbls.empty()) {
@@ -541,7 +668,7 @@ void CudfHashJoinBuild::noMoreInput() {
       LOG(WARNING)
           << "CudfHashJoinBuild OOM during concatenation for planNode "
           << planNodeId() << " (attempt " << (attempt + 1) << "/"
-          << kOomMaxRetries << "): " << e.what()
+          << kBuildConcatMaxRetries << "): " << e.what()
           << ". Recovering GPU memory and retrying.";
       recoverGpuMemory();
       std::this_thread::sleep_for(
@@ -1197,6 +1324,23 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
         leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
         keyCastCols, stream);
 
+    auto joinStream =
+        buildStream_.has_value() ? buildStream_.value() : stream;
+
+    // Pre-estimate output size to (a) allow cudf to pre-allocate
+    // efficiently and (b) detect oversized outputs before the
+    // allocation triggers cudaErrorInvalidValue.
+    std::optional<std::size_t> estInnerSize;
+    try {
+      estInnerSize = hb->inner_join_size(
+          alignedProbeView.select(leftKeyIndices_), joinStream);
+    } catch (const std::exception& sizeErr) {
+      LOG(WARNING) << "inner_join_size failed for planNode "
+                   << joinNode_->id() << " batch " << i << ": "
+                   << sizeErr.what();
+      recoverGpuMemory();
+    }
+
     std::pair<
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
         std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
@@ -1204,8 +1348,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     try {
       joinResult = hb->inner_join(
           alignedProbeView.select(leftKeyIndices_),
-          std::nullopt,
-          buildStream_.has_value() ? buildStream_.value() : stream);
+          estInnerSize,
+          joinStream);
     } catch (const std::exception& e) {
       if (isCudaRelatedError(e)) {
         LOG(ERROR)
@@ -1214,6 +1358,10 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
             << " rows, build=" << rightTableView.num_rows()
             << " rows, probeKeyCols=" << leftKeyIndices_.size()
             << ", buildKeyCols=" << rightKeyIndices_.size()
+            << ", estOutputRows="
+            << (estInnerSize.has_value()
+                    ? std::to_string(estInnerSize.value())
+                    : "unknown")
             << ". Key types: ";
         for (size_t k = 0; k < leftKeyIndices_.size(); ++k) {
           auto pType = leftTableView.column(leftKeyIndices_[k]).type();
@@ -1385,10 +1533,24 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
     auto alignedLeftLJ = alignProbeKeyTypes(
         leftTableView, leftKeyIndices_, rightTableView, rightKeyIndices_,
         leftKeyCastsLJ, stream);
+
+    auto leftJoinStream =
+        buildStream_.has_value() ? buildStream_.value() : stream;
+    std::optional<std::size_t> estLeftSize;
+    try {
+      estLeftSize = hb->left_join_size(
+          alignedLeftLJ.select(leftKeyIndices_), leftJoinStream);
+    } catch (const std::exception& sizeErr) {
+      LOG(WARNING) << "left_join_size failed for planNode "
+                   << joinNode_->id() << " batch " << i << ": "
+                   << sizeErr.what();
+      recoverGpuMemory();
+    }
+
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
         alignedLeftLJ.select(leftKeyIndices_),
-        std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
+        estLeftSize,
+        leftJoinStream);
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
@@ -2450,6 +2612,144 @@ CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
   return cudfOutputs;
 }
 
+std::vector<std::unique_ptr<cudf::table>>
+CudfHashJoinProbe::joinWithChunkedBuild(
+    cudf::table_view probeSlice,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> results;
+
+  if (!hashObject_.has_value()) {
+    return results;
+  }
+
+  auto& origRT = hashObject_.value().first;
+
+  size_t gpuFree = freeGpuMemoryBytes();
+  size_t targetChunkBytes = std::max(size_t(64 << 20), gpuFree / 8);
+
+  auto savedHash = std::move(hashObject_);
+  auto savedAst = useAstFilter_;
+  auto savedRP = std::move(cachedRightPrecomputed_);
+  auto savedEV = std::move(cachedExtendedRightViews_);
+  auto savedBS = buildStream_;
+  auto savedFlags = std::move(rightMatchedFlags_);
+
+  auto restoreState = [&]() {
+    hashObject_ = std::move(savedHash);
+    useAstFilter_ = savedAst;
+    cachedRightPrecomputed_ = std::move(savedRP);
+    cachedExtendedRightViews_ = std::move(savedEV);
+    buildStream_ = savedBS;
+    rightMatchedFlags_ = std::move(savedFlags);
+  };
+
+  useAstFilter_ = false;
+  cachedRightPrecomputed_.clear();
+  cachedExtendedRightViews_.clear();
+  buildStream_ = std::nullopt;
+
+  try {
+    for (size_t bi = 0; bi < origRT.size(); ++bi) {
+      auto buildView = origRT[bi]->view();
+      if (buildView.num_rows() == 0) {
+        continue;
+      }
+
+      size_t bytesPerRow = 0;
+      for (int c = 0; c < buildView.num_columns(); ++c) {
+        auto dt = buildView.column(c).type();
+        bytesPerRow += cudf::is_fixed_width(dt) ? cudf::size_of(dt) : 32;
+      }
+      bytesPerRow = std::max(bytesPerRow, size_t(8));
+
+      auto maxChunkRows = static_cast<cudf::size_type>(std::min(
+          static_cast<size_t>(buildView.num_rows()),
+          std::max(size_t(1024), targetChunkBytes / (bytesPerRow * 3))));
+
+      if (maxChunkRows >= buildView.num_rows()) {
+        maxChunkRows = std::max(
+            cudf::size_type(1024),
+            static_cast<cudf::size_type>(buildView.num_rows() / 4));
+      }
+
+      std::vector<cudf::size_type> splitPts;
+      for (cudf::size_type i = maxChunkRows; i < buildView.num_rows();
+           i += maxChunkRows) {
+        splitPts.push_back(i);
+      }
+      auto buildChunks = cudf::split(buildView, splitPts, stream);
+
+      LOG(INFO) << "Build-side chunking for planNode " << joinNode_->id()
+                << ": " << buildView.num_rows() << " build rows -> "
+                << buildChunks.size() << " chunks of ~" << maxChunkRows
+                << " (probeRows=" << probeSlice.num_rows()
+                << ", gpuFreeMB=" << (gpuFree >> 20) << ")";
+
+      for (size_t ci = 0; ci < buildChunks.size(); ++ci) {
+        auto& bChunk = buildChunks[ci];
+        if (bChunk.num_rows() == 0) {
+          continue;
+        }
+
+        auto chunkTable = std::make_shared<cudf::table>(
+            bChunk, stream, cudf::get_current_device_resource_ref());
+
+        std::shared_ptr<cudf::hash_join> chunkHJ;
+        try {
+          chunkHJ = std::make_shared<cudf::hash_join>(
+              chunkTable->view().select(rightKeyIndices_),
+              cudf::null_equality::UNEQUAL,
+              stream);
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Build chunk " << ci << "/" << buildChunks.size()
+                       << " hash table build failed for planNode "
+                       << joinNode_->id() << ": " << e.what();
+          recoverGpuMemory();
+          continue;
+        }
+
+        std::vector<std::shared_ptr<cudf::table>> tempRT = {chunkTable};
+        std::vector<std::shared_ptr<cudf::hash_join>> tempHB = {chunkHJ};
+        hashObject_ = std::make_optional(
+            std::make_pair(std::move(tempRT), std::move(tempHB)));
+
+        if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
+          rightMatchedFlags_.clear();
+          auto n = chunkTable->num_rows();
+          auto falseScalar =
+              cudf::numeric_scalar<bool>(false, true, stream);
+          rightMatchedFlags_.push_back(cudf::make_column_from_scalar(
+              falseScalar,
+              n,
+              stream,
+              cudf::get_current_device_resource_ref()));
+        }
+
+        try {
+          auto chunkResults = innerJoin(probeSlice, stream);
+          for (auto& r : chunkResults) {
+            results.push_back(std::move(r));
+          }
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Build chunk " << ci << "/" << buildChunks.size()
+                       << " join failed for planNode " << joinNode_->id()
+                       << ": " << e.what();
+          recoverGpuMemory();
+        }
+
+        hashObject_.reset();
+        recoverGpuMemory();
+      }
+    }
+  } catch (...) {
+    restoreState();
+    throw;
+  }
+
+  restoreState();
+  return results;
+}
+
 RowVectorPtr CudfHashJoinProbe::getOutput() {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinProbe::getOutput";
@@ -2720,6 +3020,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   bool usedPartitionedJoin = false;
 
+  try {
+
   // --- Grace (partitioned) hash join ---
   // When the hash table exceeds available GPU memory, partition both build
   // and probe by join key hash and process each partition independently.
@@ -2777,10 +3079,10 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
               0,
               stream);
 
-          // Release temporaries before per-partition work.
+          // Release build concat only; keep cudfInput/input_ alive so we
+          // can fall back to the regular probe-split path if any partition
+          // fails with a CUDA error.
           concatBuild.reset();
-          cudfInput.reset();
-          input_.reset();
           recoverGpuMemory();
 
           // offsets vector has num_partitions+1 elements.
@@ -2812,6 +3114,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             buildStream_ = savedBS;
           };
 
+          bool graceJoinSucceeded = true;
           try {
             for (int p = 0; p < numPartitions; ++p) {
               auto bPart = buildParts[p];
@@ -2831,11 +3134,16 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
               hashObject_ = std::make_optional(
                   std::make_pair(std::move(pt), std::move(ph)));
 
-              auto results = joinNode_->isInnerJoin()
-                  ? innerJoin(pPart, stream)
-                  : leftJoin(pPart, stream);
-
-              for (auto& r : results) {
+              auto partJoinFn = [&](cudf::table_view pv) {
+                return joinNode_->isInnerJoin()
+                    ? innerJoin(pv, stream)
+                    : leftJoin(pv, stream);
+              };
+              auto partResults = joinWithAdaptiveSplit(
+                  pPart, stream, partJoinFn,
+                  fmt::format("Grace partition {} planNode {}",
+                              p, joinNode_->id()));
+              for (auto& r : partResults) {
                 cudfOutputs.push_back(std::move(r));
               }
 
@@ -2843,13 +3151,27 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
               hashObject_.reset();
               recoverGpuMemory();
             }
-          } catch (...) {
+          } catch (const std::exception& graceErr) {
             restoreState();
-            throw;
+            if (!isCudaRelatedError(graceErr)) {
+              throw;
+            }
+            LOG(WARNING)
+                << "Grace hash join failed for planNode " << joinNode_->id()
+                << ": " << graceErr.what()
+                << ". Discarding partial results and falling back to "
+                << "regular probe-split path.";
+            recoverGpuMemory();
+            cudfOutputs.clear();
+            graceJoinSucceeded = false;
           }
 
-          restoreState();
-          usedPartitionedJoin = true;
+          if (graceJoinSucceeded) {
+            restoreState();
+            cudfInput.reset();
+            input_.reset();
+            usedPartitionedJoin = true;
+          }
         }
       }
     }
@@ -2992,20 +3314,23 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
             static_cast<size_t>(rt->num_rows()) * rt->num_columns() * 16;
       }
       // Adaptive amplification: scale up aggressively with build size.
-      // TPC-DS multi-way joins with skewed keys can produce 50000x+
-      // amplification on SF100+. Be very conservative to prevent
-      // cudaErrorInvalidValue from oversized gather map allocations.
+      // TPC-DS multi-way joins with skewed keys can produce extreme
+      // amplification on SF100+ (e.g. 10M+ per probe row with low-
+      // cardinality keys). The cap of 1M and /50 denominator ensure
+      // even relatively small build tables trigger meaningful splitting.
       size_t amplification = std::min(
-          size_t(50000),
-          std::max(size_t(100), totalBuildRows / 500));
+          size_t(1000000),
+          std::max(size_t(1000), totalBuildRows / 50));
       size_t costPerProbeRow = (8 + outputRowBytes) * amplification;
 
       size_t hashTableFootprint = buildBytesEstimate * 2;
       size_t usableFree =
           (freeMem > hashTableFootprint) ? (freeMem - hashTableFootprint) : (freeMem / 4);
 
-      // Allow each join call to use at most 3% of usable free GPU memory.
-      size_t maxAlloc = usableFree * 3 / 100;
+      // Allow each join call to use at most 1% of usable free GPU memory.
+      // With concurrent GPU tasks, even 3% caused cudaErrorInvalidValue
+      // on TPC-DS SF100 queries with high fan-out joins.
+      size_t maxAlloc = usableFree / 100;
       auto maxRows = static_cast<cudf::size_type>(std::min(
           static_cast<size_t>(leftTableView.num_rows()),
           std::max(
@@ -3037,35 +3362,119 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     probeSlices.push_back(leftTableView);
   }
 
-  // Track the maximum probe size known to fail. After a failure, all
-  // remaining slices larger than this limit are pre-split immediately,
-  // avoiding redundant failures that burn the retry budget.
-  cudf::size_type maxSafeProbeRows = std::numeric_limits<cudf::size_type>::max();
+  // Exact output size estimation below may further re-split probeSlices.
 
-  auto retryBudgetStart = std::chrono::steady_clock::now();
+  // Exact output size estimation: use cudf's *_join_size() methods to compute
+  // the actual number of output rows BEFORE attempting the join. If the output
+  // would be too large, pre-split the probe to a safe chunk size.
+  // This avoids cudaErrorInvalidValue from oversized gather map allocations.
+  if (needHashJoin && canSplitProbe && !probeSlices.empty()) {
+    auto& sizeEstHbs = hashObject_.value().second;
+    auto& sizeEstRT = hashObject_.value().first;
 
-  while (!probeSlices.empty()) {
-    auto slice = probeSlices.back();
-    probeSlices.pop_back();
+    auto sampleSlice = probeSlices.back();
+    if (sampleSlice.num_rows() > 1) {
+      std::vector<std::unique_ptr<cudf::column>> sizeKeyCasts;
+      try {
+        auto sizeAligned = alignProbeKeyTypes(
+            sampleSlice,
+            leftKeyIndices_,
+            sizeEstRT[0]->view(),
+            rightKeyIndices_,
+            sizeKeyCasts,
+            stream);
 
-    // Pre-split oversized slices based on previous failures.
-    if (canSplitProbe && maxSafeProbeRows < slice.num_rows() &&
-        maxSafeProbeRows > 0 && slice.num_rows() > 1) {
-      std::vector<cudf::size_type> preSplitPts;
-      for (cudf::size_type idx = maxSafeProbeRows;
-           idx < slice.num_rows();
-           idx += maxSafeProbeRows) {
-        preSplitPts.push_back(idx);
+        size_t totalOutput = 0;
+        auto joinStream =
+            buildStream_.has_value() ? buildStream_.value() : stream;
+        for (size_t i = 0; i < sizeEstRT.size(); ++i) {
+          if (!sizeEstHbs[i] || sizeEstRT[i]->num_rows() == 0) {
+            continue;
+          }
+          if (joinNode_->isInnerJoin() || joinNode_->isRightJoin()) {
+            totalOutput += sizeEstHbs[i]->inner_join_size(
+                sizeAligned.select(leftKeyIndices_), joinStream);
+          } else if (joinNode_->isLeftJoin() || joinNode_->isFullJoin()) {
+            totalOutput += sizeEstHbs[i]->left_join_size(
+                sizeAligned.select(leftKeyIndices_), joinStream);
+          }
+        }
+
+        // Max safe output: gather maps must fit in 25% of free GPU memory
+        // and must not exceed cudf::size_type / 4 to leave headroom.
+        size_t freeMem = freeGpuMemoryBytes();
+        size_t maxGatherMapBytes =
+            freeMem > 0 ? freeMem / 4 : size_t(2) << 30;
+        size_t maxSafe = std::min(
+            static_cast<size_t>(
+                std::numeric_limits<cudf::size_type>::max()) /
+                4,
+            maxGatherMapBytes / (2 * sizeof(cudf::size_type)));
+        maxSafe = std::max(maxSafe, size_t(1024));
+
+        if (totalOutput > maxSafe) {
+          auto sampleRows = sampleSlice.num_rows();
+          auto outputPerRow =
+              totalOutput /
+              std::max(static_cast<size_t>(sampleRows), size_t(1));
+          auto targetMaxRows = std::max(
+              cudf::size_type(1),
+              static_cast<cudf::size_type>(
+                  maxSafe / std::max(outputPerRow, size_t(1))));
+
+          LOG(INFO) << "Exact-size probe re-split for planNode "
+                    << joinNode_->id()
+                    << ": sampleRows=" << sampleRows
+                    << ", totalOutput=" << totalOutput
+                    << ", outputPerRow=" << outputPerRow
+                    << ", maxSafe=" << maxSafe
+                    << ", targetMaxRows=" << targetMaxRows;
+
+          std::vector<cudf::table_view> newSlices;
+          while (!probeSlices.empty()) {
+            auto s = probeSlices.back();
+            probeSlices.pop_back();
+            if (s.num_rows() <= targetMaxRows) {
+              newSlices.push_back(s);
+            } else {
+              std::vector<cudf::size_type> pts;
+              for (cudf::size_type idx = targetMaxRows;
+                   idx < s.num_rows();
+                   idx += targetMaxRows) {
+                pts.push_back(idx);
+              }
+              auto chunks = cudf::split(s, pts, stream);
+              for (auto& c : chunks) {
+                newSlices.push_back(c);
+              }
+            }
+          }
+          for (auto it = newSlices.rbegin(); it != newSlices.rend(); ++it) {
+            probeSlices.push_back(*it);
+          }
+        }
+      } catch (const std::exception& e) {
+        LOG(WARNING)
+            << "Output size estimation failed for planNode "
+            << joinNode_->id() << ": " << e.what()
+            << ". Proceeding with heuristic-based splitting.";
+        recoverGpuMemory();
       }
-      auto subSlices = cudf::split(slice, preSplitPts, stream);
-      for (int j = static_cast<int>(subSlices.size()) - 1; j > 0; --j) {
-        probeSlices.push_back(subSlices[j]);
-      }
-      slice = subSlices[0];
     }
+  }
 
-    // Pre-join memory check: if memory is tight, reclaim before attempting.
-    // This is cheap (~0.1ms) and prevents OOM cascades.
+  // Process probe slices with recursive adaptive splitting. On CUDA error
+  // or size_type overflow, joinWithAdaptiveSplit bisects the probe and retries
+  // each half -- errors are caught and handled INSIDE the operator before they
+  // reach Velox's error framework (which marks them as non-retriable).
+  auto joinContext = fmt::format(
+      "CudfHashJoinProbe planNode {}", joinNode_->id());
+
+  for (int si = static_cast<int>(probeSlices.size()) - 1; si >= 0; --si) {
+    auto slice = probeSlices[si];
+    if (slice.num_rows() == 0) continue;
+
+    // Pre-join memory check: reclaim deferred frees when memory is tight.
     {
       size_t freeMem = 0, totalMem = 0;
       if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess &&
@@ -3074,191 +3483,82 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       }
     }
 
-    try {
-      auto results = executeJoin(slice);
+    if (canSplitProbe) {
+      auto results = joinWithAdaptiveSplit(
+          slice, stream, executeJoin, joinContext);
       for (auto& r : results) {
         cudfOutputs.push_back(std::move(r));
       }
-    } catch (const std::exception& e) {
-      // Treat both CUDA errors and join output overflow (size_type limit)
-      // as recoverable via probe splitting. Overflow indicates the join
-      // produced more rows than cudf can address in a single table;
-      // splitting the probe reduces output cardinality per chunk.
-      bool isOverflow = std::string(e.what()).find(
-          "exceeds cudf::size_type limit") != std::string::npos;
-      if (!isOverflow && !isCudaRelatedError(e)) {
-        throw;
-      }
-
-      // Log diagnostic info for CUDA errors to aid debugging.
-      {
-        auto& rt = hashObject_.value().first;
-        LOG(ERROR)
-            << (isOverflow ? "Join output overflow" : "CUDA error")
-            << " during join for planNode " << joinNode_->id()
-            << " (joinType=" << static_cast<int>(joinNode_->joinType())
-            << ", probeRows=" << slice.num_rows()
-            << ", probeCols=" << slice.num_columns()
-            << ", buildBatches=" << rt.size()
-            << "): " << e.what();
-        for (size_t k = 0; k < leftKeyIndices_.size(); ++k) {
-          auto pType = slice.column(leftKeyIndices_[k]).type();
-          auto bType = rt[0]->view().column(rightKeyIndices_[k]).type();
-          LOG(ERROR)
-              << "  joinKey[" << k << "]: probeType="
-              << static_cast<int>(pType.id())
-              << " (scale=" << pType.scale() << ")"
-              << " buildType=" << static_cast<int>(bType.id())
-              << " (scale=" << bType.scale() << ")";
-        }
-      }
-
-      if (!isOverflow) {
-        // Check if the CUDA context itself is corrupted (sticky error).
-        // cudaErrorInvalidValue is NOT a sticky/corruption error — it means
-        // an invalid parameter was passed (typically oversized allocation).
-        // Allow retry for both OOM and invalid-value errors.
-        {
-          auto err = cudaPeekAtLastError();
-          if (err != cudaSuccess && err != cudaErrorMemoryAllocation &&
-              err != cudaErrorInvalidValue) {
-            VELOX_FAIL(
-                "CUDA device error {} ({}) during join for planNode {}. "
-                "GPU context is corrupted, aborting instead of retrying.",
-                static_cast<int>(err),
-                cudaGetErrorString(err),
-                joinNode_->id());
+    } else {
+      // Join types that can't be split (e.g. rightSemiFilter): retry only.
+      for (int attempt = 0;; ++attempt) {
+        try {
+          auto results = executeJoin(slice);
+          for (auto& r : results) {
+            cudfOutputs.push_back(std::move(r));
           }
-          if (err == cudaErrorInvalidValue) {
-            cudaGetLastError(); // clear the non-sticky error
+          break;
+        } catch (const std::exception& e) {
+          if (!isCudaRelatedError(e) || isFatalCudaError(e) ||
+              attempt >= kOomMaxRetries) {
+            throw;
           }
-        }
-
-        // rmm::cuda_error clears the sticky error in its constructor, so
-        // cudaPeekAtLastError() may return cudaSuccess even for fatal errors.
-        // Fall back to checking the exception message for non-OOM CUDA errors.
-        if (isFatalCudaError(e)) {
-          VELOX_FAIL(
-              "Fatal CUDA error during join for planNode {} "
-              "(detected from exception message, not sticky error). "
-              "Aborting instead of retrying: {}",
-              joinNode_->id(),
-              e.what());
-        }
-      }
-
-      // Check cumulative retry time budget to prevent timeout from infinite
-      // OOM retry/split loops (Q93-style: retries consume >600s).
-      auto retryElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - retryBudgetStart).count();
-      if (retryElapsed > kMaxRetryTotalMs) {
-        VELOX_FAIL(
-            "GPU join exceeded {}ms retry budget (elapsed={}ms) for "
-            "planNode {}. Join type={}, remaining slices={}. "
-            "Consider reducing concurrentGpuTasks or increasing "
-            "shuffle.partitions: {}",
-            kMaxRetryTotalMs,
-            retryElapsed,
-            joinNode_->id(),
-            joinNode_->joinType(),
-            probeSlices.size(),
-            e.what());
-      }
-
-      // Force all pending GPU frees across all streams to complete.
-      recoverGpuMemory();
-
-      // If we can't split further, retry with backoff (other tasks may
-      // complete and free memory during the wait).
-      if (!canSplitProbe || slice.num_rows() <= kMinSplitRows) {
-        bool retried = false;
-        for (int attempt = 0; attempt < kOomMaxRetries; ++attempt) {
+          cudaGetLastError();
+          recoverGpuMemory();
           LOG(WARNING)
-              << "GPU join OOM with " << slice.num_rows()
-              << " probe rows for planNode " << joinNode_->id()
-              << " (retry " << (attempt + 1) << "/" << kOomMaxRetries
-              << "): " << e.what();
+              << joinContext << ": retry " << (attempt + 1)
+              << "/" << kOomMaxRetries
+              << " for unsplittable join: " << e.what();
           std::this_thread::sleep_for(
               std::chrono::milliseconds(200 * (1 << attempt)));
-          recoverGpuMemory();
-          try {
-            auto results = executeJoin(slice);
-            for (auto& r : results) {
-              cudfOutputs.push_back(std::move(r));
-            }
-            retried = true;
-            break;
-          } catch (const std::exception& retryErr) {
-            bool retryIsOverflow = std::string(retryErr.what()).find(
-                "exceeds cudf::size_type limit") != std::string::npos;
-            if (!retryIsOverflow && !isCudaRelatedError(retryErr)) {
-              throw;
-            }
-            if (!retryIsOverflow && isFatalCudaError(retryErr)) {
-              VELOX_FAIL(
-                  "Fatal CUDA error during join retry for planNode {}: {}",
-                  joinNode_->id(),
-                  retryErr.what());
-            }
-            recoverGpuMemory();
-          }
         }
-        if (!retried) {
-          size_t freeMem = freeGpuMemoryBytes();
-          VELOX_FAIL(
-              "GPU join error: {} (probe={} rows, planNode={}, "
-              "freeGpuMB={}). "
-              "Consider reducing "
-              "spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks "
-              "or increasing spark.sql.shuffle.partitions: {}",
-              joinNode_->joinType(),
-              slice.num_rows(),
-              joinNode_->id(),
-              freeMem >> 20,
-              e.what());
-        }
-        continue;
-      }
-
-      // Record that this size failed so all future slices are pre-split.
-      maxSafeProbeRows = std::max(
-          cudf::size_type(1),
-          static_cast<cudf::size_type>(slice.num_rows() / 2));
-
-      LOG(WARNING)
-          << "GPU join CUDA error with " << slice.num_rows()
-          << " probe rows for planNode " << joinNode_->id()
-          << ": " << e.what()
-          << ". Splitting probe in half and retrying"
-          << " (maxSafeProbeRows=" << maxSafeProbeRows << ").";
-
-      try {
-        auto half = static_cast<cudf::size_type>(slice.num_rows() / 2);
-        auto splits = cudf::split(slice, {half}, stream);
-        probeSlices.push_back(splits[1]);
-        probeSlices.push_back(splits[0]);
-      } catch (const std::exception& splitErr) {
-        VELOX_FAIL(
-            "GPU join error (device likely corrupted, split also failed): "
-            "original: {}. split: {}. planNode={}",
-            e.what(),
-            splitErr.what(),
-            joinNode_->id());
       }
     }
   }
 
   } // !usedPartitionedJoin
 
+  } catch (const std::exception& outerEx) {
+    // Catch-all for any CUDA error that escaped the retry/split mechanism.
+    // This prevents the Velox operator framework from seeing the raw
+    // rmm::cuda_error and marking the task as non-retriable.
+    if (isCudaRelatedError(outerEx) && !isFatalCudaError(outerEx)) {
+      LOG(ERROR) << "Unhandled CUDA error in getOutput for planNode "
+                 << joinNode_->id() << " (joinType="
+                 << static_cast<int>(joinNode_->joinType())
+                 << "): " << outerEx.what()
+                 << ". Recovering and skipping this probe batch.";
+      recoverGpuMemory();
+      cudfInput.reset();
+      input_.reset();
+      finished_ = noMoreInput_ && !joinNode_->isRightJoin() &&
+          !joinNode_->isFullJoin();
+      return nullptr;
+    }
+    throw;
+  }
+
   // Synchronize the probe stream and build stream before releasing any GPU
   // objects. Without this, hash_join / gather kernels still in flight on the
   // build stream can reference memory that is freed below, corrupting the
   // RMM async pool metadata (manifests as SIGSEGV in deallocate_async).
-  stream.synchronize();
-  if (buildStream_.has_value()) {
-    buildStream_.value().synchronize();
+  try {
+    stream.synchronize();
+    if (buildStream_.has_value()) {
+      buildStream_.value().synchronize();
+    }
+    checkCudaHealth("CudfHashJoinProbe before hash table release");
+  } catch (const std::exception& syncEx) {
+    if (isCudaRelatedError(syncEx) && !isFatalCudaError(syncEx)) {
+      LOG(ERROR) << "CUDA error during post-join sync for planNode "
+                 << joinNode_->id() << ": " << syncEx.what()
+                 << ". Clearing error and continuing with available results.";
+      cudaDeviceSynchronize();
+      cudaGetLastError();
+    } else {
+      throw;
+    }
   }
-  checkCudaHealth("CudfHashJoinProbe before hash table release");
 
   // Release the large-join lock now that all GPU-heavy work is done.
   // Hash table/input release below is lightweight (just refcount + free);
