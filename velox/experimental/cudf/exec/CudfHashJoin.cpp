@@ -682,12 +682,25 @@ void CudfHashJoinBuild::noMoreInput() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  // Reclaim deferred async frees before attempting a large allocation.
-  // With many concurrent tasks, cudaFreeAsync defers actual deallocation;
-  // this forces those frees, reducing the chance of OOM during concatenation.
-  ensureGpuMemoryAvailable(256ULL << 20, "CudfHashJoinBuild::noMoreInput");
-
   std::vector<std::unique_ptr<cudf::table>> tbls;
+
+  // Fast path: single build batch needs no concatenation or memory reclaim.
+  // Avoids GPU allocation + cudaDeviceSynchronize() on failure that would
+  // serialize all concurrent tasks (Q75 hits this 19+ times per stage).
+  if (inputs_.size() == 1 && inputs_[0] && inputs_[0]->size() > 0) {
+    auto inputStream = inputs_[0]->stream();
+    if (inputStream != stream) {
+      CudaEvent event(cudaEventDisableTiming);
+      event.recordFrom(inputStream);
+      event.waitOn(stream);
+    }
+    tbls.push_back(inputs_[0]->release());
+  } else if (inputs_.size() == 1 && (!inputs_[0] || inputs_[0]->size() == 0)) {
+    tbls.push_back(makeEmptyTable(joinNode_->sources()[1]->outputType()));
+  } else {
+    // Multi-batch path: reclaim deferred async frees before large allocation.
+    ensureGpuMemoryAvailable(256ULL << 20, "CudfHashJoinBuild::noMoreInput");
+
   for (int attempt = 0;; ++attempt) {
     try {
       tbls = getConcatenatedTableBatched(
@@ -788,6 +801,7 @@ void CudfHashJoinBuild::noMoreInput() {
           std::chrono::milliseconds(200 * (1 << attempt)));
     }
   }
+  } // end of multi-batch else block
   inputs_.clear();
 
   for (auto const& tbl : tbls) {

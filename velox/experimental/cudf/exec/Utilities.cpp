@@ -369,7 +369,10 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   cudf::detail::join_streams(inputStreams, stream);
 
-  if (tables.size() == 1 && inputStreams[0] == stream) {
+  // join_streams already makes 'stream' depend on all input streams, so
+  // releasing is safe regardless of stream identity. Avoid the copy path
+  // which can fail with cudaErrorInvalidValue on large tables.
+  if (tables.size() == 1) {
     concatTables.push_back(tables[0]->release());
     return concatTables;
   }
