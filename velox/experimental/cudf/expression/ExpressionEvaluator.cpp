@@ -282,9 +282,11 @@ class MakeDecimalCudfFunction : public CudfFunction {
 // GPU implementation of Spark's unscaled_value special form.
 // Extracts the raw unscaled integer from a DECIMAL column.
 // E.g. unscaled_value(DECIMAL(7,2) 123.45) = BIGINT 12345.
-// Since cuDF stores decimals as their unscaled integer representation,
-// this is a zero-copy reinterpretation (DECIMAL64 → INT64) or a widening
-// cast (DECIMAL32 → INT32 → INT64).
+// cuDF stores decimals as their unscaled integer representation, so for
+// DECIMAL32/64 this is a cheap reinterpret + optional widening cast.
+// For DECIMAL128 we first narrow to DECIMAL64 (same scale) since cuDF has
+// no INT128 column type, then reinterpret. Spark guarantees the value fits
+// in a Long when it emits unscaled_value.
 class UnscaledValueFunction : public CudfFunction {
  public:
   UnscaledValueFunction(
@@ -295,6 +297,22 @@ class UnscaledValueFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
+
+    if (inputCol.type().id() == cudf::type_id::DECIMAL128) {
+      auto dec64 = cudf::cast(
+          inputCol,
+          cudf::data_type{cudf::type_id::DECIMAL64, inputCol.type().scale()},
+          stream,
+          mr);
+      cudf::column_view intView(
+          cudf::data_type{cudf::type_id::INT64},
+          dec64->size(),
+          dec64->view().head(),
+          dec64->view().null_mask(),
+          dec64->view().null_count());
+      return std::make_unique<cudf::column>(intView, stream, mr);
+    }
+
     cudf::type_id intType;
     switch (inputCol.type().id()) {
       case cudf::type_id::DECIMAL32:
@@ -305,7 +323,7 @@ class UnscaledValueFunction : public CudfFunction {
         break;
       default:
         VELOX_FAIL(
-            "unscaled_value expects DECIMAL32/DECIMAL64 input, got type_id {}",
+            "unscaled_value expects DECIMAL input, got type_id {}",
             static_cast<int>(inputCol.type().id()));
     }
     cudf::column_view intView(
@@ -1789,9 +1807,7 @@ class CoalesceFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const {
     auto view = asView(col);
-    if (cudf::is_fixed_point(view.type()) &&
-        cudf::is_fixed_point(type_) &&
-        view.type() != type_) {
+    if (view.type() != type_) {
       castHolders_.push_back(cudf::cast(view, type_, stream, mr));
       col = castHolders_.back()->view();
     }
@@ -1802,9 +1818,7 @@ class CoalesceFunction : public CudfFunction {
       cudf::data_type colType,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const {
-    if (cudf::is_fixed_point(s.type()) &&
-        cudf::is_fixed_point(colType) &&
-        s.type() != colType) {
+    if (s.type() != colType) {
       auto col = cudf::make_column_from_scalar(s, 1, stream, mr);
       auto casted = cudf::cast(col->view(), colType, stream, mr);
       return cudf::get_element(*casted, 0, stream, mr);
