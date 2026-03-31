@@ -2518,12 +2518,27 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
           .integerVariable("a_scale")
           .returnType("decimal(38, a_scale)")
           .argumentType("varbinary")
+          .build(),
+      // After shuffle, intermediate state may arrive as ROW(sum, count)
+      // instead of serialized varbinary.
+      FunctionSignatureBuilder()
+          .integerVariable("a_precision")
+          .integerVariable("a_scale")
+          .returnType("decimal(38, a_scale)")
+          .argumentType("row(decimal(a_precision, a_scale),bigint)")
           .build()};
   auto decimalSumIntermediate =
-      std::vector<exec::FunctionSignaturePtr>{FunctionSignatureBuilder()
-                                                  .returnType("varbinary")
-                                                  .argumentType("varbinary")
-                                                  .build()};
+      std::vector<exec::FunctionSignaturePtr>{
+          FunctionSignatureBuilder()
+              .returnType("varbinary")
+              .argumentType("varbinary")
+              .build(),
+          FunctionSignatureBuilder()
+              .integerVariable("a_precision")
+              .integerVariable("a_scale")
+              .returnType("row(decimal(a_precision, a_scale),bigint)")
+              .argumentType("row(decimal(a_precision, a_scale),bigint)")
+              .build()};
 
   sumSingleSignatures.insert(
       sumSingleSignatures.end(),
@@ -2766,12 +2781,27 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
           .integerVariable("a_scale")
           .returnType("decimal(a_precision, a_scale)")
           .argumentType("varbinary")
+          .build(),
+      // After shuffle, intermediate state may arrive as ROW(sum, count)
+      // instead of serialized varbinary.
+      FunctionSignatureBuilder()
+          .integerVariable("a_precision")
+          .integerVariable("a_scale")
+          .returnType("decimal(a_precision, a_scale)")
+          .argumentType("row(decimal(a_precision, a_scale),bigint)")
           .build()};
   auto decimalAvgIntermediate =
-      std::vector<exec::FunctionSignaturePtr>{FunctionSignatureBuilder()
-                                                  .returnType("varbinary")
-                                                  .argumentType("varbinary")
-                                                  .build()};
+      std::vector<exec::FunctionSignaturePtr>{
+          FunctionSignatureBuilder()
+              .returnType("varbinary")
+              .argumentType("varbinary")
+              .build(),
+          FunctionSignatureBuilder()
+              .integerVariable("a_precision")
+              .integerVariable("a_scale")
+              .returnType("row(decimal(a_precision, a_scale),bigint)")
+              .argumentType("row(decimal(a_precision, a_scale),bigint)")
+              .build()};
 
   avgSingleSignatures.insert(
       avgSingleSignatures.end(),
