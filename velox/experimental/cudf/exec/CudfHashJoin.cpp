@@ -811,6 +811,14 @@ void CudfHashJoinBuild::noMoreInput() {
       !tbls.empty(),
       "Expected at least one build table after concatenation. planNodeId: {}",
       planNodeId());
+
+  for (auto& tbl : tbls) {
+    if (tbl && tbl->num_rows() > 0 &&
+        hasDecimal128Misalignment(tbl->view())) {
+      auto mr = cudf::get_current_device_resource_ref();
+      tbl = std::make_unique<cudf::table>(tbl->view(), stream, mr);
+    }
+  }
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Build table batches count: " << tbls.size();
     VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
@@ -3424,6 +3432,12 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     auto& rightTables = hashObject_.value().first;
     auto& hbs = hashObject_.value().second;
     for (size_t i = 0; i < rightTables.size(); ++i) {
+      if (rightTables[i] && rightTables[i]->num_rows() > 0 &&
+          hasDecimal128Misalignment(rightTables[i]->view())) {
+        auto mr = cudf::get_current_device_resource_ref();
+        rightTables[i] = std::make_shared<cudf::table>(
+            rightTables[i]->view(), stream, mr);
+      }
       if (!hbs[i]) {
         ensureGpuMemoryAvailable(
             128ULL << 20, "CudfHashJoinProbe hash table construction");

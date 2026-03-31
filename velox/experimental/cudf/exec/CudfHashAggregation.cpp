@@ -1924,6 +1924,15 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
 
+    std::vector<AlignedTable> concatAlignStorage;
+    for (size_t i = 0; i < tablesToConcat.size(); ++i) {
+      if (hasDecimal128Misalignment(tablesToConcat[i])) {
+        concatAlignStorage.push_back(
+            ensureDecimal128Alignment(tablesToConcat[i], partialOutputStream));
+        tablesToConcat[i] = concatAlignStorage.back().view;
+      }
+    }
+
     std::unique_ptr<cudf::table> concatenatedTable;
     concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream);
@@ -1964,6 +1973,15 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
     cudf::detail::join_streams(
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
+
+    std::vector<AlignedTable> distinctAlignStorage;
+    for (size_t i = 0; i < tablesToConcat.size(); ++i) {
+      if (hasDecimal128Misalignment(tablesToConcat[i])) {
+        distinctAlignStorage.push_back(
+            ensureDecimal128Alignment(tablesToConcat[i], partialOutputStream));
+        tablesToConcat[i] = distinctAlignStorage.back().view;
+      }
+    }
 
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream);
@@ -2443,6 +2461,16 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           std::vector<cudf::table_view> toConcat;
           toConcat.push_back(mergedResult->getTableView());
           toConcat.push_back(batchResult->getTableView());
+
+          std::vector<AlignedTable> mergeAlignStorage;
+          for (size_t ci = 0; ci < toConcat.size(); ++ci) {
+            if (hasDecimal128Misalignment(toConcat[ci])) {
+              mergeAlignStorage.push_back(
+                  ensureDecimal128Alignment(toConcat[ci], stream));
+              toConcat[ci] = mergeAlignStorage.back().view;
+            }
+          }
+
           std::unique_ptr<cudf::table> concatTable;
           try {
             concatTable = cudf::concatenate(
@@ -2495,6 +2523,16 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           std::vector<cudf::table_view> toConcat;
           toConcat.push_back(mergedResult->getTableView());
           toConcat.push_back(batchResult->getTableView());
+
+          std::vector<AlignedTable> distinctMergeAlignStorage;
+          for (size_t ci = 0; ci < toConcat.size(); ++ci) {
+            if (hasDecimal128Misalignment(toConcat[ci])) {
+              distinctMergeAlignStorage.push_back(
+                  ensureDecimal128Alignment(toConcat[ci], stream));
+              toConcat[ci] = distinctMergeAlignStorage.back().view;
+            }
+          }
+
           std::unique_ptr<cudf::table> concatTable;
           try {
             concatTable = cudf::concatenate(
@@ -2545,6 +2583,16 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           }
           std::vector<cudf::table_view> views = {
               batches[i]->view(), batches[i + 1]->view()};
+
+          std::vector<AlignedTable> pairAlignStorage;
+          for (size_t vi = 0; vi < views.size(); ++vi) {
+            if (hasDecimal128Misalignment(views[vi])) {
+              pairAlignStorage.push_back(
+                  ensureDecimal128Alignment(views[vi], stream));
+              views[vi] = pairAlignStorage.back().view;
+            }
+          }
+
           std::unique_ptr<cudf::table> merged;
           try {
             merged = cudf::concatenate(
