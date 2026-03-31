@@ -24,6 +24,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -330,6 +331,22 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
             << " cols=" << (tableViews.empty() ? 0 : tableViews[0].num_columns());
 
   cudf::detail::join_streams(inputStreams, stream);
+
+  // cudf 0-column tables report num_rows()==0 through table_view because the
+  // row count is derived from columns. When Spark prunes all columns (e.g.
+  // count(1) after LIMIT), the CudfVector::size() is correct but the cudf
+  // table loses the row count. Fix: add a sentinel INT8 column so that
+  // downstream operators (CountAggregator, etc.) see the real row count.
+  const bool zeroColumns =
+      !tableViews.empty() && tableViews[0].num_columns() == 0;
+  if (zeroColumns && totalRows > 0) {
+    auto sentinel = cudf::numeric_scalar<int8_t>(0);
+    auto col = cudf::make_column_from_scalar(
+        sentinel, static_cast<cudf::size_type>(totalRows), stream);
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::move(col));
+    return std::make_unique<cudf::table>(std::move(cols));
+  }
 
   if (tables.size() == 1 && inputStreams[0] == stream) {
     return tables[0]->release();
