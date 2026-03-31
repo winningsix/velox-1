@@ -101,6 +101,27 @@ getConcatenatedTableBatched(
 [[nodiscard]] uint64_t estimateTableBytes(
     std::unique_ptr<cudf::table>& table);
 
+/// Returns true if any DECIMAL128 column (including nested STRUCT/LIST
+/// children) in `input` has a base data pointer that is not 16-byte aligned.
+[[nodiscard]] bool hasDecimal128Misalignment(cudf::table_view input);
+
+/// Holds alignment-corrected column data. The `view` field is always safe
+/// to pass to cudf APIs; `storage` keeps any reallocated columns alive.
+struct AlignedTable {
+  cudf::table_view view;
+  std::vector<std::unique_ptr<cudf::column>> storage;
+};
+
+/// Checks every DECIMAL128 column (including STRUCT children) in
+/// `input` for 16-byte alignment. Misaligned columns are deep-copied
+/// into freshly RMM-allocated buffers that satisfy the alignment
+/// requirement. Returns an AlignedTable whose `view` is safe for cudf
+/// kernels. When no columns need fixing the returned view aliases the
+/// original data with zero copies.
+[[nodiscard]] AlignedTable ensureDecimal128Alignment(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream);
+
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.
  *

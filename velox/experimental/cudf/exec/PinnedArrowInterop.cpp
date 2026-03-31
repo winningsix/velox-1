@@ -225,6 +225,13 @@ void buildArrowColumnFromPacked(
   auto& col = meta[idx++];
 
   auto typeId = col.type.id();
+  LOG(WARNING) << "[DIAG-DtoH] buildCol: typeId=" << static_cast<int>(typeId)
+               << " size=" << col.size
+               << " null_count=" << col.null_count
+               << " data_offset=" << col.data_offset
+               << " null_mask_offset=" << col.null_mask_offset
+               << " num_children=" << col.num_children
+               << " scale=" << col.type.scale();
   bool isString = (typeId == cudf::type_id::STRING);
 
   if (isString) {
@@ -365,11 +372,11 @@ void buildArrowColumnFromPacked(
         break;
       case cudf::type_id::DECIMAL32:
         arrowType = NANOARROW_TYPE_INT32;
-        elemSize = 4;
+        elemSize = 0; // widened to 128-bit below
         break;
       case cudf::type_id::DECIMAL64:
         arrowType = NANOARROW_TYPE_INT64;
-        elemSize = 8;
+        elemSize = 0; // widened to 128-bit below
         break;
       case cudf::type_id::DECIMAL128:
         arrowType = NANOARROW_TYPE_DECIMAL128;
@@ -405,6 +412,44 @@ void buildArrowColumnFromPacked(
       auto dataBytes = static_cast<int64_t>(col.size) * elemSize;
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
+      out->buffers[1] = buf->data;
+      LOG(WARNING) << "[DIAG-DtoH] col typeId=" << static_cast<int>(typeId)
+                   << " elemSize=" << elemSize
+                   << " rows=" << col.size
+                   << " arrowType=" << arrowType;
+    } else if (
+        col.data_offset != -1 &&
+        (typeId == cudf::type_id::DECIMAL32 ||
+         typeId == cudf::type_id::DECIMAL64)) {
+      // Velox's Arrow import (createShortDecimalVector in Bridge.cpp) casts
+      // decimal buffers to int128_t* with 16-byte stride.  cudf stores
+      // DECIMAL32 as 4 bytes and DECIMAL64 as 8 bytes per element.
+      // Sign-extend each value to 128-bit so Velox reads correct data.
+      auto numElements = static_cast<int64_t>(col.size);
+      auto* src = hostBase + col.data_offset;
+      auto* buf = ArrowArrayBuffer(out, 1);
+      NANOARROW_THROW_NOT_OK(
+          ArrowBufferResize(buf, numElements * 16, 0));
+      auto* dst = reinterpret_cast<uint8_t*>(buf->data);
+      if (typeId == cudf::type_id::DECIMAL32) {
+        auto* s = reinterpret_cast<const int32_t*>(src);
+        for (int64_t i = 0; i < numElements; ++i) {
+          __int128_t v = static_cast<__int128_t>(s[i]);
+          memcpy(dst + i * 16, &v, 16);
+        }
+        LOG(WARNING) << "[DIAG-DtoH] DECIMAL32 widened: " << numElements
+                     << " elements, first=" << s[0]
+                     << " last=" << s[numElements - 1];
+      } else {
+        auto* s = reinterpret_cast<const int64_t*>(src);
+        for (int64_t i = 0; i < numElements; ++i) {
+          __int128_t v = static_cast<__int128_t>(s[i]);
+          memcpy(dst + i * 16, &v, 16);
+        }
+        LOG(WARNING) << "[DIAG-DtoH] DECIMAL64 widened: " << numElements
+                     << " elements, first=" << s[0]
+                     << " last=" << s[numElements - 1];
+      }
       out->buffers[1] = buf->data;
     } else if (col.data_offset != -1 && arrowType == NANOARROW_TYPE_BOOL) {
       // cudf BOOL8 stores 1 byte per element; Arrow BOOL stores 1 bit

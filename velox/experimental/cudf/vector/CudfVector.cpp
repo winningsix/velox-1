@@ -81,8 +81,21 @@ CudfVector::CudfVector(
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
-  // For packed table, flatSize is the size of the GPU data buffer
   flatSize_ = packedPtr->data.gpu_data->size();
+
+  // Packed buffers store columns contiguously; DECIMAL128 data may land at
+  // offsets that are not 16-byte aligned.  Materializing the table early
+  // (deep-copying each column into its own RMM allocation) guarantees the
+  // 16-byte alignment that CUDA kernels require for __int128_t access.
+  if (hasDecimal128Misalignment(tabView_)) {
+    auto mr = cudf::get_current_device_resource_ref();
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, mr);
+    tableStorage_ = std::move(materializedTable);
+    auto& tablePtr = std::get<std::unique_ptr<cudf::table>>(tableStorage_);
+    flatSize_ = estimateTableBytes(tablePtr);
+    tabView_ = tablePtr->view();
+  }
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {

@@ -3160,6 +3160,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();
+
+  auto probeAligned = ensureDecimal128Alignment(leftTableView, stream);
+  leftTableView = probeAligned.view;
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Probe table number of columns: " << leftTableView.num_columns();
     VLOG(1) << "Probe table number of rows: " << leftTableView.num_rows();
@@ -3801,13 +3804,28 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       cudfOutputs.end());
 
   if (cudfOutputs.empty()) {
+    LOG(WARNING) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
+                 << "] join produced 0 output rows"
+                 << " probeRows=" << leftTableView.num_rows()
+                 << " joinType=" << static_cast<int>(joinNode_->joinType());
     finished_ =
         noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
     return nullptr;
   }
 
+  {
+    cudf::size_type totalJoinRows = 0;
+    for (const auto& t : cudfOutputs) {
+      if (t) totalJoinRows += t->num_rows();
+    }
+    LOG(WARNING) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
+                 << "] join produced " << totalJoinRows << " output rows"
+                 << " from " << cudfOutputs.size() << " chunks"
+                 << " probeRows=" << leftTableView.num_rows()
+                 << " joinType=" << static_cast<int>(joinNode_->joinType());
+  }
+
   if (cudfOutputs.size() == 1) {
-    // Single result — return directly without concatenation.
     finished_ =
         noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
     auto tbl = std::move(cudfOutputs[0]);

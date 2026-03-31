@@ -212,6 +212,16 @@ std::unique_ptr<cudf::table> concatenateTables(
   std::vector<std::unique_ptr<cudf::table>> castStorage;
   alignDecimalColumnsForConcat(tableViews, castStorage, stream);
 
+  // Ensure DECIMAL128 columns are 16-byte aligned before concatenation.
+  std::vector<AlignedTable> alignStorage;
+  for (size_t i = 0; i < tableViews.size(); ++i) {
+    if (hasDecimal128Misalignment(tableViews[i])) {
+      alignStorage.push_back(
+          ensureDecimal128Alignment(tableViews[i], stream));
+      tableViews[i] = alignStorage.back().view;
+    }
+  }
+
   return cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
 }
@@ -237,6 +247,77 @@ std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
     }
   }
   return std::make_unique<cudf::table>(std::move(emptyColumns));
+}
+
+namespace {
+
+bool isDecimal128Misaligned(cudf::column_view const& col) {
+  if (col.size() == 0) return false;
+  if (col.type().id() == cudf::type_id::DECIMAL128) {
+    // CUDA kernels access DECIMAL128 data at head<__int128_t>() + offset,
+    // i.e. byte address = head + offset * 16. Since offset * 16 is always
+    // a multiple of 16, alignment depends solely on the head pointer.
+    auto ptr = reinterpret_cast<uintptr_t>(col.head<uint8_t>());
+    if (ptr % 16 != 0) return true;
+  }
+  if (col.type().id() == cudf::type_id::STRUCT ||
+      col.type().id() == cudf::type_id::LIST) {
+    for (int c = 0; c < col.num_children(); ++c) {
+      if (isDecimal128Misaligned(col.child(c))) return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
+bool hasDecimal128Misalignment(cudf::table_view input) {
+  for (cudf::size_type i = 0; i < input.num_columns(); ++i) {
+    if (isDecimal128Misaligned(input.column(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+AlignedTable ensureDecimal128Alignment(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream) {
+  AlignedTable result;
+  bool anyMisaligned = false;
+
+  for (cudf::size_type i = 0; i < input.num_columns(); ++i) {
+    if (isDecimal128Misaligned(input.column(i))) {
+      anyMisaligned = true;
+      break;
+    }
+  }
+
+  if (!anyMisaligned) {
+    result.view = input;
+    return result;
+  }
+
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<cudf::column_view> views;
+  views.reserve(input.num_columns());
+
+  for (cudf::size_type i = 0; i < input.num_columns(); ++i) {
+    auto col = input.column(i);
+    if (isDecimal128Misaligned(col)) {
+      LOG(WARNING) << "ensureDecimal128Alignment: realigning column " << i
+                   << " (type=" << static_cast<int>(col.type().id())
+                   << ", rows=" << col.size() << ")";
+      auto aligned = std::make_unique<cudf::column>(col, stream, mr);
+      views.push_back(aligned->view());
+      result.storage.push_back(std::move(aligned));
+    } else {
+      views.push_back(col);
+    }
+  }
+
+  result.view = cudf::table_view(views);
+  return result;
 }
 
 namespace {
@@ -355,6 +436,17 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   std::vector<std::unique_ptr<cudf::table>> castStorage;
   alignDecimalColumnsForConcat(tableViews, castStorage, stream);
 
+  // Ensure DECIMAL128 columns are 16-byte aligned before concatenation;
+  // cudf::concatenate uses typed kernels that require aligned access.
+  std::vector<AlignedTable> alignedStorage;
+  for (size_t i = 0; i < tableViews.size(); ++i) {
+    if (hasDecimal128Misalignment(tableViews[i])) {
+      alignedStorage.push_back(
+          ensureDecimal128Alignment(tableViews[i], stream));
+      tableViews[i] = alignedStorage.back().view;
+    }
+  }
+
   auto output = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
   stream.synchronize();
@@ -397,6 +489,16 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   std::vector<std::unique_ptr<cudf::table>> castStorage;
   alignDecimalColumnsForConcat(tableViews, castStorage, stream);
 
+  // Ensure DECIMAL128 columns are 16-byte aligned before concatenation.
+  std::vector<AlignedTable> batchAlignedStorage;
+  for (size_t i = 0; i < tableViews.size(); ++i) {
+    if (hasDecimal128Misalignment(tableViews[i])) {
+      batchAlignedStorage.push_back(
+          ensureDecimal128Alignment(tableViews[i], stream));
+      tableViews[i] = batchAlignedStorage.back().view;
+    }
+  }
+
   // Estimate bytes per row from the first table's schema. Multiply by 2 to
   // account for null bitmasks, alignment padding, string offset arrays, and
   // the fact that cudf::concatenate holds both input + output simultaneously.
@@ -414,16 +516,16 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     bytesPerRow = std::max(bytesPerRow * 2, size_t(2));
   }
 
-  // Limit batches by byte size. Use the lesser of 0.5% of free GPU memory
-  // and a hard cap (256 MB) to avoid oversized allocations that trigger
-  // cudaErrorInvalidValue. Conservative because concurrent GPU tasks compete
-  // for memory and the RMM pool may be heavily fragmented.
-  static constexpr size_t kMaxBatchBytesCap = 256ULL << 20; // 256 MB
+  // Limit batches by byte size. Use 10% of free GPU memory (capped at 1 GB)
+  // to produce fewer, larger batches. Fewer batches reduces the overhead of
+  // pairwise concatenation in the caller and lowers the chance of hitting
+  // cudaErrorInvalidValue from many simultaneous small allocations.
+  static constexpr size_t kMaxBatchBytesCap = 1ULL << 30; // 1 GB
   size_t maxBatchBytes = kMaxBatchBytesCap;
   {
     size_t freeMem = 0, totalMem = 0;
     if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess && freeMem > 0) {
-      maxBatchBytes = std::min(kMaxBatchBytesCap, freeMem / 200);
+      maxBatchBytes = std::min(kMaxBatchBytesCap, freeMem / 10);
     }
   }
 

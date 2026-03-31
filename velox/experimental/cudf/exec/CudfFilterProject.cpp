@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -302,7 +303,16 @@ RowVectorPtr CudfFilterProject::getOutput() {
 
   try {
     if (hasFilter_) {
+      auto preFilterRows = inputTableColumns.empty()
+          ? inputRows
+          : static_cast<cudf::size_type>(inputTableColumns[0]->size());
       filter(inputTableColumns, stream);
+      auto postFilterRows = inputTableColumns.empty()
+          ? 0
+          : static_cast<cudf::size_type>(inputTableColumns[0]->size());
+      LOG(WARNING) << "[DIAG] CudfFilterProject[" << planNodeId()
+                   << "] filter: " << preFilterRows << " -> "
+                   << postFilterRows << " rows";
       if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
         input_.reset();
         if (!accumulatedOutputs_.empty() && noMoreInput_) {
@@ -506,6 +516,19 @@ void CudfFilterProject::filter(
 std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     rmm::cuda_stream_view stream) {
+  auto mr = cudf::get_current_device_resource_ref();
+  for (auto& col : inputTableColumns) {
+    if (col && col->size() > 0 &&
+        col->type().id() == cudf::type_id::DECIMAL128) {
+      auto ptr = reinterpret_cast<uintptr_t>(col->view().head<uint8_t>());
+      if (ptr % 16 != 0) {
+        LOG(WARNING) << "CudfFilterProject: realigning DECIMAL128 column ("
+                     << col->size() << " rows)";
+        col = std::make_unique<cudf::column>(col->view(), stream, mr);
+      }
+    }
+  }
+
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
   for (auto& col : inputTableColumns) {
