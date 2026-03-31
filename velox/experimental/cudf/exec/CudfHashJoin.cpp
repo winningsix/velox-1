@@ -3818,7 +3818,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       cudfOutputs.end());
 
   if (cudfOutputs.empty()) {
-    LOG(WARNING) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
+    VLOG(1) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
                  << "] join produced 0 output rows"
                  << " probeRows=" << leftTableView.num_rows()
                  << " joinType=" << static_cast<int>(joinNode_->joinType());
@@ -3832,7 +3832,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     for (const auto& t : cudfOutputs) {
       if (t) totalJoinRows += t->num_rows();
     }
-    LOG(WARNING) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
+    VLOG(1) << "[DIAG] CudfHashJoinProbe[" << joinNode_->id()
                  << "] join produced " << totalJoinRows << " output rows"
                  << " from " << cudfOutputs.size() << " chunks"
                  << " probeRows=" << leftTableView.num_rows()

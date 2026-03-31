@@ -1907,7 +1907,7 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       inputTableStream);
 
   if (!groupbyOnInput) {
-    LOG(WARNING) << "[DIAG] computeIntermediateGroupbyPartial node="
+    VLOG(1) << "[DIAG] computeIntermediateGroupbyPartial node="
                  << planNodeId()
                  << " initial groupby returned nullptr, inputRows="
                  << tbl->size();
@@ -2053,14 +2053,6 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
-  LOG(WARNING) << "[DIAG] addInput node=" << planNodeId()
-            << " batchRows=" << input->size()
-            << " totalInputRows=" << numInputRows_
-            << " inputsSize=" << inputs_.size()
-            << " partial=" << isPartialOutput_
-            << " global=" << isGlobal_
-            << " distinct=" << isDistinct_;
-
   // #region agent log
   try {
   // #endregion
@@ -2121,7 +2113,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
-  LOG(WARNING) << "[DIAG] doGroupByAgg:entry node=" << planNodeId()
+  VLOG(1) << "[DIAG] doGroupByAgg:entry node=" << planNodeId()
                << " rows=" << tableView.num_rows()
                << " cols=" << tableView.num_columns()
                << " nKeys=" << groupByKeys.size()
@@ -2258,7 +2250,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     return nullptr;
   }
 
-  LOG(WARNING) << "[DIAG] doGroupByAgg:exit node=" << planNodeId()
+  VLOG(1) << "[DIAG] doGroupByAgg:exit node=" << planNodeId()
                << " numRows=" << numRows;
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(resultTable), stream);
@@ -2382,7 +2374,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     }
     finished_ = true;
     if (isGlobal_) {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                    << " emptyInputs globalAgg with makeEmptyTable";
       auto stream = cudfGlobalStreamPool().get_stream();
       auto tbl = makeEmptyTable(inputType_);
@@ -2397,7 +2389,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   for (const auto& inp : inputs_) {
     totalInputRows += inp->size();
   }
-  LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+  VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                << " inputsBatches=" << inputs_.size()
                << " totalInputRows=" << totalInputRows
                << " noMoreInput=" << noMoreInput_
@@ -2441,7 +2433,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   try {
     // --- Incremental group-by aggregation across multiple batches ---
     if (canMergeGroupBy) {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                 << " incremental group-by over " << batches.size() << " batches";
 
       CudfVectorPtr mergedResult;
@@ -2494,7 +2486,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       batches.clear();
 
       if (mergedResult) {
-        LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+        VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                   << " incremental aggregation produced "
                   << mergedResult->size() << " rows";
       }
@@ -2503,7 +2495,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
     // --- Incremental distinct across multiple batches ---
     if (canMergeDistinct) {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                 << " incremental distinct over " << batches.size() << " batches";
 
       CudfVectorPtr mergedResult;
@@ -2555,7 +2547,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       batches.clear();
 
       if (mergedResult) {
-        LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+        VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                   << " incremental distinct produced "
                   << mergedResult->size() << " rows";
       }
@@ -2571,7 +2563,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       // instead of all-at-once. This limits peak GPU memory (only 2 inputs +
       // 1 output at each step) and avoids cudaErrorInvalidValue when many
       // small batches are passed to cudf::concatenate simultaneously.
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                    << " pairwise concat for " << batches.size() << " batches";
       while (batches.size() > 1) {
         std::vector<std::unique_ptr<cudf::table>> nextLevel;
@@ -2618,12 +2610,12 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
     VELOX_CHECK_NOT_NULL(tbl);
 
-    LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+    VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
               << " concatenatedRows=" << tbl->num_rows()
               << " concatenatedCols=" << tbl->num_columns();
 
     if (tbl->num_rows() == 0 && !isGlobal_) {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                    << " concatenated table has 0 rows (non-global), returning nullptr";
       return nullptr;
     }
@@ -2644,16 +2636,126 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       }
     };
 
-    // OOM recovery strategy: when the aggregation fails due to GPU memory
-    // pressure (typically from concurrent operators like hash joins), wait
-    // with exponential backoff for memory to be released before retrying.
-    // Other GPU operators run on separate threads and will release memory
-    // as they complete. A bounded wait avoids blocking indefinitely.
+    // Determine if split-merge is possible: distinct is always splittable;
+    // group-by requires valid intermediate aggregators for the merge step;
+    // global aggregation cannot be split.
+    bool canSplitOnOOM = !isGlobal_ && tbl->num_rows() > 1000;
+    if (canSplitOnOOM && !isDistinct_) {
+      for (const auto& agg : intermediateAggregators_) {
+        if (!agg) { canSplitOnOOM = false; break; }
+      }
+    }
+
+    // Reclaim cached GPU memory from the CUDA async pool. Called before
+    // retries and split-merge attempts so fragmented free blocks are
+    // consolidated and available for new allocations.
+    auto trimGpuMemoryPool = [&]() {
+      cudaDeviceSynchronize();
+      cudaGetLastError();
+      int device = 0;
+      cudaGetDevice(&device);
+      cudaMemPool_t pool = nullptr;
+      if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
+          pool != nullptr) {
+        cudaMemPoolTrimTo(pool, 0);
+      }
+    };
+
+    // Split the table into N chunks, run aggregation on each chunk
+    // sequentially (releasing intermediate hash tables between chunks),
+    // then merge all results. Adaptive: starts with 2 chunks, doubles
+    // on failure up to kMaxSplitParts. Returns true on success.
+    auto trySplitMerge = [&](CudfVectorPtr& out) -> bool {
+      static constexpr int kMaxSplitParts = 16;
+      int numParts = 2;
+
+      while (numParts <= kMaxSplitParts) {
+        auto numRows = tbl->num_rows();
+        std::vector<cudf::size_type> splitIndices;
+        for (int p = 1; p < numParts; ++p) {
+          splitIndices.push_back(
+              static_cast<cudf::size_type>((int64_t)numRows * p / numParts));
+        }
+        auto parts = cudf::split(tbl->view(), splitIndices, stream);
+
+        LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                     << "]: split-merge " << numRows << " rows into "
+                     << numParts << " parts (first="
+                     << parts[0].num_rows() << ")";
+
+        std::vector<CudfVectorPtr> chunkResults;
+        bool allChunksOk = true;
+        for (size_t ci = 0; ci < parts.size(); ++ci) {
+          trimGpuMemoryPool();
+          try {
+            auto chunkResult = runAggregation(parts[ci]);
+            if (chunkResult) {
+              chunkResults.push_back(std::move(chunkResult));
+            }
+          } catch (const std::exception& e) {
+            LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                         << "]: split-merge chunk " << ci << "/"
+                         << parts.size() << " failed: " << e.what();
+            allChunksOk = false;
+            cudaDeviceSynchronize();
+            cudaGetLastError();
+            break;
+          }
+        }
+
+        if (!allChunksOk) {
+          chunkResults.clear();
+          numParts *= 2;
+          LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                       << "]: retrying with " << numParts << " parts";
+          continue;
+        }
+
+        stream.synchronize();
+        tbl.reset();
+
+        if (chunkResults.empty()) {
+          out = nullptr;
+          return true;
+        }
+        if (chunkResults.size() == 1) {
+          out = std::move(chunkResults[0]);
+          return true;
+        }
+
+        std::vector<cudf::table_view> toConcat;
+        for (auto& cr : chunkResults) {
+          toConcat.push_back(cr->getTableView());
+        }
+        auto mergedTable = cudf::concatenate(
+            toConcat, stream, cudf::get_current_device_resource_ref());
+        chunkResults.clear();
+
+        trimGpuMemoryPool();
+        if (isDistinct_) {
+          out = getDistinctKeys(
+              mergedTable->view(), groupingKeyOutputChannels_, stream);
+        } else {
+          out = doGroupByAggregation(
+              mergedTable->view(), groupingKeyOutputChannels_,
+              intermediateAggregators_, stream);
+        }
+        return true;
+      }
+      return false;
+    };
+
+    // OOM recovery strategy:
+    //  1. Retry with exponential backoff (other GPU operators on separate
+    //     threads release memory as they complete).
+    //  2. After kSplitAttemptRetry failures, split-and-merge to halve peak
+    //     GPU memory per aggregation step.
+    //  3. Give up after kMaxOomRetries.
     CudfVectorPtr result;
     static constexpr int kMaxOomRetries = 20;
     static constexpr int kInitialBackoffMs = 200;
     static constexpr int kMaxBackoffMs = 5000;
-    static constexpr size_t kMinFreeBytesForRetry = 100ULL << 20; // 100 MB
+    static constexpr int kSplitAttemptRetry = 3;
 
     for (int oomRetry = 0;; ++oomRetry) {
       try {
@@ -2670,6 +2772,24 @@ RowVectorPtr CudfHashAggregation::getOutput() {
                      << "]: OOM after " << kMaxOomRetries
                      << " retries, giving up: " << oom.what();
           throw;
+        }
+
+        if (oomRetry == kSplitAttemptRetry && canSplitOnOOM) {
+          try {
+            if (trySplitMerge(result)) {
+              LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                           << "]: split-merge succeeded, produced "
+                           << (result ? result->size() : 0) << " rows";
+              break;
+            }
+          } catch (const std::exception& e) {
+            LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                         << "]: split-merge failed: " << e.what()
+                         << ", continuing retries";
+            cudaDeviceSynchronize();
+            cudaGetLastError();
+            if (!tbl) throw;
+          }
         }
 
         size_t freeMem = 0, totalMem = 0;
@@ -2695,6 +2815,23 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           throw;
         }
 
+        if (oomRetry == kSplitAttemptRetry && canSplitOnOOM) {
+          try {
+            if (trySplitMerge(result)) {
+              LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                           << "]: split-merge (CUDA error recovery) succeeded";
+              break;
+            }
+          } catch (const std::exception& e) {
+            LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                         << "]: split-merge (CUDA error recovery) failed: "
+                         << e.what() << ", continuing retries";
+            cudaDeviceSynchronize();
+            cudaGetLastError();
+            if (!tbl) throw;
+          }
+        }
+
         int backoffMs = std::min(
             kMaxBackoffMs, kInitialBackoffMs * (1 << std::min(oomRetry, 5)));
         LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
@@ -2706,13 +2843,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     }
 
     if (!result) {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                    << " aggregation returned nullptr despite "
                    << tbl->num_rows() << " input rows"
                    << " (global=" << isGlobal_
                    << " distinct=" << isDistinct_ << ")";
     } else {
-      LOG(WARNING) << "[DIAG] getOutput node=" << planNodeId()
+      VLOG(1) << "[DIAG] getOutput node=" << planNodeId()
                 << " aggregation produced " << result->size() << " rows";
     }
     return result;

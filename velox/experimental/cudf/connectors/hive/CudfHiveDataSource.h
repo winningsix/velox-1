@@ -135,6 +135,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;
   bool useExperimentalSplitReader_;
+  bool splitReadDone_{false};
   rmm::cuda_stream_view stream_;
 
   // Output type from file reader.  This is different from outputType_ that it

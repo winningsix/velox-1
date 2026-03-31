@@ -330,13 +330,45 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
 
     // Single-file path (no coalesced files).
-    if (not splitReader_->has_next()) {
+    gpuGuard.emplace();
+    if (splitReader_->has_next()) {
+      auto tableWithMetadata = splitReader_->read_chunk();
+      cudfTable = std::move(tableWithMetadata.tbl);
+      metadata = std::move(tableWithMetadata.metadata);
+    } else if (!splitReadDone_) {
+      // Work around cudf chunked_parquet_reader bug where has_next()
+      // returns false for valid Parquet files. Fall back to the
+      // non-chunked read_parquet() which handles the same files correctly.
+      splitReadDone_ = true;
+      auto fallbackOpts = cudf::io::parquet_reader_options::builder(
+          cudf::io::source_info{split_->filePath})
+          .skip_bytes(split_->start)
+          .use_pandas_metadata(cudfHiveConfig_->isUsePandasMetadata())
+          .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
+          .allow_mismatched_pq_schemas(
+              cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
+          .timestamp_type(cudfHiveConfig_->timestampType())
+          .build();
+      if (split_->size() != std::numeric_limits<uint64_t>::max()) {
+        fallbackOpts.set_num_bytes(split_->size());
+      }
+      if (!readColumnNames_.empty()) {
+        fallbackOpts.set_column_names(readColumnNames_);
+      }
+      if (subfieldFilterExpr_ != nullptr) {
+        fallbackOpts.set_filter(*subfieldFilterExpr_);
+      }
+      auto fallbackResult = cudf::io::read_parquet(
+          fallbackOpts, stream_, cudf::get_current_device_resource_ref());
+      if (fallbackResult.tbl && fallbackResult.tbl->num_rows() > 0) {
+        cudfTable = std::move(fallbackResult.tbl);
+        metadata = std::move(fallbackResult.metadata);
+      } else {
+        return nullptr;
+      }
+    } else {
       return nullptr;
     }
-    gpuGuard.emplace();
-    auto tableWithMetadata = splitReader_->read_chunk();
-    cudfTable = std::move(tableWithMetadata.tbl);
-    metadata = std::move(tableWithMetadata.metadata);
   } else {
     // Chunked experimental reader: process row groups in batches.
     // Loops across coalesced files when the current file is exhausted.
@@ -854,6 +886,7 @@ void CudfHiveDataSource::resetSplit() {
   coalescedPinnedBuffers_.clear();
   currentFilePinnedBuffer_.reset();
   coalescedMultiSourcePending_ = false;
+  splitReadDone_ = false;
   exptMetadataInitialized_ = false;
   exptFilteredRowGroups_.clear();
   exptNextRGIndex_ = 0;

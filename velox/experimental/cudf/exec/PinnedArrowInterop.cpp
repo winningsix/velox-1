@@ -225,7 +225,7 @@ void buildArrowColumnFromPacked(
   auto& col = meta[idx++];
 
   auto typeId = col.type.id();
-  LOG(WARNING) << "[DIAG-DtoH] buildCol: typeId=" << static_cast<int>(typeId)
+  VLOG(1) << "[DIAG-DtoH] buildCol: typeId=" << static_cast<int>(typeId)
                << " size=" << col.size
                << " null_count=" << col.null_count
                << " data_offset=" << col.data_offset
@@ -413,7 +413,7 @@ void buildArrowColumnFromPacked(
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
       out->buffers[1] = buf->data;
-      LOG(WARNING) << "[DIAG-DtoH] col typeId=" << static_cast<int>(typeId)
+      VLOG(1) << "[DIAG-DtoH] col typeId=" << static_cast<int>(typeId)
                    << " elemSize=" << elemSize
                    << " rows=" << col.size
                    << " arrowType=" << arrowType;
@@ -437,7 +437,7 @@ void buildArrowColumnFromPacked(
           __int128_t v = static_cast<__int128_t>(s[i]);
           memcpy(dst + i * 16, &v, 16);
         }
-        LOG(WARNING) << "[DIAG-DtoH] DECIMAL32 widened: " << numElements
+        VLOG(1) << "[DIAG-DtoH] DECIMAL32 widened: " << numElements
                      << " elements, first=" << s[0]
                      << " last=" << s[numElements - 1];
       } else {
@@ -446,7 +446,7 @@ void buildArrowColumnFromPacked(
           __int128_t v = static_cast<__int128_t>(s[i]);
           memcpy(dst + i * 16, &v, 16);
         }
-        LOG(WARNING) << "[DIAG-DtoH] DECIMAL64 widened: " << numElements
+        VLOG(1) << "[DIAG-DtoH] DECIMAL64 widened: " << numElements
                      << " elements, first=" << s[0]
                      << " last=" << s[numElements - 1];
       }

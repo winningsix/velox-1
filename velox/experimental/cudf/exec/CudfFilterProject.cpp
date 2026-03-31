@@ -310,7 +310,7 @@ RowVectorPtr CudfFilterProject::getOutput() {
       auto postFilterRows = inputTableColumns.empty()
           ? 0
           : static_cast<cudf::size_type>(inputTableColumns[0]->size());
-      LOG(WARNING) << "[DIAG] CudfFilterProject[" << planNodeId()
+      VLOG(1) << "[DIAG] CudfFilterProject[" << planNodeId()
                    << "] filter: " << preFilterRows << " -> "
                    << postFilterRows << " rows";
       if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {

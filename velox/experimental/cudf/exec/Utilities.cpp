@@ -390,7 +390,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     const TypePtr& tableType,
     rmm::cuda_stream_view stream) {
   if (tables.size() == 0) {
-    LOG(INFO) << "[DIAG] getConcatenatedTable: 0 tables, returning empty";
+    VLOG(1) << "getConcatenatedTable: 0 tables, returning empty";
     return makeEmptyTable(tableType);
   }
 
@@ -407,9 +407,9 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     inputStreams.push_back(table->stream());
     totalRows += table->size();
   }
-  LOG(INFO) << "[DIAG] getConcatenatedTable: nTables=" << tables.size()
-            << " totalRows=" << totalRows
-            << " cols=" << (tableViews.empty() ? 0 : tableViews[0].num_columns());
+  VLOG(1) << "getConcatenatedTable: nTables=" << tables.size()
+           << " totalRows=" << totalRows
+           << " cols=" << (tableViews.empty() ? 0 : tableViews[0].num_columns());
 
   cudf::detail::join_streams(inputStreams, stream);
 
