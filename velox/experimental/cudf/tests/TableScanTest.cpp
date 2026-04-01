@@ -560,6 +560,34 @@ TEST_F(TableScanTest, filterPushdown) {
 #endif
 }
 
+TEST_F(TableScanTest, singleRowFilterDoesNotReplaySplit) {
+  auto rowType =
+      ROW({"c0", "c1", "c2", "c3"}, {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto vector = makeRowVector(
+      {"c0", "c1", "c2", "c3"},
+      {makeFlatVector<int64_t>({5214, 5215, 5216}),
+       makeFlatVector<int64_t>({1999, 1999, 1999}),
+       makeFlatVector<int64_t>({12, 12, 12}),
+       makeFlatVector<int64_t>({11, 12, 13})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector}, "c");
+  createDuckDbTable({vector});
+
+  auto task = assertQuery(
+      PlanBuilder(pool_.get())
+          .startTableScan()
+          .outputType(rowType)
+          .tableHandle(makeTableHandle())
+          .endTableScan()
+          .filter("c1 = 1999 AND c2 = 12 AND c3 = 12")
+          .project({"c0"})
+          .planNode(),
+      makeCudfHiveSplit(filePath->getPath()),
+      "SELECT c0 FROM tmp WHERE c1 = 1999 AND c2 = 12 AND c3 = 12");
+
+  EXPECT_EQ(getTableScanStats(task).outputRows, 1);
+}
+
 // Disable this test and the one below for now, pending a CUDF fix.
 // simoneves 2/25/26
 // @TODO simoneves/mattgara re-enable once fixed.

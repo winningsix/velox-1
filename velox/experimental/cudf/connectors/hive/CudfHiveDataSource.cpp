@@ -333,6 +333,11 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     gpuGuard.emplace();
     if (splitReader_->has_next()) {
       auto tableWithMetadata = splitReader_->read_chunk();
+      // Only use the whole-file fallback if the chunked reader produced no
+      // chunks at all for this split. Once a chunk has been read
+      // successfully, a later has_next() == false means the split is done,
+      // not that it should be reread from the beginning.
+      splitReadDone_ = true;
       cudfTable = std::move(tableWithMetadata.tbl);
       metadata = std::move(tableWithMetadata.metadata);
     } else if (!splitReadDone_) {
