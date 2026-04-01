@@ -2764,7 +2764,6 @@ bool registerBuiltinFunctions(const std::string& prefix) {
              .build()});
   };
 
-  registerUnaryOp({prefix + "abs"}, cudf::unary_operator::ABS);
   registerUnaryOp({prefix + "negate"}, cudf::unary_operator::NEGATE);
   registerUnaryOp({prefix + "floor"}, cudf::unary_operator::FLOOR);
   registerUnaryOp({prefix + "ceil"}, cudf::unary_operator::CEIL);
@@ -2917,6 +2916,12 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("decimal(p,s)")
            .build()});
 
   registerCudfFunction(

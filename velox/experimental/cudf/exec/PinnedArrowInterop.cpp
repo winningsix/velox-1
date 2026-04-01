@@ -59,19 +59,15 @@ struct DtoHStats {
   }
 
   void dump(const char* event) {
-    fprintf(
-        stderr,
-        "[DtoH] %s: packed=%lu/%luMB (%lu cols, %lu rows) "
-        "fallback=%lu/%lu bufs/%luMB empty=%lu\n",
-        event,
-        (unsigned long)packedCalls.load(std::memory_order_relaxed),
-        (unsigned long)(packedBytes.load(std::memory_order_relaxed) >> 20),
-        (unsigned long)packedCols.load(std::memory_order_relaxed),
-        (unsigned long)packedRows.load(std::memory_order_relaxed),
-        (unsigned long)fallbackCalls.load(std::memory_order_relaxed),
-        (unsigned long)fallbackBuffers.load(std::memory_order_relaxed),
-        (unsigned long)(fallbackBytes.load(std::memory_order_relaxed) >> 20),
-        (unsigned long)emptyCalls.load(std::memory_order_relaxed));
+    VLOG(1) << "[DtoH] " << event
+            << ": packed=" << packedCalls.load(std::memory_order_relaxed)
+            << "/" << (packedBytes.load(std::memory_order_relaxed) >> 20) << "MB"
+            << " (" << packedCols.load(std::memory_order_relaxed) << " cols, "
+            << packedRows.load(std::memory_order_relaxed) << " rows)"
+            << " fallback=" << fallbackCalls.load(std::memory_order_relaxed)
+            << "/" << fallbackBuffers.load(std::memory_order_relaxed) << " bufs/"
+            << (fallbackBytes.load(std::memory_order_relaxed) >> 20) << "MB"
+            << " empty=" << emptyCalls.load(std::memory_order_relaxed);
   }
 };
 

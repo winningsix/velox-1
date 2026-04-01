@@ -21,10 +21,11 @@
 
 #include <cuda_runtime.h>
 
+#include <glog/logging.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -75,17 +76,13 @@ struct PinnedAllocStats {
   }
 
   void dump(const char* event) {
-    fprintf(
-        stderr,
-        "[PinnedAlloc] %s: pinned=%lu/%luMB fallback=%lu/%luMB "
-        "inFlight=%luMB peak=%luMB\n",
-        event,
-        (unsigned long)pinnedCount.load(std::memory_order_relaxed),
-        (unsigned long)(pinnedBytes.load(std::memory_order_relaxed) >> 20),
-        (unsigned long)fallbackCount.load(std::memory_order_relaxed),
-        (unsigned long)(fallbackBytes.load(std::memory_order_relaxed) >> 20),
-        (unsigned long)(curInFlight.load(std::memory_order_relaxed) >> 20),
-        (unsigned long)(peakInFlight.load(std::memory_order_relaxed) >> 20));
+    VLOG(1) << "[PinnedAlloc] " << event
+            << ": pinned=" << pinnedCount.load(std::memory_order_relaxed)
+            << "/" << (pinnedBytes.load(std::memory_order_relaxed) >> 20) << "MB"
+            << " fallback=" << fallbackCount.load(std::memory_order_relaxed)
+            << "/" << (fallbackBytes.load(std::memory_order_relaxed) >> 20) << "MB"
+            << " inFlight=" << (curInFlight.load(std::memory_order_relaxed) >> 20) << "MB"
+            << " peak=" << (peakInFlight.load(std::memory_order_relaxed) >> 20) << "MB";
   }
 };
 
