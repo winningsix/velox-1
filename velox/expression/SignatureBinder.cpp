@@ -382,10 +382,20 @@ bool SignatureBinder::tryBindVariablesWithCoercion(
 
   for (auto i = 0; i < params.size(); i++) {
     const auto& actualParameter = actualType->parameters()[i];
-    if (actualParameter.kind == TypeParameterKind::kType) {
-      if (!tryBindVariablesWithCoercion(params[i], actualParameter.type)) {
-        return false;
-      }
+    switch (actualParameter.kind) {
+      case TypeParameterKind::kLongLiteral:
+        if (!checkOrSetIntegerParameter(
+                params[i].baseName(), actualParameter.longLiteral.value())) {
+          return false;
+        }
+        break;
+      case TypeParameterKind::kType:
+        if (!tryBindVariablesWithCoercion(params[i], actualParameter.type)) {
+          return false;
+        }
+        break;
+      default:
+        break;
     }
   }
 

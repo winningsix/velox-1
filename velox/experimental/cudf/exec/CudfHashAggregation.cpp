@@ -1662,7 +1662,10 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
   if (kind.rfind(prefix + "sum", 0) == 0) {
     bool isDecimalInput =
         rawInputTypes.size() == 1 && rawInputTypes[0]->isDecimal();
-    if (isDecimalInput) {
+    bool isDecimalRowInput =
+        rawInputTypes.size() == 1 && rawInputTypes[0]->isRow() &&
+        rawInputTypes[0]->asRow().childAt(0)->isDecimal();
+    if (isDecimalInput || isDecimalRowInput || resultType->isDecimal()) {
       return std::make_unique<DecimalSumOrAvgAggregator>(
           step, inputIndex, constant, isGlobal, resultType, false);
     }
@@ -1735,13 +1738,11 @@ core::AggregationNode::Step getCompanionStep(
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
-  // In a SINGLE-step aggregation node, _merge_extract companions receive raw
-  // input (not intermediate state) so they must use kSingle signatures and
-  // aggregation logic rather than kFinal.
+  // Spark companion plans keep the AggregationNode at kSingle even when the
+  // companion itself is the final merge+extract stage. Execute all
+  // _merge_extract companions as kFinal so intermediate state is merged and
+  // extracted instead of being re-aggregated as raw input.
   if (kind.find("_merge_extract") != std::string::npos) {
-    if (step == core::AggregationNode::Step::kSingle) {
-      return core::AggregationNode::Step::kSingle;
-    }
     return core::AggregationNode::Step::kFinal;
   }
 
@@ -3827,21 +3828,6 @@ bool canAggregationBeEvaluatedByCudf(
     if (!call.inputs().empty() && call.inputs()[0]->type()->isRow()) {
       auto const& rowType = call.inputs()[0]->type()->asRow();
       if (rowType.size() >= 1 && rowType.childAt(0)->isDecimal()) {
-        return true;
-      }
-    }
-  }
-
-  // For _merge_extract companions in a SINGLE-step node, try the other
-  // candidate step if the first didn't match.
-  if (call.name().find("_merge_extract") != std::string::npos &&
-      step == core::AggregationNode::Step::kSingle) {
-    auto altStep = (companionStep == core::AggregationNode::Step::kSingle)
-        ? core::AggregationNode::Step::kFinal
-        : core::AggregationNode::Step::kSingle;
-    auto altIt = funcIt->second.find(altStep);
-    if (altIt != funcIt->second.end()) {
-      if (matchTypedCallAgainstSignatures(call, altIt->second)) {
         return true;
       }
     }
