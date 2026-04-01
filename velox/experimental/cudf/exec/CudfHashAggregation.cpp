@@ -1786,8 +1786,20 @@ auto toAggregators(
         resultType = outputType->childAt(numKeys + i);
       }
 
+      // For _merge_extract companions in a SINGLE node, the actual input
+      // may be intermediate VARBINARY rather than raw BIGINT.  Detect this
+      // and switch to kFinal so doMergeReduce is invoked.
+      auto bloomStep = companionStep;
+      if (exec::isRawInput(bloomStep) &&
+          kind.find("_merge_extract") != std::string::npos) {
+        auto inputType = inputRowSchema->childAt(bloomInputIndex);
+        if (inputType->isVarbinary() || inputType->isVarchar()) {
+          bloomStep = core::AggregationNode::Step::kFinal;
+        }
+      }
+
       aggregators.push_back(std::make_unique<BloomFilterAggregator>(
-          companionStep,
+          bloomStep,
           bloomInputIndex,
           nullptr,
           isGlobal,
@@ -2015,8 +2027,18 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
     }
 
     std::unique_ptr<cudf::table> concatenatedTable;
-    concatenatedTable =
-        cudf::concatenate(tablesToConcat, partialOutputStream);
+    try {
+      concatenatedTable =
+          cudf::concatenate(tablesToConcat, partialOutputStream);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                   << "]: partial groupby concat failed (" << e.what()
+                   << "), syncing and retrying";
+      cudaDeviceSynchronize();
+      cudaGetLastError();
+      concatenatedTable =
+          cudf::concatenate(tablesToConcat, partialOutputStream);
+    }
 
     auto compactedOutput = doGroupByAggregation(
         concatenatedTable->view(),
@@ -2064,8 +2086,19 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
       }
     }
 
-    auto concatenatedTable =
-        cudf::concatenate(tablesToConcat, partialOutputStream);
+    std::unique_ptr<cudf::table> concatenatedTable;
+    try {
+      concatenatedTable =
+          cudf::concatenate(tablesToConcat, partialOutputStream);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "CudfHashAggregation[" << planNodeId()
+                   << "]: partial distinct concat failed (" << e.what()
+                   << "), syncing and retrying";
+      cudaDeviceSynchronize();
+      cudaGetLastError();
+      concatenatedTable =
+          cudf::concatenate(tablesToConcat, partialOutputStream);
+    }
 
     // Do a distinct on the concatenated results.
     // Keep concatenatedTable alive while we use its view.
@@ -2838,16 +2871,20 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     };
 
     // OOM recovery strategy:
-    //  1. Retry with exponential backoff (other GPU operators on separate
+    //  1. Trim GPU memory pool before first attempt to reclaim fragmented
+    //     memory from prior operators.
+    //  2. Retry with exponential backoff (other GPU operators on separate
     //     threads release memory as they complete).
-    //  2. After kSplitAttemptRetry failures, split-and-merge to halve peak
+    //  3. After kSplitAttemptRetry failures, split-and-merge to halve peak
     //     GPU memory per aggregation step.
-    //  3. Give up after kMaxOomRetries.
+    //  4. Give up after kMaxOomRetries.
     CudfVectorPtr result;
     static constexpr int kMaxOomRetries = 20;
     static constexpr int kInitialBackoffMs = 200;
     static constexpr int kMaxBackoffMs = 5000;
     static constexpr int kSplitAttemptRetry = 3;
+
+    trimGpuMemoryPool();
 
     for (int oomRetry = 0;; ++oomRetry) {
       try {
@@ -2884,6 +2921,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           }
         }
 
+        trimGpuMemoryPool();
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
         int backoffMs = std::min(
@@ -3630,9 +3668,6 @@ bool matchTypedCallAgainstSignatures(
       continue;
     }
 
-    // For simplicity we skip checking for constant agruments, this may be added
-    // in the future
-
     return true;
   }
   return false;
@@ -3644,10 +3679,6 @@ bool canAggregationBeEvaluatedByCudf(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& rawInputTypes,
     core::QueryCtx* queryCtx) {
-  // Check against step-aware aggregation registry.
-  // Strip companion suffix (e.g. avg_partial -> avg) and adjust the step
-  // accordingly, so that companion function names from Spark/Gluten plans
-  // are validated against the base function's step-specific signatures.
   auto& stepAwareRegistry = getStepAwareAggregationRegistry();
   auto originalName = getOriginalName(call.name());
   auto companionStep = getCompanionStep(call.name(), step);
@@ -3658,16 +3689,13 @@ bool canAggregationBeEvaluatedByCudf(
   }
 
   auto stepIt = funcIt->second.find(companionStep);
-  if (stepIt == funcIt->second.end()) {
-    return false;
+  if (stepIt != funcIt->second.end()) {
+    if (matchTypedCallAgainstSignatures(call, stepIt->second)) {
+      return true;
+    }
   }
 
-  // Validate against step-specific signatures from registry
-  if (matchTypedCallAgainstSignatures(call, stepIt->second)) {
-    return true;
-  }
   // Allow decimal avg/sum kFinal/kIntermediate with ROW(DECIMAL, BIGINT)
-  // input even though no type-safe signature can be registered.
   if ((companionStep == core::AggregationNode::Step::kFinal ||
        companionStep == core::AggregationNode::Step::kIntermediate) &&
       (originalName.size() >= 3 &&
@@ -3680,6 +3708,22 @@ bool canAggregationBeEvaluatedByCudf(
       }
     }
   }
+
+  // For _merge_extract companions in a SINGLE-step node, try the other
+  // candidate step if the first didn't match.
+  if (call.name().find("_merge_extract") != std::string::npos &&
+      step == core::AggregationNode::Step::kSingle) {
+    auto altStep = (companionStep == core::AggregationNode::Step::kSingle)
+        ? core::AggregationNode::Step::kFinal
+        : core::AggregationNode::Step::kSingle;
+    auto altIt = funcIt->second.find(altStep);
+    if (altIt != funcIt->second.end()) {
+      if (matchTypedCallAgainstSignatures(call, altIt->second)) {
+        return true;
+      }
+    }
+  }
+
   return false;
 }
 

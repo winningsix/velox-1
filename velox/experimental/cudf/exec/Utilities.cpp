@@ -411,6 +411,25 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
            << " totalRows=" << totalRows
            << " cols=" << (tableViews.empty() ? 0 : tableViews[0].num_columns());
 
+  auto const maxRows =
+      static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+  if (totalRows > maxRows) {
+    LOG(WARNING) << "getConcatenatedTable: totalRows=" << totalRows
+                 << " exceeds cudf::size_type max (" << maxRows
+                 << "), delegating to batched version";
+    auto batched = getConcatenatedTableBatched(tables, tableType, stream);
+    if (batched.empty()) {
+      return makeEmptyTable(tableType);
+    }
+    if (batched.size() == 1) {
+      return std::move(batched[0]);
+    }
+    VELOX_FAIL(
+        "getConcatenatedTable: totalRows={} requires batched concatenation "
+        "which produced {} batches; caller must use getConcatenatedTableBatched",
+        totalRows, batched.size());
+  }
+
   cudf::detail::join_streams(inputStreams, stream);
 
   // cudf 0-column tables report num_rows()==0 through table_view because the
@@ -447,8 +466,20 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     }
   }
 
-  auto output = cudf::concatenate(
-      tableViews, stream, cudf::get_current_device_resource_ref());
+  std::unique_ptr<cudf::table> output;
+  try {
+    output = cudf::concatenate(
+        tableViews, stream, cudf::get_current_device_resource_ref());
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "getConcatenatedTable: concatenate failed ("
+                 << e.what() << ") for " << tableViews.size()
+                 << " tables / " << totalRows
+                 << " rows, syncing and retrying";
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+    output = cudf::concatenate(
+        tableViews, stream, cudf::get_current_device_resource_ref());
+  }
   stream.synchronize();
   return output;
 }
