@@ -2415,6 +2415,18 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         e.what());
   }
 
+  // Align each request.values column (including nested DECIMAL128 in structs);
+  // keep AlignedTable storage alive until aggregate() completes.
+  std::vector<AlignedTable> requestValuesAlignStorage;
+  requestValuesAlignStorage.reserve(requests.size());
+  for (auto& request : requests) {
+    std::vector<cudf::column_view> valueCols{request.values};
+    auto alignedVals = ensureDecimal128Alignment(
+        cudf::table_view(valueCols), stream);
+    request.values = alignedVals.view.column(0);
+    requestValuesAlignStorage.push_back(std::move(alignedVals));
+  }
+
   // Synchronize stream before aggregate to surface any misaligned-address
   // error from prior async work rather than letting it propagate into the
   // groupby kernels which obscures the real source.

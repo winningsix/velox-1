@@ -527,6 +527,75 @@ TEST_F(AggregationTest, CompanionAggs) {
       op, "SELECT c0, count(c1), count(distinct c2) FROM tmp GROUP BY c0");
 }
 
+TEST_F(AggregationTest, CountMergeExtractSingleStepUsesFinalSemantics) {
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({1, 1, 2, 2, 2}),
+       makeFlatVector<int64_t>({4, 3, 2, 1, 5})});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto child = PlanBuilder(planNodeIdGenerator).values({input}).planNode();
+
+  core::AggregationNode::Aggregate aggregate;
+  aggregate.call = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      "count_merge_extract_bigint",
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c1")});
+  aggregate.rawInputTypes = {BIGINT()};
+
+  auto plan = std::make_shared<core::AggregationNode>(
+      planNodeIdGenerator->next(),
+      core::AggregationNode::Step::kSingle,
+      std::vector<core::FieldAccessTypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")},
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<std::string>{"c0", "a0"},
+      std::vector<core::AggregationNode::Aggregate>{aggregate},
+      /*ignoreNullKeys=*/false,
+      /*noGroupsSpanBatches=*/false,
+      std::move(child));
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({7, 8})});
+  assertQuery(plan, expected);
+}
+
+TEST_F(AggregationTest, AvgMergeExtractSingleStepUsesFinalSemantics) {
+  auto intermediateState = makeRowVector(
+      {makeFlatVector<double>({10.0, 5.0, 9.0, 1.0}),
+       makeFlatVector<int64_t>({2, 1, 3, 1})});
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({1, 1, 2, 2}), intermediateState});
+
+  auto intermediateType = ROW({DOUBLE(), BIGINT()});
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto child = PlanBuilder(planNodeIdGenerator).values({input}).planNode();
+
+  core::AggregationNode::Aggregate aggregate;
+  aggregate.call = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      "avg_merge_extract_double",
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(intermediateType, "c1")});
+  aggregate.rawInputTypes = {intermediateType};
+
+  auto plan = std::make_shared<core::AggregationNode>(
+      planNodeIdGenerator->next(),
+      core::AggregationNode::Step::kSingle,
+      std::vector<core::FieldAccessTypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")},
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<std::string>{"c0", "a0"},
+      std::vector<core::AggregationNode::Aggregate>{aggregate},
+      /*ignoreNullKeys=*/false,
+      /*noGroupsSpanBatches=*/false,
+      std::move(child));
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<double>({5.0, 2.5})});
+  assertQuery(plan, expected);
+}
+
 TEST_F(AggregationTest, partialAggregationMemoryLimit) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(

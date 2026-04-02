@@ -65,10 +65,12 @@ class SignatureBinderBase {
   std::unordered_map<std::string, VarcharEnumParameter>
       varcharEnumVariablesBindings_;
 
- private:
+ protected:
   /// If the integer parameter is set, then it must match with value.
   /// Returns false if values do not match or the parameter does not exist.
   bool checkOrSetIntegerParameter(const std::string& parameterName, int value);
+
+ private:
 
   /// Try to bind the LongEnumParameter from the actualType.
   bool checkOrSetLongEnumParameter(
