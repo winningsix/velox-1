@@ -203,7 +203,6 @@ void CudfFilterProject::initialize() {
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
 
-  // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
     int i = 0;
     for (const auto& expr : expr->exprs()) {
