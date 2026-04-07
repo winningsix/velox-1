@@ -16,7 +16,6 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
-#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -32,6 +31,7 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cuda_runtime.h>
 
 namespace {
 
@@ -154,7 +154,18 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFromVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
+
+  // (A) Previous async H2D transfer completed — return the buffered result.
+  if (streamDone_.load(std::memory_order_acquire)) {
+    streamDone_.store(false, std::memory_order_relaxed);
+    finished_ = noMoreInput_ && inputs_.empty();
+    return std::move(pendingOutput_);
+  }
+
+  // (B) Transfer in-flight — isBlocked() parks the driver on streamFuture_.
+  if (streamPending_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
 
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   const auto targetRows =
@@ -168,7 +179,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
       (targetBytes > 0) ? (currentOutputBytes_ < targetBytes) : true;
   bool belowThreshold = belowRowThreshold && belowByteThreshold;
 
-  if (finished_ or (belowThreshold and not noMoreInput_) or inputs_.empty()) {
+  if (finished_ || (belowThreshold && !noMoreInput_) || inputs_.empty()) {
     return nullptr;
   }
 
@@ -193,19 +204,9 @@ RowVectorPtr CudfFromVelox::getOutput() {
   currentOutputSize_ -= totalSize;
   currentOutputBytes_ -= totalBytes;
 
-  // Early return if no input
   if (totalSize == 0) {
     return nullptr;
   }
-
-  auto stream = cudfGlobalStreamPool().get_stream();
-
-  // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
-  // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
-  auto tbl =
-      with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
-
-  VELOX_CHECK_NOT_NULL(tbl);
 
   if (selectedInputs.size() > 1) {
     auto lockedStats = stats_.wlock();
@@ -213,15 +214,59 @@ RowVectorPtr CudfFromVelox::getOutput() {
         "numCoalescedBatches", RuntimeCounter(1));
   }
 
+  // (D) Submit H2D conversion to CUDA stream — no GPU lock acquired.
+  // toCudfTableBatched enqueues async Arrow→cuDF copies on `stream` and
+  // returns a cudf::table whose device buffers are filled asynchronously.
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto tbl =
+      with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
+
+  VELOX_CHECK_NOT_NULL(tbl);
+
   const auto size = tbl->num_rows();
-  return std::make_shared<CudfVector>(
+  pendingOutput_ = std::make_shared<CudfVector>(
       selectedInputs[0]->pool(), outputType_, size, std::move(tbl), stream);
+
+  // Create a fresh promise+future pair and register a stream callback that
+  // fires when all GPU work enqueued above has completed.  The callback runs
+  // on a CUDA host-function thread (not the Velox driver thread).
+  auto [promise, future] =
+      makeVeloxContinuePromiseContract("CudfFromVelox::stream");
+  streamFuture_ = std::move(future);
+  streamPromise_ = std::move(promise);
+  streamPending_.store(true, std::memory_order_release);
+
+  auto* self = this;
+  cudaLaunchHostFunc(
+      stream.value(),
+      [](void* p) {
+        auto* op = static_cast<CudfFromVelox*>(p);
+        // Signal completion; Velox driver wakes and calls getOutput() again.
+        op->streamDone_.store(true, std::memory_order_release);
+        op->streamPending_.store(false, std::memory_order_release);
+        op->streamPromise_->setValue();
+      },
+      self);
+
+  return nullptr;
+}
+
+exec::BlockingReason CudfFromVelox::isBlocked(ContinueFuture* future) {
+  if (streamPending_.load(std::memory_order_acquire)) {
+    *future = std::move(streamFuture_);
+    return exec::BlockingReason::kWaitForStream;
+  }
+  return exec::BlockingReason::kNotBlocked;
 }
 
 void CudfFromVelox::close() {
   cudf::get_default_stream().synchronize();
   exec::Operator::close();
   inputs_.clear();
+  pendingOutput_ = nullptr;
+  streamPending_.store(false, std::memory_order_relaxed);
+  streamDone_.store(false, std::memory_order_relaxed);
+  streamPromise_.reset();
 }
 
 CudfToVelox::CudfToVelox(
@@ -267,7 +312,19 @@ std::optional<uint64_t> CudfToVelox::averageRowSize() {
 
 RowVectorPtr CudfToVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
+
+  // (A) Previous async D2H conversion completed — return the buffered result.
+  if (streamDone_.load(std::memory_order_acquire)) {
+    streamDone_.store(false, std::memory_order_relaxed);
+    finished_ = noMoreInput_ && inputs_.empty();
+    return std::move(pendingOutput_);
+  }
+
+  // (B) Conversion in-flight — isBlocked() parks the driver on streamFuture_.
+  if (streamPending_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+
   if (finished_ || inputs_.empty()) {
     finished_ = noMoreInput_ && inputs_.empty();
     return nullptr;
@@ -276,6 +333,8 @@ RowVectorPtr CudfToVelox::getOutput() {
   // Get the target batch size
   const auto targetBatchSize = outputBatchRows(averageRowSize());
   auto stream = inputs_.front()->stream();
+
+  RowVectorPtr output;
 
   // Process single input directly in these cases:
   // 1. In passthrough mode
@@ -293,9 +352,7 @@ RowVectorPtr CudfToVelox::getOutput() {
       finished_ = noMoreInput_ && inputs_.empty();
       return nullptr;
     }
-    RowVectorPtr output =
-        with_arrow::toVeloxColumn(tableView, pool(), "", stream);
-    finished_ = noMoreInput_ && inputs_.empty();
+    output = with_arrow::toVeloxColumn(tableView, pool(), "", stream);
     if (output->type()->kindEquals(outputType_)) {
       output->setType(outputType_);
     } else {
@@ -314,106 +371,140 @@ RowVectorPtr CudfToVelox::getOutput() {
           pool(), outputType_, output->nulls(), output->size(),
           std::move(children));
     }
-    return output;
-  }
-
-  // Calculate how many tables we need to concatenate to reach the target batch
-  // size and collect them in a vector
-  std::vector<CudfVectorPtr> selectedInputs;
-  vector_size_t totalSize = 0;
-
-  while (!inputs_.empty() && totalSize < targetBatchSize) {
-    auto& input = inputs_.front();
-    if (totalSize + input->size() <= targetBatchSize) {
-      totalSize += input->size();
-      selectedInputs.push_back(std::move(input));
-      inputs_.pop_front();
-    } else {
-      // If the next input would exceed targetBatchSize,
-      // we need to split it and only take what we need.
-      // The input may have been produced on a different stream than the
-      // first input's stream; ensure ordering before using its data.
-      if (input->stream() != stream) {
-        cudf::detail::join_streams(
-            std::vector<rmm::cuda_stream_view>{input->stream()}, stream);
-      }
-      auto cudfTableView = input->getTableView();
-      auto partitions = std::vector<cudf::size_type>{
-          static_cast<cudf::size_type>(targetBatchSize - totalSize)};
-      auto tableSplits = cudf::split(cudfTableView, partitions, stream);
-
-      // Create new CudfVector from the first part
-      auto firstPart = std::make_unique<cudf::table>(tableSplits[0], stream);
-      auto firstPartSize = firstPart->num_rows();
-      auto firstPartVector = std::make_shared<CudfVector>(
-          pool(), input->type(), firstPartSize, std::move(firstPart), stream);
-
-      // Create new CudfVector from the second part
-      auto secondPart = std::make_unique<cudf::table>(tableSplits[1], stream);
-      auto secondPartSize = secondPart->num_rows();
-      auto secondPartVector = std::make_shared<CudfVector>(
-          pool(), input->type(), secondPartSize, std::move(secondPart), stream);
-
-      // Sync before releasing the original input: the table copies above are
-      // async on `stream` and read from the original input's device buffers.
-      // Without this, the original's GPU memory may be freed (when `input` is
-      // reassigned below) while the copy kernels are still reading from it.
-      stream.synchronize();
-
-      // Replace the original input with the second part
-      input = std::move(secondPartVector);
-
-      // Add the first part to selectedInputs
-      selectedInputs.push_back(std::move(firstPartVector));
-      totalSize += firstPartSize;
-      break;
-    }
-  }
-
-  finished_ = noMoreInput_ && inputs_.empty();
-
-  // If we have no inputs to process, return nullptr
-  if (selectedInputs.empty()) {
-    return nullptr;
-  }
-
-  // Concatenate the selected tables on the GPU
-  auto resultTable = getConcatenatedTable(selectedInputs, outputType_, stream);
-
-  // Convert the concatenated table to a RowVector
-  const auto size = resultTable->num_rows();
-  VELOX_CHECK_NOT_NULL(resultTable);
-  if (size == 0) {
-    return nullptr;
-  }
-
-  RowVectorPtr output =
-      with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
-  finished_ = noMoreInput_ && inputs_.empty();
-  if (output->type()->kindEquals(outputType_)) {
-    output->setType(outputType_);
   } else {
-    for (column_index_t i = 0; i < output->childrenSize(); ++i) {
-      if (i < outputType_->size()) {
-        fixStringBinaryMismatch(
-            output->childAt(i), outputType_->childAt(i));
+    // Calculate how many tables we need to concatenate to reach the target
+    // batch size and collect them in a vector
+    std::vector<CudfVectorPtr> selectedInputs;
+    vector_size_t totalSize = 0;
+
+    while (!inputs_.empty() && totalSize < targetBatchSize) {
+      auto& input = inputs_.front();
+      if (totalSize + input->size() <= targetBatchSize) {
+        totalSize += input->size();
+        selectedInputs.push_back(std::move(input));
+        inputs_.pop_front();
+      } else {
+        // If the next input would exceed targetBatchSize,
+        // we need to split it and only take what we need.
+        // The input may have been produced on a different stream than the
+        // first input's stream; ensure ordering before using its data.
+        if (input->stream() != stream) {
+          cudf::detail::join_streams(
+              std::vector<rmm::cuda_stream_view>{input->stream()}, stream);
+        }
+        auto cudfTableView = input->getTableView();
+        auto partitions = std::vector<cudf::size_type>{
+            static_cast<cudf::size_type>(targetBatchSize - totalSize)};
+        auto tableSplits = cudf::split(cudfTableView, partitions, stream);
+
+        // Create new CudfVector from the first part
+        auto firstPart = std::make_unique<cudf::table>(tableSplits[0], stream);
+        auto firstPartSize = firstPart->num_rows();
+        auto firstPartVector = std::make_shared<CudfVector>(
+            pool(), input->type(), firstPartSize, std::move(firstPart), stream);
+
+        // Create new CudfVector from the second part
+        auto secondPart =
+            std::make_unique<cudf::table>(tableSplits[1], stream);
+        auto secondPartSize = secondPart->num_rows();
+        auto secondPartVector = std::make_shared<CudfVector>(
+            pool(), input->type(), secondPartSize, std::move(secondPart),
+            stream);
+
+        // Sync before releasing the original input: the table copies above are
+        // async on `stream` and read from the original input's device buffers.
+        // Without this, the original's GPU memory may be freed (when `input` is
+        // reassigned below) while the copy kernels are still reading from it.
+        stream.synchronize();
+
+        // Replace the original input with the second part
+        input = std::move(secondPartVector);
+
+        // Add the first part to selectedInputs
+        selectedInputs.push_back(std::move(firstPartVector));
+        totalSize += firstPartSize;
+        break;
       }
     }
-    std::vector<VectorPtr> children;
-    children.reserve(output->childrenSize());
-    for (column_index_t i = 0; i < output->childrenSize(); ++i) {
-      children.push_back(output->childAt(i));
+
+    if (selectedInputs.empty()) {
+      return nullptr;
     }
-    output = std::make_shared<RowVector>(
-        pool(), outputType_, output->nulls(), output->size(),
-        std::move(children));
+
+    // Concatenate the selected tables on the GPU
+    auto resultTable = getConcatenatedTable(selectedInputs, outputType_, stream);
+
+    // Convert the concatenated table to a RowVector
+    const auto size = resultTable->num_rows();
+    VELOX_CHECK_NOT_NULL(resultTable);
+    if (size == 0) {
+      return nullptr;
+    }
+
+    output =
+        with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
+    if (output->type()->kindEquals(outputType_)) {
+      output->setType(outputType_);
+    } else {
+      for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+        if (i < outputType_->size()) {
+          fixStringBinaryMismatch(
+              output->childAt(i), outputType_->childAt(i));
+        }
+      }
+      std::vector<VectorPtr> children;
+      children.reserve(output->childrenSize());
+      for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+        children.push_back(output->childAt(i));
+      }
+      output = std::make_shared<RowVector>(
+          pool(), outputType_, output->nulls(), output->size(),
+          std::move(children));
+    }
   }
-  return output;
+
+  if (!output) {
+    return nullptr;
+  }
+
+  // (D) Buffer the result and register a stream-completion callback so the
+  // driver parks while any remaining async D2H transfers complete.
+  pendingOutput_ = std::move(output);
+  auto [promise, future] =
+      makeVeloxContinuePromiseContract("CudfToVelox::stream");
+  streamFuture_ = std::move(future);
+  streamPromise_ = std::move(promise);
+  streamPending_.store(true, std::memory_order_release);
+
+  auto* self = this;
+  cudaLaunchHostFunc(
+      stream.value(),
+      [](void* p) {
+        auto* op = static_cast<CudfToVelox*>(p);
+        op->streamDone_.store(true, std::memory_order_release);
+        op->streamPending_.store(false, std::memory_order_release);
+        op->streamPromise_->setValue();
+      },
+      self);
+
+  return nullptr;
+}
+
+exec::BlockingReason CudfToVelox::isBlocked(ContinueFuture* future) {
+  if (streamPending_.load(std::memory_order_acquire)) {
+    *future = std::move(streamFuture_);
+    return exec::BlockingReason::kWaitForStream;
+  }
+  return exec::BlockingReason::kNotBlocked;
 }
 
 void CudfToVelox::close() {
   exec::Operator::close();
   inputs_.clear();
+  pendingOutput_ = nullptr;
+  streamPending_.store(false, std::memory_order_relaxed);
+  streamDone_.store(false, std::memory_order_relaxed);
+  streamPromise_.reset();
 }
 
 } // namespace facebook::velox::cudf_velox

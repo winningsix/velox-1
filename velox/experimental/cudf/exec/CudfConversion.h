@@ -23,8 +23,10 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <atomic>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -48,9 +50,7 @@ class CudfFromVelox : public exec::Operator, public NvtxHelper {
 
   RowVectorPtr getOutput() override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_;
@@ -63,6 +63,13 @@ class CudfFromVelox : public exec::Operator, public NvtxHelper {
   std::size_t currentOutputSize_ = 0;
   int64_t currentOutputBytes_ = 0;
   bool finished_ = false;
+
+  // Async CUDA-stream state — replaces GpuGuard
+  std::atomic<bool> streamPending_{false};
+  std::atomic<bool> streamDone_{false};
+  RowVectorPtr pendingOutput_;
+  std::optional<ContinuePromise> streamPromise_;
+  ContinueFuture streamFuture_{ContinueFuture::makeEmpty()};
 };
 
 class CudfToVelox : public exec::Operator, public NvtxHelper {
@@ -84,9 +91,7 @@ class CudfToVelox : public exec::Operator, public NvtxHelper {
 
   RowVectorPtr getOutput() override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_;
@@ -100,6 +105,13 @@ class CudfToVelox : public exec::Operator, public NvtxHelper {
   std::optional<uint64_t> averageRowSize_;
   std::deque<CudfVectorPtr> inputs_;
   bool finished_ = false;
+
+  // Async CUDA-stream state — replaces GpuGuard
+  std::atomic<bool> streamPending_{false};
+  std::atomic<bool> streamDone_{false};
+  RowVectorPtr pendingOutput_;
+  std::optional<ContinuePromise> streamPromise_;
+  ContinueFuture streamFuture_{ContinueFuture::makeEmpty()};
 };
 
 } // namespace facebook::velox::cudf_velox
