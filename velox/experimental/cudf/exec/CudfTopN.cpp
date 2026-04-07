@@ -15,7 +15,6 @@
  */
 #include "velox/experimental/cudf/CudfQueryConfig.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
-#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/detail/copy.hpp>
@@ -73,7 +72,8 @@ CudfVectorPtr CudfTopN::mergeTopK(
     std::vector<CudfVectorPtr> topNBatches,
     int32_t k,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    bool doSync) {
   std::vector<cudf::table_view> tableViews;
   std::vector<rmm::cuda_stream_view> inputStreams;
   for (const auto& batch : topNBatches) {
@@ -94,9 +94,14 @@ CudfVectorPtr CudfTopN::mergeTopK(
   // cudf::merge and the table copy above are async on `stream` and read from
   // the input batches' device buffers, which live on their original streams.
   // The caller destroys the input batches after we return, freeing those
-  // buffers via cudaFreeAsync on the original streams.  Without this sync the
-  // frees can race ahead of the reads on `stream`.
-  stream.synchronize();
+  // buffers via cudaFreeAsync on the original streams.  Without sync the frees
+  // can race ahead of the reads on `stream`.
+  //
+  // When doSync=false the caller must keep the input batches alive in
+  // pendingReleaseBatches_ until the CUDA stream callback fires.
+  if (doSync) {
+    stream.synchronize();
+  }
 
   return std::make_shared<CudfVector>(
       topNBatches[0]->pool(),
@@ -142,18 +147,21 @@ CudfVectorPtr CudfTopN::getTopKBatch(CudfVectorPtr cudfInput, int32_t k) {
 
 void CudfTopN::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
+  // Ensure the driver does not feed input while async stream work is in flight.
+  // needsInput() already returns false when streamPending_, so this is a
+  // belt-and-suspenders guard.
+  VELOX_CHECK(!streamPending_, "addInput called while CUDA stream is pending");
+
   if (count_ == 0 || input->size() == 0) {
     return;
   }
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  // Take topk of each input, add to batch.
-  // If got kBatchSize_ batches, concat batches and topk once.
-  // During getOutput, concat batches and topk once.
+
+  // Enqueue per-batch top-K sort on the input's own CUDA stream (non-blocking).
   topNBatches_.push_back(getTopKBatch(cudfInput, count_));
-  // sum of sizes of topNBatches_ >= count_, then concat and topk once.
+
   auto totalSize = std::accumulate(
       topNBatches_.begin(),
       topNBatches_.end(),
@@ -161,33 +169,102 @@ void CudfTopN::addInput(RowVectorPtr input) {
       [](int32_t sum, const auto& batch) {
         return sum + (batch ? batch->size() : 0);
       });
-  if (topNBatches_.size() >= kBatchSize_ and totalSize >= count_) {
+
+  if (topNBatches_.size() >= static_cast<size_t>(kBatchSize_) &&
+      totalSize >= count_) {
+    // Intermediate compaction: merge the accumulated batches down to one.
+    // We do this without stream.synchronize() and instead keep the input
+    // batches alive in pendingReleaseBatches_ until the CUDA callback fires.
     auto stream = cudfGlobalStreamPool().get_stream();
     auto mr = cudf::get_current_device_resource_ref();
 
-    auto result = mergeTopK(topNBatches_, count_, stream, mr);
-    topNBatches_.clear();
-    topNBatches_.push_back(std::move(result));
+    pendingReleaseBatches_ = std::move(topNBatches_);
+    auto merged =
+        mergeTopK(pendingReleaseBatches_, count_, stream, mr, /*doSync=*/false);
+    topNBatches_.push_back(std::move(merged));
+
+    streamPending_ = true;
+    streamDone_ = false;
+    streamPromise_ = ContinuePromise("CudfTopN::addInput");
+
+    auto* self = this;
+    cudaLaunchHostFunc(
+        stream.value(),
+        [](void* p) {
+          auto* op = static_cast<CudfTopN*>(p);
+          // GPU merge complete: release input device buffers and wake driver.
+          op->pendingReleaseBatches_.clear();
+          op->streamDone_ = true;
+          op->streamPending_ = false;
+          op->streamPromise_.setValue();
+        },
+        self);
   }
 }
 
 RowVectorPtr CudfTopN::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
-  if (finished_ || !noMoreInput_) {
+
+  // (A) Async work completed — return the buffered result.
+  if (streamDone_) {
+    streamDone_ = false;
+    // topNBatches_ was already moved to pendingReleaseBatches_ before submit;
+    // the callback has cleared pendingReleaseBatches_, so nothing to do here.
+    finished_ = noMoreInput_;
+    return std::move(pendingOutput_);
+  }
+
+  // (B) Work is in-flight — driver will park via isBlocked().
+  if (streamPending_) {
+    return nullptr;
+  }
+
+  // (C) Not ready: still receiving input or no batches to merge.
+  if (!noMoreInput_) {
     return nullptr;
   }
   if (topNBatches_.empty()) {
-    finished_ = noMoreInput_;
+    finished_ = true;
     return nullptr;
+  }
+
+  // (D) All input received; submit the final merge asynchronously.
+  //
+  // Single-batch shortcut: the one batch is already top-K sorted; no merge
+  // needed, so we avoid the overhead of a no-op merge + async callback.
+  if (topNBatches_.size() == 1) {
+    auto result = std::move(topNBatches_[0]);
+    topNBatches_.clear();
+    finished_ = true;
+    return result;
   }
 
   auto stream = topNBatches_[0]->stream();
   auto mr = cudf::get_current_device_resource_ref();
-  auto result = mergeTopK(topNBatches_, count_, stream, mr);
-  topNBatches_.clear();
-  finished_ = noMoreInput_ && topNBatches_.empty();
-  return result;
+
+  // Move input batches to pending-release so they stay alive on the heap
+  // until the CUDA stream callback confirms the merge is finished.
+  pendingReleaseBatches_ = std::move(topNBatches_);
+  pendingOutput_ =
+      mergeTopK(pendingReleaseBatches_, count_, stream, mr, /*doSync=*/false);
+
+  streamPending_ = true;
+  streamDone_ = false;
+  streamPromise_ = ContinuePromise("CudfTopN::getOutput");
+
+  auto* self = this;
+  cudaLaunchHostFunc(
+      stream.value(),
+      [](void* p) {
+        auto* op = static_cast<CudfTopN*>(p);
+        op->pendingReleaseBatches_.clear();
+        op->streamDone_ = true;
+        op->streamPending_ = false;
+        op->streamPromise_.setValue();
+      },
+      self);
+
+  return nullptr; // driver parks; woken by the callback above
 }
 
 void CudfTopN::noMoreInput() {
@@ -196,6 +273,14 @@ void CudfTopN::noMoreInput() {
     finished_ = true;
     return;
   }
+}
+
+exec::BlockingReason CudfTopN::isBlocked(ContinueFuture* future) {
+  if (streamPending_) {
+    *future = streamPromise_.getSemiFuture();
+    return exec::BlockingReason::kWaitForStream;
+  }
+  return exec::BlockingReason::kNotBlocked;
 }
 
 bool CudfTopN::isFinished() {

@@ -55,6 +55,9 @@ enum class BlockingReason {
   /// Used by IndexLookupJoin operator, indicating that it was blocked by the
   /// async index lookup.
   kWaitForIndexLookup,
+  /// Used by cuDF GPU operators waiting for an async CUDA stream kernel to
+  /// complete (e.g. CudfTopN partial-sort, CudfOrderBy, etc.).
+  kWaitForStream,
 };
 
 VELOX_DECLARE_ENUM_NAME(BlockingReason);

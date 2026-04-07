@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -29,8 +30,10 @@ class CudfTopN : public exec::Operator, public NvtxHelper {
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::TopNNode>& topNNode);
 
+  // Returns false while a CUDA stream is in flight so the Velox driver does
+  // not feed more input before the previous async work completes.
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && !streamPending_;
   }
 
   void addInput(RowVectorPtr input) override;
@@ -39,9 +42,7 @@ class CudfTopN : public exec::Operator, public NvtxHelper {
 
   void noMoreInput() override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override;
 
@@ -53,11 +54,15 @@ class CudfTopN : public exec::Operator, public NvtxHelper {
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
 
+  // When doSync=false the caller is responsible for keeping topNBatches alive
+  // until the returned CudfVector's stream has completed (use
+  // pendingReleaseBatches_ + cudaLaunchHostFunc for this).
   CudfVectorPtr mergeTopK(
       std::vector<CudfVectorPtr> topNBatches,
       int32_t k,
       rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr,
+      bool doSync = true);
 
   CudfVectorPtr getTopKBatch(CudfVectorPtr cudfInput, int32_t k);
   std::unique_ptr<cudf::table> getTopK(
@@ -75,5 +80,26 @@ class CudfTopN : public exec::Operator, public NvtxHelper {
   std::vector<CudfVectorPtr> topNBatches_;
   int32_t kBatchSize_{5};
   bool finished_ = false;
+
+  // --- Async GPU stream state (Phase 2 lock-free pattern) ---
+  //
+  // Lifecycle:
+  //   addInput / getOutput (state D): set streamPending_=true, enqueue
+  //     cudaLaunchHostFunc.
+  //   CUDA callback thread: clear streamPending_, set streamDone_=true,
+  //     fulfill streamPromise_ (wakes Velox driver).
+  //   isBlocked(): returns kWaitForStream + future while streamPending_.
+  //   getOutput (state A) / addInput (guard): consume streamDone_, return
+  //     pendingOutput_.
+  bool streamPending_{false};
+  bool streamDone_{false};
+  ContinuePromise streamPromise_{ContinuePromise::makeEmpty()};
+
+  // Result produced asynchronously by getOutput state D; returned in state A.
+  RowVectorPtr pendingOutput_;
+
+  // Input batches that were moved into an async merge; kept alive here until
+  // the CUDA stream callback fires and it is safe to free device memory.
+  std::vector<CudfVectorPtr> pendingReleaseBatches_;
 };
 } // namespace facebook::velox::cudf_velox
