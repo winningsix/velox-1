@@ -15,6 +15,10 @@
  */
 #pragma once
 
+#include <atomic>
+#include <optional>
+
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -27,6 +31,11 @@ namespace facebook::velox::cudf_velox {
 /// operator computes PID = hash % numPartitions, replaces the first column with
 /// the PID, and reorders rows by partition via cudf::partition().  The output is
 /// a CudfVector whose rows are grouped by partition (first col = sorted PID).
+///
+/// Phase 2 async design: GPU kernels are submitted to the input CUDA stream
+/// without holding GpuGuard.  A cudaLaunchHostFunc callback fires when the
+/// stream work completes and fulfills a ContinuePromise to wake the Velox
+/// driver.  isBlocked() returns kWaitForStream while the stream is in-flight.
 ///
 /// Inserted by ToCudf::CompileState when the query config key
 /// "cudf.shuffle_num_partitions" is > 0 and the operator is the last in the
@@ -48,16 +57,15 @@ class CudfShufflePartition : public exec::Operator, public NvtxHelper {
   }
 
   bool needsInput() const override {
-    return !finished_ && output_ == nullptr;
+    return !finished_ && !streamPending_.load(std::memory_order_acquire) &&
+        output_ == nullptr;
   }
 
   void addInput(RowVectorPtr input) override;
 
   RowVectorPtr getOutput() override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_ && output_ == nullptr;
@@ -67,6 +75,14 @@ class CudfShufflePartition : public exec::Operator, public NvtxHelper {
   const int32_t numPartitions_;
   CudfVectorPtr output_;
   bool finished_ = false;
+
+  /// true while the GPU stream work (partition kernels) has been submitted but
+  /// the host-function callback has not yet fired.
+  std::atomic<bool> streamPending_{false};
+
+  /// Consumed by isBlocked() to park the Velox driver until the CUDA host
+  /// callback fires and the stream work is complete.
+  std::optional<ContinueFuture> streamFuture_;
 };
 
 } // namespace facebook::velox::cudf_velox
