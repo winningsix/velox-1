@@ -19,23 +19,25 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
-thread_local int gpuRegionDepth = 0;
+thread_local bool gpuRegionActive = false;
 } // namespace
 
 void beginGpuRegion() {
-  gluten::lockGpu();
-  ++gpuRegionDepth;
+  if (!gpuRegionActive) {
+    gluten::lockGpu();
+    gpuRegionActive = true;
+  }
 }
 
 void endGpuRegion() {
-  if (gpuRegionDepth > 0) {
-    --gpuRegionDepth;
+  if (gpuRegionActive) {
+    gpuRegionActive = false;
     gluten::unlockGpu();
   }
 }
 
 bool isInGpuRegion() {
-  return gpuRegionDepth > 0;
+  return gpuRegionActive;
 }
 
 } // namespace facebook::velox::cudf_velox
