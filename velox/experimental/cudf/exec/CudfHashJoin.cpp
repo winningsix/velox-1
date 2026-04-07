@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -31,6 +32,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
@@ -76,12 +78,10 @@ void CudfHashJoinProbe::buildHashTable() {
   VELOX_CHECK(!hashObject_.has_value());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
-  auto& batches = buildBatches_.value();
+  auto& hostBatches = buildBatches_.value();
   auto buildType = joinNode_->sources()[1]->outputType();
 
-  if (batches.empty()) {
-    // Empty build side — create a 0-row table with the correct schema
-    // so probe logic can detect "0 rows" via the standard path.
+  if (hostBatches.empty()) {
     std::vector<std::unique_ptr<cudf::column>> emptyCols;
     for (int i = 0; i < buildType->size(); ++i) {
       auto cudfType = cudf::data_type{veloxToCudfTypeId(buildType->childAt(i))};
@@ -101,13 +101,39 @@ void CudfHashJoinProbe::buildHashTable() {
   auto stream = cudfGlobalStreamPool().get_stream();
   buildStream_ = stream;
 
-  auto buildType = joinNode_->sources()[1]->outputType();
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "CudfHashJoinProbe::buildHashTable batches=" << batches.size();
+    VLOG(1) << "CudfHashJoinProbe::buildHashTable hostBatches="
+            << hostBatches.size();
   }
 
-  auto tbls = getConcatenatedTableBatched(batches, buildType, stream);
+  // H2D: copy each host-pinned batch back to GPU and reconstruct CudfVectors.
+  std::vector<CudfVectorPtr> gpuBatches;
+  gpuBatches.reserve(hostBatches.size());
+  for (auto& hb : hostBatches) {
+    rmm::device_buffer devBuf(hb.data->size(), stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        devBuf.data(),
+        hb.data->data(),
+        hb.data->size(),
+        cudaMemcpyHostToDevice,
+        stream.value()));
+    auto metadata = std::make_unique<std::vector<uint8_t>>(
+        std::move(hb.metadata));
+    cudf::packed_columns pc{std::move(metadata),
+                            std::make_unique<rmm::device_buffer>(
+                                std::move(devBuf))};
+    auto unpacked = std::make_unique<cudf::packed_table>(cudf::unpack(pc));
+    auto numRows = hb.numRows;
+    gpuBatches.push_back(std::make_shared<CudfVector>(
+        operatorCtx_->pool(),
+        buildType,
+        numRows,
+        std::move(unpacked),
+        stream));
+  }
   buildBatches_.reset();
+
+  auto tbls = getConcatenatedTableBatched(gpuBatches, buildType, stream);
 
   for (auto const& tbl : tbls) {
     VELOX_CHECK_NOT_NULL(tbl);
@@ -157,7 +183,8 @@ void CudfHashJoinProbe::buildHashTable() {
   }
 }
 
-void CudfHashJoinBridge::setBuildBatches(std::vector<CudfVectorPtr> batches) {
+void CudfHashJoinBridge::setBuildBatches(
+    std::vector<HostBuildBatch> batches) {
   VLOG_IF(2, CudfConfig::getInstance().debugEnabled)
       << "CudfHashJoinBridge::setBuildBatches  batches=" << batches.size();
   std::vector<ContinuePromise> promises;
@@ -172,7 +199,7 @@ void CudfHashJoinBridge::setBuildBatches(std::vector<CudfVectorPtr> batches) {
   notify(std::move(promises));
 }
 
-std::optional<std::vector<CudfVectorPtr>>
+std::optional<std::vector<HostBuildBatch>>
 CudfHashJoinBridge::buildBatchesOrFuture(ContinueFuture* future) {
   VLOG_IF(2, CudfConfig::getInstance().debugEnabled)
       << "CudfHashJoinBridge::buildBatchesOrFuture";
@@ -210,12 +237,32 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBuild::addInput";
   }
-  // Queue inputs, process all at once.
-  if (input->size() > 0) {
-    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_CHECK_NOT_NULL(cudfInput);
-    inputs_.push_back(std::move(cudfInput));
+  if (input->size() == 0) {
+    return;
   }
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+  VELOX_CHECK_NOT_NULL(cudfInput);
+
+  auto stream = cudfInput->stream();
+
+  // Pack GPU table into one contiguous device buffer, then D2H to pinned
+  // host memory. This frees GPU memory immediately — the bridge holds only
+  // host-resident data, so build accumulation consumes zero GPU memory.
+  GpuGuard gpuGuard;
+  auto packed = cudf::pack(cudfInput->getTableView(), stream);
+  auto devSize = packed.gpu_data->size();
+  auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      hostBuf->data(),
+      packed.gpu_data->data(),
+      devSize,
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+
+  auto numRows = static_cast<vector_size_t>(cudfInput->size());
+  hostInputs_.push_back(
+      {std::move(*packed.metadata), std::move(hostBuf), numRows});
 }
 
 bool CudfHashJoinBuild::needsInput() const {
@@ -241,12 +288,15 @@ void CudfHashJoinBuild::noMoreInput() {
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
     return;
   }
-  // Collect batches from all peers (CPU pointer moves, no GPU work).
+  // Collect host-resident batches from all peers (pointer moves, no GPU work).
   for (auto& peer : peers) {
     auto op = peer->findOperator(planNodeId());
     auto* build = dynamic_cast<CudfHashJoinBuild*>(op);
     VELOX_CHECK_NOT_NULL(build);
-    inputs_.insert(inputs_.end(), build->inputs_.begin(), build->inputs_.end());
+    hostInputs_.insert(
+        hostInputs_.end(),
+        std::make_move_iterator(build->hostInputs_.begin()),
+        std::make_move_iterator(build->hostInputs_.end()));
   }
 
   SCOPE_EXIT {
@@ -256,14 +306,14 @@ void CudfHashJoinBuild::noMoreInput() {
     }
   };
 
-  // Pass raw batches to bridge — the probe side builds the hash table
-  // lazily under its own GpuGuard, so the build pipeline does no GPU work
-  // and never acquires the GPU semaphore.
+  // Pass host-pinned batches to bridge — probe side does H2D + hash table
+  // build lazily under its own GpuGuard. Build pipeline never holds the
+  // GPU semaphore beyond the brief pack+D2H in addInput().
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-  cudfHashJoinBridge->setBuildBatches(std::move(inputs_));
+  cudfHashJoinBridge->setBuildBatches(std::move(hostInputs_));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -1351,7 +1401,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   // Detect empty build from raw batch row counts (no GPU work needed).
   int64_t totalBuildRows = 0;
   for (auto& batch : buildBatches_.value()) {
-    totalBuildRows += batch->size();
+    totalBuildRows += batch.numRows;
   }
   if (totalBuildRows == 0) {
     if (skipProbeOnEmptyBuild()) {
