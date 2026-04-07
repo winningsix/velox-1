@@ -54,29 +54,23 @@ class CudfExpression;
  */
 class CudfHashJoinBridge : public exec::JoinBridge {
  public:
-  // The bridge transfers all build side batches and the hash join objects
-  // constructed from them to the probe operator
   /** @brief Hash tables paired with their corresponding join objects for
    * batched processing */
   using hash_type = std::pair<
       std::vector<std::shared_ptr<cudf::table>>,
       std::vector<std::shared_ptr<cudf::hash_join>>>;
 
-  void setHashTable(std::optional<hash_type> hashObject);
+  /// Set raw build-side batches. The hash table is built lazily on the
+  /// probe side under its GpuGuard, so the build pipeline does no GPU work.
+  void setBuildBatches(std::vector<CudfVectorPtr> batches);
 
-  std::optional<hash_type> hashOrFuture(ContinueFuture* future);
-
-  // Store and retrieve the CUDA stream used for building the hash join.
-  void setBuildStream(rmm::cuda_stream_view buildStream);
-
-  std::optional<rmm::cuda_stream_view> getBuildStream();
+  /// Get the raw build batches, or register a future to be notified when
+  /// they become available.
+  std::optional<std::vector<CudfVectorPtr>> buildBatchesOrFuture(
+      ContinueFuture* future);
 
  private:
-  /** @brief Hash tables and join objects transferred from build to probe
-   * operators */
-  std::optional<hash_type> hashObject_;
-  /** @brief CUDA stream used by build operator for proper synchronization */
-  std::optional<rmm::cuda_stream_view> buildStream_;
+  std::optional<std::vector<CudfVectorPtr>> buildBatches_;
 };
 
 /**
@@ -211,10 +205,17 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   // hanging problem at the producer side caused by the early query finish.
   bool skipInput_{false};
 
-  /** @brief CUDA stream from build operator for synchronization */
+  /// Raw build-side batches received from the bridge, consumed once by
+  /// buildHashTable() to construct hashObject_.
+  std::optional<std::vector<CudfVectorPtr>> buildBatches_;
+
+  /** @brief CUDA stream used during hash table construction */
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief CUDA event for coordinating stream synchronization */
   std::unique_ptr<CudaEvent> cudaEvent_;
+  /** @brief True when this probe holds an operator-level GPU semaphore slot
+   * (from buildHashTable through close). */
+  bool gpuSlotHeld_{false};
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one
@@ -320,6 +321,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
           std::vector<std::unique_ptr<cudf::column>>&&,
           cudf::column_view)> func,
       rmm::cuda_stream_view stream);
+
+  /// Build hash table from raw batches received via the bridge. Called
+  /// lazily on the first getOutput() under operator-level GpuGuard.
+  void buildHashTable();
 
   std::unique_ptr<cudf::table> filteredOutputIndices(
       cudf::table_view leftTableView,
