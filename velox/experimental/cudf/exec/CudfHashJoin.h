@@ -29,6 +29,7 @@
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cuda_runtime_api.h>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
@@ -70,12 +71,21 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  // Record the CUDA event that fires when the build stream finishes
+  // constructing the hash table. Called by the last build driver after
+  // submitting build kernels; allows releasing the GPU semaphore early while
+  // hash table construction continues asynchronously.
+  void setBuildDoneEvent(cudaEvent_t event);
+  std::optional<cudaEvent_t> getBuildDoneEvent();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
+  /** @brief CUDA event that fires when hash table construction is complete */
+  std::optional<cudaEvent_t> buildDoneEvent_;
 };
 
 /**
@@ -214,6 +224,8 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief CUDA event for coordinating stream synchronization */
   std::unique_ptr<CudaEvent> cudaEvent_;
+  /** @brief CUDA event that fires when hash table construction is complete */
+  std::optional<cudaEvent_t> buildDoneEvent_;
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one

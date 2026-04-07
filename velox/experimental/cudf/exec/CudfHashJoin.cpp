@@ -112,6 +112,16 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfHashJoinBridge::setBuildDoneEvent(cudaEvent_t event) {
+  std::lock_guard<std::mutex> l(mutex_);
+  buildDoneEvent_ = event;
+}
+
+std::optional<cudaEvent_t> CudfHashJoinBridge::getBuildDoneEvent() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return buildDoneEvent_;
+}
+
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -264,6 +274,16 @@ void CudfHashJoinBuild::noMoreInput() {
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+
+  // Record a CUDA event that fires when all hash table construction kernels
+  // submitted above have completed on the build stream. Publishing this event
+  // lets probe drivers synchronize at GPU level (cudaStreamWaitEvent) instead
+  // of blocking the CPU. The GpuGuard is released when this function returns —
+  // the build stream continues executing in the background.
+  cudaEvent_t buildDoneEvent;
+  cudaEventCreateWithFlags(&buildDoneEvent, cudaEventDisableTiming);
+  cudaEventRecord(buildDoneEvent, stream.value());
+  cudfHashJoinBridge->setBuildDoneEvent(buildDoneEvent);
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -604,10 +624,9 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   for (int i = 0; i < rightColumnOutputIndices_.size(); i++) {
     joinedCols[rightColumnOutputIndices_[i]] = std::move(rightCols[i]);
   }
-  if (buildStream_.has_value()) {
-    // Ensure deallocation of build table happens after probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
+  // All join work now runs on the probe stream; build stream ordering is
+  // established via cudaStreamWaitEvent(stream, buildDoneEvent_) at the top of
+  // each join function, so no additional cross-stream event sync is needed here.
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
@@ -655,10 +674,9 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
         std::move(joinedCols[leftColsSize + rightColumnIndicesToGather_[i]]);
   }
   joinedCols = std::move(filteredjoinedCols);
-  if (buildStream_.has_value()) {
-    // Ensure any deallocation of join indices is ordered wrt probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
+  // All join work now runs on the probe stream; build stream ordering is
+  // established via cudaStreamWaitEvent(stream, buildDoneEvent_) at the top of
+  // each join function, so no additional cross-stream event sync is needed here.
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
@@ -707,18 +725,15 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      // Make build stream wait for probe tables to become valid
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    if (buildDoneEvent_.has_value()) {
+      // GPU-side wait: ensure hash table construction is complete before the
+      // probe stream accesses it. This avoids CPU-blocking on the build stream.
+      cudaStreamWaitEvent(stream.value(), *buildDoneEvent_, 0);
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      // Make probe stream wait for join completion before using indices
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
+        stream);
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -760,16 +775,13 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
     auto& hb = hbs[i];
 
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    if (buildDoneEvent_.has_value()) {
+      cudaStreamWaitEvent(stream.value(), *buildDoneEvent_, 0);
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
+        stream);
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -812,16 +824,13 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     auto& hb = hbs[i];
 
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    if (buildDoneEvent_.has_value()) {
+      cudaStreamWaitEvent(stream.value(), *buildDoneEvent_, 0);
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
+        stream);
     // cudf::scatter is async: it enqueues a device memcpy of the old flags
     // (the target) plus a thrust::scatter kernel onto `stream`, then returns
     // immediately. The old rightMatchedFlags_[i] column must stay alive until
@@ -1336,6 +1345,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
+  buildDoneEvent_ = cudfJoinBridge->getBuildDoneEvent();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin()) {
