@@ -59,6 +59,7 @@
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using cudf_velox::beginGpuRegion;
+using cudf_velox::endGpuRegion;
 using cudf_velox::GpuGuard;
 
 using namespace facebook::velox::connector;
@@ -270,6 +271,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       auto result = flushAccumulated();
       gpuTimer_.stop(stream_);
       if (result == nullptr) {
+        endGpuRegion();
         return nullptr;
       }
       TotalScanTimeCallbackData* callbackData =
@@ -313,6 +315,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       }
 
       if (!hasCoalescedFiles || !advanceToNextCoalescedFile()) {
+        endGpuRegion();
         return nullptr;
       }
     }

@@ -154,8 +154,6 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFromVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  beginGpuRegion();
-  GpuGuard gpuGuard;
 
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   const auto targetRows =
@@ -198,6 +196,10 @@ RowVectorPtr CudfFromVelox::getOutput() {
   if (totalSize == 0) {
     return nullptr;
   }
+
+  // All early returns passed — begin GPU region before actual H2D work.
+  beginGpuRegion();
+  GpuGuard gpuGuard;
 
   auto stream = cudfGlobalStreamPool().get_stream();
 

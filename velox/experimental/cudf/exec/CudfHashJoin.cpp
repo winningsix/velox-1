@@ -238,6 +238,7 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
     VLOG(2) << "Calling CudfHashJoinBuild::addInput";
   }
   if (input->size() == 0) {
+    endGpuRegion();
     return;
   }
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
