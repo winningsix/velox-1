@@ -1230,6 +1230,14 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  // Multi-join pipeline ordering (§3.5.3): each probe inherits `stream` from
+  // its upstream CudfVector.  When Join1 returns a CudfVector on stream S and
+  // Join2's probe receives that vector as input, Join2 also runs on S.  Because
+  // all cuDF operations on the same stream are GPU-ordered, Join2's kernels are
+  // guaranteed to execute after Join1's — no explicit compute_done_event is
+  // needed between consecutive joins in the pipeline.  The per-bridge
+  // buildDoneEvent_ (cudaStreamWaitEvent below) handles build→probe ordering
+  // for each join's own hash table.
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
   auto leftTableView = cudfInput->getTableView();

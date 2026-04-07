@@ -21,6 +21,7 @@ add_library(
   CudfHashJoin.cpp
   CudfLimit.cpp
   CudfLocalPartition.cpp
+  CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp
   CudfShufflePartition.cpp
   CudfTopN.cpp

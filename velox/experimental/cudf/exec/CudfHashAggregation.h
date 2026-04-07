@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "velox/common/future/VeloxPromise.h"
+#include "velox/experimental/cudf/exec/GpuMemoryBudget.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -81,12 +83,18 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   RowVectorPtr getOutput() override;
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && !streamPending_;
   }
 
   void noMoreInput() override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
+  exec::BlockingReason isBlocked(ContinueFuture* future) override {
+    if (streamPending_) {
+      if (streamFuture_.valid()) {
+        *future = std::move(streamFuture_);
+      }
+      return exec::BlockingReason::kWaitForStream;
+    }
     return exec::BlockingReason::kNotBlocked;
   }
 
@@ -165,6 +173,24 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   int64_t accumulatedPartialBytes_{0};
 
   CudfVectorPtr partialOutput_;
+
+  // --- Async GPU operator state (§3.6.3 semaphore redesign) ---
+  // true while a CUDA stream callback is in-flight (set before cudaLaunchHostFunc,
+  // cleared inside the callback).
+  bool streamPending_{false};
+  // true after the CUDA callback fires; consumed once by getOutput().
+  bool streamDone_{false};
+  // Promise fulfilled by the CUDA host callback to wake the Velox driver.
+  ContinuePromise streamPromise_{ContinuePromise::makeEmpty()};
+  // Semi-future extracted from streamPromise_ and handed to the driver via
+  // isBlocked().  Moved out on first call; valid() returns false afterwards.
+  ContinueFuture streamFuture_{ContinueFuture::makeEmpty()};
+  // Stores the pending output produced by the final-aggregation async path.
+  // Null for the partial path (which stores results in partialOutput_).
+  RowVectorPtr pendingOutput_;
+  // Bytes reserved from GpuMemoryBudget for the in-flight work; released in
+  // getOutput() path (A) after the result is consumed.
+  int64_t reservedBytes_{0};
 };
 
 // Step-aware aggregation function registry
