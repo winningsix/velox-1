@@ -154,6 +154,7 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFromVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  beginGpuRegion();
   GpuGuard gpuGuard;
 
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
@@ -280,6 +281,7 @@ RowVectorPtr CudfToVelox::getOutput() {
   GpuGuard gpuGuard;
   if (finished_ || inputs_.empty()) {
     finished_ = noMoreInput_ && inputs_.empty();
+    endGpuRegion();
     return nullptr;
   }
 
@@ -301,12 +303,15 @@ RowVectorPtr CudfToVelox::getOutput() {
     auto tableView = cudfVector->getTableView();
     if (tableView.num_rows() == 0) {
       finished_ = noMoreInput_ && inputs_.empty();
+      endGpuRegion();
       return nullptr;
     }
     gpuTimer_.start(stream);
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), "", stream);
     gpuTimer_.stop(stream);
+    // D2H complete — end GPU region before returning host data.
+    endGpuRegion();
     finished_ = noMoreInput_ && inputs_.empty();
     if (output->type()->kindEquals(outputType_)) {
       output->setType(outputType_);
@@ -386,6 +391,7 @@ RowVectorPtr CudfToVelox::getOutput() {
 
   // If we have no inputs to process, return nullptr
   if (selectedInputs.empty()) {
+    endGpuRegion();
     return nullptr;
   }
 
@@ -396,6 +402,7 @@ RowVectorPtr CudfToVelox::getOutput() {
   const auto size = resultTable->num_rows();
   VELOX_CHECK_NOT_NULL(resultTable);
   if (size == 0) {
+    endGpuRegion();
     return nullptr;
   }
 
@@ -403,6 +410,8 @@ RowVectorPtr CudfToVelox::getOutput() {
   RowVectorPtr output =
       with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
   gpuTimer_.stop(stream);
+  // D2H complete — end GPU region before returning host data.
+  endGpuRegion();
   finished_ = noMoreInput_ && inputs_.empty();
   if (output->type()->kindEquals(outputType_)) {
     output->setType(outputType_);

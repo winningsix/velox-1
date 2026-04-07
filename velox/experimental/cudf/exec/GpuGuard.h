@@ -36,4 +36,23 @@ struct GpuGuard {
   GpuGuard& operator=(const GpuGuard&) = delete;
 };
 
+/// Pipeline-level GPU region using thread-local state.
+///
+/// A GPU region brackets a contiguous sequence of GPU work across multiple
+/// operators within one pipeline iteration. It exploits the existing
+/// thread-local ref-counting in lockGpu/unlockGpu: beginGpuRegion() bumps
+/// the refcount, so all nested GpuGuard acquisitions become free (refcount
+/// 1→2→1→2→1). The actual semaphore is never released between operators.
+///
+/// Usage pattern:
+///   Source operator (after I/O, before H2D): beginGpuRegion()
+///   Intermediate operators: GpuGuard as usual (nested, no-op on semaphore)
+///   Sink / D2H point: endGpuRegion()
+///
+/// This gives the Spark-Rapids scope: [H2D acquire, D2H release] without
+/// holding the lock during I/O at either end.
+void beginGpuRegion();
+void endGpuRegion();
+bool isInGpuRegion();
+
 } // namespace facebook::velox::cudf_velox

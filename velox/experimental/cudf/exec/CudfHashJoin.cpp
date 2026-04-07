@@ -245,10 +245,8 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
 
   auto stream = cudfInput->stream();
 
-  // Pack GPU table into one contiguous device buffer, then D2H to pinned
-  // host memory. No GpuGuard here — the data is already on GPU from the
-  // upstream operator, and the net effect is freeing GPU memory. Skipping
-  // the semaphore allows parallel D2H across tasks for faster cleanup.
+  // D2H: pack into contiguous device buffer, copy to pinned host memory.
+  // Runs under the GPU region started by the source operator (scan).
   auto packed = cudf::pack(cudfInput->getTableView(), stream);
   auto devSize = packed.gpu_data->size();
   auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
@@ -263,6 +261,10 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   auto numRows = static_cast<vector_size_t>(cudfInput->size());
   hostInputs_.push_back(
       {std::move(*packed.metadata), std::move(hostBuf), numRows});
+
+  // D2H complete — end the GPU region started by the source operator.
+  // All GPU data for this batch is now on host; semaphore released.
+  endGpuRegion();
 }
 
 bool CudfHashJoinBuild::needsInput() const {
