@@ -25,6 +25,7 @@ add_library(
   CudfShufflePartition.cpp
   CudfTopN.cpp
   DebugUtil.cpp
+  GpuMemoryBudget.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp
   ToCudf.cpp
