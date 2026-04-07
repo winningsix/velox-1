@@ -17,8 +17,9 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
-#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+
+#include <cuda_runtime.h>
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/exec/Aggregate.h"
@@ -1065,18 +1066,44 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
         thresholdReached = accumulatedPartialRows_ >= targetRows;
       }
       if (thresholdReached) {
-        GpuGuard gpuGuard;
         processAccumulatedPartialInputs();
+        if (partialOutput_) {
+          streamPending_ = true;
+          streamDone_ = false;
+          streamPromise_ = ContinuePromise("CudfHashAggregation::addInput");
+          streamFuture_ = streamPromise_.getSemiFuture();
+          cudaLaunchHostFunc(
+              partialOutput_->stream().value(),
+              [](void* p) {
+                auto* op = static_cast<CudfHashAggregation*>(p);
+                op->streamDone_ = true;
+                op->streamPending_ = false;
+                op->streamPromise_.setValue();
+              },
+              this);
+        }
       }
       return;
     }
-    {
-      GpuGuard gpuGuard;
-      if (isDistinct_) {
-        computeIntermediateDistinctPartial(cudfInput);
-      } else {
-        computeIntermediateGroupbyPartial(cudfInput);
-      }
+    if (isDistinct_) {
+      computeIntermediateDistinctPartial(cudfInput);
+    } else {
+      computeIntermediateGroupbyPartial(cudfInput);
+    }
+    if (partialOutput_) {
+      streamPending_ = true;
+      streamDone_ = false;
+      streamPromise_ = ContinuePromise("CudfHashAggregation::addInput");
+      streamFuture_ = streamPromise_.getSemiFuture();
+      cudaLaunchHostFunc(
+          partialOutput_->stream().value(),
+          [](void* p) {
+            auto* op = static_cast<CudfHashAggregation*>(p);
+            op->streamDone_ = true;
+            op->streamPending_ = false;
+            op->streamPromise_.setValue();
+          },
+          this);
     }
     return;
   }
@@ -1199,19 +1226,38 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
+
+  // (A) Final-aggregation result from previous async GPU work is ready.
+  // The condition mirrors the final path below: !(isPartialOutput_ && !isGlobal_).
+  if (streamDone_ && !(isPartialOutput_ && !isGlobal_)) {
+    streamDone_ = false;
+    GpuMemoryBudget::instance().release(reservedBytes_);
+    reservedBytes_ = 0;
+    return std::move(pendingOutput_);
+  }
+
+  // Partial async work submitted from addInput() / noMoreInput() has
+  // completed — reset the flag and fall through to the partial output logic.
+  if (streamDone_) {
+    streamDone_ = false;
+  }
+
+  // (B) Async GPU work is still in-flight — park the driver.
+  if (streamPending_) {
+    return nullptr;
+  }
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {
     if (partialOutput_ &&
         partialOutput_->estimateFlatSize() >
             maxPartialAggregationMemoryUsage_) {
-      // This is basically a flush of the partial output.
+      // Flush the partial output when it has grown past the memory limit.
       return releaseAndResetPartialOutput();
     }
-    if (not noMoreInput_) {
-      // Don't produce output if the partial output hasn't reached memory limit
-      // and there's more batches to come.
+    if (!noMoreInput_) {
+      // Don't produce output until the partial output has reached memory limit
+      // or there is no more input.
       return nullptr;
     }
     if (!partialOutput_ && finished_) {
@@ -1224,9 +1270,8 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
+  // (C) Final aggregation must wait for all input batches.
   if (!isPartialOutput_ && !noMoreInput_) {
-    // Final aggregation has to wait for all batches to arrive so we cannot
-    // return any results here.
     return nullptr;
   }
 
@@ -1234,8 +1279,12 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
+  // (D) Submit GPU aggregation work asynchronously — no GpuGuard held.
   auto stream = cudfGlobalStreamPool().get_stream();
 
+  // getConcatenatedTable returns a cudf::table whose lifetime is managed by
+  // tbl; keep tbl alive until the end of this scope so that the table_view
+  // passed to the kernel functions remains valid.
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();
 
@@ -1245,23 +1294,55 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  // Use tbl->view() instead of moving the table.
-  // tbl stays alive until the end of this function, keeping the view valid.
   if (isDistinct_) {
-    return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+    pendingOutput_ =
+        getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
   } else if (isGlobal_) {
-    return doGlobalAggregation(tbl->view(), stream);
+    pendingOutput_ = doGlobalAggregation(tbl->view(), stream);
   } else {
-    return doGroupByAggregation(
+    pendingOutput_ = doGroupByAggregation(
         tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
   }
+
+  streamPending_ = true;
+  streamDone_ = false;
+  streamPromise_ = ContinuePromise("CudfHashAggregation::getOutput");
+  streamFuture_ = streamPromise_.getSemiFuture();
+  auto* self = this;
+  cudaLaunchHostFunc(
+      stream.value(),
+      [](void* p) {
+        auto* op = static_cast<CudfHashAggregation*>(p);
+        op->streamDone_ = true;
+        op->streamPending_ = false;
+        op->streamPromise_.setValue();
+      },
+      self);
+
+  return nullptr;
 }
 
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
   if (isPartialOutput_ && !isGlobal_) {
-    GpuGuard gpuGuard;
+    // Submit any remaining accumulated inputs to the GPU without holding
+    // GpuGuard; register a host callback so the driver parks until done.
     processAccumulatedPartialInputs();
+    if (partialOutput_) {
+      streamPending_ = true;
+      streamDone_ = false;
+      streamPromise_ = ContinuePromise("CudfHashAggregation::noMoreInput");
+      streamFuture_ = streamPromise_.getSemiFuture();
+      cudaLaunchHostFunc(
+          partialOutput_->stream().value(),
+          [](void* p) {
+            auto* op = static_cast<CudfHashAggregation*>(p);
+            op->streamDone_ = true;
+            op->streamPending_ = false;
+            op->streamPromise_.setValue();
+          },
+          this);
+    }
   }
   if (isPartialOutput_ && inputs_.empty() &&
       accumulatedPartialInputs_.empty()) {

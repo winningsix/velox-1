@@ -167,6 +167,18 @@ class CudaEvent {
    */
   const CudaEvent& waitOn(rmm::cuda_stream_view stream) const;
 
+  /**
+   * @brief Returns the underlying cudaEvent_t handle.
+   *
+   * The returned handle is owned by this CudaEvent; the caller must not
+   * destroy it. Use this only for passing to CUDA APIs (e.g.
+   * cudaStreamWaitEvent) when the CudaEvent::waitOn() convenience method
+   * is insufficient.
+   */
+  cudaEvent_t get() const {
+    return event_;
+  }
+
  private:
   cudaEvent_t event_{};
 };

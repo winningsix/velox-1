@@ -50,7 +50,22 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <chrono>
+#include <mutex>
+#include <thread>
+
 namespace facebook::velox::cudf_velox {
+
+// Guards large probe batches from running concurrently to avoid GPU OOM.
+// Probes whose estimated flat size exceeds kLargeJoinBytesThreshold must
+// acquire this mutex before launching join kernels.  The mutex is never
+// blocking: callers use try_lock() and schedule a ContinueFuture retry if
+// the lock is already held by another large join.
+static std::mutex sLargeJoinMutex;
+
+// Probe batches larger than this threshold (bytes) are considered "large"
+// and must serialize through sLargeJoinMutex.
+static constexpr int64_t kLargeJoinBytesThreshold = 512LL << 20; // 512 MiB
 
 void CudfHashJoinProbe::close() {
   Operator::close();
@@ -60,6 +75,10 @@ void CudfHashJoinProbe::close() {
   accumulatedProbeInputs_.clear();
   accumulatedProbeRows_ = 0;
   accumulatedProbeBytes_ = 0;
+  pendingJoinOutputs_.clear();
+  pendingRightMatchedFlags_.clear();
+  streamPending_ = false;
+  streamDone_ = false;
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -112,6 +131,19 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfHashJoinBridge::setBuildDoneEvent(CudaEvent event) {
+  std::lock_guard<std::mutex> l(mutex_);
+  buildDoneEvent_ = std::move(event);
+}
+
+cudaEvent_t CudfHashJoinBridge::getBuildDoneEvent() {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (buildDoneEvent_.has_value()) {
+    return buildDoneEvent_->get();
+  }
+  return nullptr;
+}
+
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -161,7 +193,6 @@ void CudfHashJoinBuild::noMoreInput() {
     VLOG(2) << "Calling CudfHashJoinBuild::noMoreInput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
   Operator::noMoreInput();
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
@@ -260,10 +291,17 @@ void CudfHashJoinBuild::noMoreInput() {
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
+  // Record a CUDA event on the build stream instead of stream.synchronize().
+  // The probe driver will call buildDoneEvent->waitOn(probeStream) to insert
+  // a GPU-side dependency, ensuring hash table visibility without blocking CPU.
+  CudaEvent buildDoneEvent(cudaEventDisableTiming);
+  buildDoneEvent.recordFrom(stream);
+  cudfHashJoinBridge->setBuildDoneEvent(std::move(buildDoneEvent));
   cudfHashJoinBridge->setBuildStream(stream);
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+  // GpuGuard removed: GPU build continues asynchronously on the stream.
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -440,6 +478,10 @@ bool CudfHashJoinProbe::needsInput() const {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinProbe::needsInput";
   }
+  // Do not accept new input while async GPU work is in flight.
+  if (streamPending_) {
+    return false;
+  }
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
   }
@@ -488,7 +530,6 @@ void CudfHashJoinProbe::noMoreInput() {
     VLOG(2) << "Calling CudfHashJoinProbe::noMoreInput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
   Operator::noMoreInput();
   if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin()) {
     return;
@@ -604,11 +645,10 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   for (int i = 0; i < rightColumnOutputIndices_.size(); i++) {
     joinedCols[rightColumnOutputIndices_[i]] = std::move(rightCols[i]);
   }
-  if (buildStream_.has_value()) {
-    // Ensure deallocation of build table happens after probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
-  stream.synchronize();
+  // No stream.synchronize() here: the cudaLaunchHostFunc in getOutput()
+  // signals completion once all kernels on this stream have finished.
+  // The buildDoneEvent->waitOn(stream) in getOutput() ensures hash table
+  // visibility without the buildStream_ cross-stream event dance.
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -655,11 +695,8 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
         std::move(joinedCols[leftColsSize + rightColumnIndicesToGather_[i]]);
   }
   joinedCols = std::move(filteredjoinedCols);
-  if (buildStream_.has_value()) {
-    // Ensure any deallocation of join indices is ordered wrt probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-  }
-  stream.synchronize();
+  // No stream.synchronize() here: the cudaLaunchHostFunc in getOutput()
+  // signals completion once all kernels on this stream have finished.
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -707,18 +744,12 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      // Make build stream wait for probe tables to become valid
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-    }
+    // buildDoneEvent->waitOn(stream) in getOutput() ensures the hash table is
+    // visible on this stream; run the join directly on the probe stream.
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      // Make probe stream wait for join completion before using indices
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
+        stream);
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -760,16 +791,12 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
     auto& hb = hbs[i];
 
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-    }
+    // buildDoneEvent->waitOn(stream) in getOutput() ensures the hash table is
+    // visible on this stream; run the join directly on the probe stream.
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
+        stream);
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -812,23 +839,18 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     auto& hb = hbs[i];
 
     VELOX_CHECK_NOT_NULL(hb);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
-    }
+    // buildDoneEvent->waitOn(stream) in getOutput() ensures the hash table is
+    // visible on this stream; run the join directly on the probe stream.
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
         std::nullopt,
-        buildStream_.has_value() ? buildStream_.value() : stream);
-    if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
-    }
-    // cudf::scatter is async: it enqueues a device memcpy of the old flags
-    // (the target) plus a thrust::scatter kernel onto `stream`, then returns
-    // immediately. The old rightMatchedFlags_[i] column must stay alive until
-    // that work completes. We defer the assignment to rightMatchedFlags_[i]
-    // until after unfilteredOutput/filteredOutput (which call
-    // stream.synchronize()), so the old column is not destroyed while the
-    // scatter kernel is still reading from it.
+        stream);
+    // cudf::scatter is async: enqueues kernels onto `stream` then returns.
+    // The old rightMatchedFlags_[i] column must stay alive until the kernels
+    // complete. With the async design, we defer the assignment to
+    // pendingRightMatchedFlags_ and apply it when streamDone_ is true.
+    // The old column is kept alive as the current rightMatchedFlags_[i] until
+    // the stream callback fires and the next getOutput() call swaps it out.
     std::unique_ptr<cudf::column> updated_flag_col;
     if (!joinNode_->filter()) {
       // Mark matched rights using scatter of true into flags at matching
@@ -918,8 +940,10 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           rightIndicesCol,
           stream));
     }
-    // Safe to assign now: stream has been synchronized by the output call above.
-    rightMatchedFlags_[i] = std::move(updated_flag_col);
+    // Defer the flag update: store updated_flag_col in pendingRightMatchedFlags_
+    // so getOutput() can apply it after streamDone_ is set by the callback.
+    // This avoids freeing the old flag column while the scatter kernel runs.
+    pendingRightMatchedFlags_.emplace_back(i, std::move(updated_flag_col));
   }
   return cudfOutputs;
 }
@@ -1229,6 +1253,36 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
+
+  // Large-join concurrency gate: serialize probe batches above the size
+  // threshold to prevent multiple concurrent large GPU allocations from
+  // triggering OOM.  Use try_lock() instead of lock() so the driver thread is
+  // never blocked; if the lock is held, schedule a 1 ms ContinueFuture retry.
+  const bool isLargeJoin =
+      (cudfInput->estimateFlatSize() > kLargeJoinBytesThreshold);
+  if (isLargeJoin) {
+    if (!sLargeJoinMutex.try_lock()) {
+      streamPending_ = true;
+      auto [promise, future] = makeVeloxContinuePromiseContract(
+          "CudfHashJoinProbe::largeJoinRetry");
+      streamFuture_ = std::move(future);
+      std::thread(
+          [p = std::move(promise)]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            p.setValue();
+          })
+          .detach();
+      return nullptr;
+    }
+  }
+  // If isLargeJoin and try_lock() succeeded, adopt the lock via SCOPE_EXIT.
+  SCOPE_EXIT {
+    if (isLargeJoin) {
+      sLargeJoinMutex.unlock();
+    }
+  };
+  streamPending_ = false;
+
   auto stream = cudfInput->stream();
   // Use getTableView() to avoid expensive materialization for packed_table.
   // cudfInput is staying alive until the table view is no longer needed.
@@ -1307,6 +1361,14 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
+  // Park the driver while an async GPU stream is in flight.
+  // streamFuture_ is always set before streamPending_; once it is moved out
+  // here Velox will not call isBlocked() again until the promise fires.
+  if (streamPending_) {
+    *future = std::move(streamFuture_);
+    return exec::BlockingReason::kWaitForStream;
+  }
+
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) &&
       hashObject_.has_value()) {
     if (!future_.valid()) {
@@ -1336,6 +1398,10 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
+  // Retrieve the raw build-done event handle for GPU-side ordering.
+  // The probe stream will call cudaStreamWaitEvent(stream, buildDoneEvent_)
+  // before launching join kernels, replacing the buildStream_ event dance.
+  buildDoneEvent_ = cudfJoinBridge->getBuildDoneEvent();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin()) {
@@ -1376,11 +1442,13 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 
 bool CudfHashJoinProbe::isFinished() {
   auto const isFinished = finished_ ||
-      (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty());
+      (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty() &&
+       pendingJoinOutputs_.empty() && !streamPending_);
 
   // Release hashObject_ if finished
   if (isFinished) {
     hashObject_.reset();
+    buildDoneEvent_ = nullptr;
   }
   return isFinished;
 }

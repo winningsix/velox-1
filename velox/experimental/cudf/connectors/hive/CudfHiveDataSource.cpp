@@ -19,7 +19,6 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
-#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -58,10 +57,37 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-using cudf_velox::GpuGuard;
-
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
+
+// --- ChunkSizeAdaptor implementation ---
+
+ChunkSizeAdaptor::ChunkSizeAdaptor() {
+  auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
+  currentChunkLimit = (targetBytes > 0) ? targetBytes : (256LL << 20);
+}
+
+void ChunkSizeAdaptor::onChunkDecoded(
+    int64_t compressedBytes,
+    int64_t decodedBytes) {
+  compressedBytesRead += compressedBytes;
+  decodedBytesProduced += decodedBytes;
+  if (compressedBytesRead > 0) {
+    double ratio =
+        static_cast<double>(decodedBytesProduced) / compressedBytesRead;
+    auto targetDecoded = CudfConfig::getInstance().gpuTargetBatchBytes;
+    if (targetDecoded <= 0) {
+      targetDecoded = 256LL << 20;
+    }
+    currentChunkLimit =
+        static_cast<int64_t>(targetDecoded / ratio * kSafetyFactor);
+    currentChunkLimit = std::max(currentChunkLimit, 4LL << 20);
+  }
+}
+
+void ChunkSizeAdaptor::onDecodeOOM() {
+  currentChunkLimit = std::max(currentChunkLimit / 2, 1LL << 20);
+}
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
@@ -191,8 +217,30 @@ CudfHiveDataSource::CudfHiveDataSource(
 
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t /*size*/,
-    velox::ContinueFuture& /* future */) {
+    velox::ContinueFuture& future) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+
+  // --- Phase 2: Async GPU decode state machine ---
+  // On a prior call we enqueued GPU kernels via read_chunk(), stored the
+  // result in pendingNextResult_, and registered asyncDecodeCompleteCallback
+  // on stream_.  The driver was suspended via ContinueFuture until the
+  // callback fired (signalling all decode kernels completed).  Return the
+  // buffered result now.
+  if (streamPending_) {
+    VELOX_CHECK(
+        streamDone_.load(std::memory_order_acquire),
+        "CudfHiveDataSource::next() called while GPU decode is still "
+        "in-flight; the Velox driver should only re-schedule after "
+        "streamDecodePromise_ is fulfilled.");
+    VELOX_CHECK(
+        pendingNextResult_.has_value(), "pendingNextResult_ unexpectedly empty");
+    auto result = std::move(*pendingNextResult_);
+    pendingNextResult_.reset();
+    streamPending_ = false;
+    streamDone_.store(false, std::memory_order_release);
+    return result;
+  }
+
   // Basic sanity checks
   VELOX_CHECK_NOT_NULL(split_, "No split to process. Call addSplit first.");
   VELOX_CHECK(
@@ -208,9 +256,24 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   const bool hasCoalescedFiles = !pendingFiles_.empty();
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
 
-  // GPU guard for single-file and experimental paths; emplaced before first
-  // GPU operation and held through common post-processing.
-  std::optional<GpuGuard> gpuGuard;
+  // Helper: store result, register asyncDecodeCompleteCallback on stream_, set
+  // ContinueFuture for the caller, and return nullopt to suspend the driver.
+  // next() will be called again after the callback fires; the state machine
+  // above then returns the buffered result.
+  auto emitAsync = [&](RowVectorPtr result) -> std::optional<RowVectorPtr> {
+    completedRows_ += result->size();
+    pendingNextResult_ = std::move(result);
+    streamPending_ = true;
+    streamDone_.store(false, std::memory_order_release);
+    streamDecodePromise_ =
+        ContinuePromise{"CudfHiveDataSource::asyncGpuDecode"};
+    future = streamDecodePromise_.getSemiFuture();
+    cudaLaunchHostFunc(
+        stream_.value(),
+        &CudfHiveDataSource::asyncDecodeCompleteCallback,
+        this);
+    return std::nullopt;
+  };
 
   if (not useExperimentalSplitReader_) {
     // Lazily create the multi-source reader on first next() call.
@@ -223,10 +286,11 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     if (hasCoalescedFiles) {
       // Multi-source coalesced read: a single chunked_parquet_reader sees
       // all files as multiple sources, reading row groups across them.
+      // No GPU lock needed — read_chunk() enqueues cuDF decode kernels to
+      // stream_; asyncDecodeCompleteCallback fires when they complete.
       const auto effectiveTarget = (targetBytes > 0)
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
-      GpuGuard coalescedGpuGuard;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -274,24 +338,34 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           stream_.value(),
           &CudfHiveDataSource::totalScanTimeCalculator,
           callbackData);
-      return result;
+      return emitAsync(std::move(result));
     }
 
     // Single-file path (no coalesced files).
+    // No GPU lock needed — read_chunk() enqueues cuDF decode kernels to
+    // stream_.
     if (not splitReader_->has_next()) {
       return nullptr;
     }
-    gpuGuard.emplace();
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
+    // Update compression-ratio estimate for adaptive chunk sizing.
+    // Use currentChunkLimit as a proxy for compressed bytes consumed this
+    // chunk; decodedBytes is the actual GPU memory footprint of the result.
+    if (cudfTable && cudfTable->num_rows() > 0) {
+      const auto decodedBytes =
+          static_cast<int64_t>(estimateTableBytes(cudfTable));
+      chunkSizeAdaptor_.onChunkDecoded(
+          chunkSizeAdaptor_.currentChunkLimit, decodedBytes);
+    }
   } else {
     // Chunked experimental reader: process row groups in batches.
     // Loops across coalesced files when the current file is exhausted.
+    // No GPU lock needed — GPU kernels are enqueued to stream_.
     VELOX_CHECK_NOT_NULL(
         exptSplitReader_, "Experimental cudf split reader not present");
 
-    gpuGuard.emplace();
     while (true) {
       if (!exptMetadataInitialized_) {
         initExperimentalReaderMetadata();
@@ -372,12 +446,12 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Check if conversion yielded a nullptr
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 
-  // Update completedRows_.
-  completedRows_ += output->size();
-
   // TODO: Update `completedBytes_` here instead of in `addSplit()`
 
-  return output;
+  // Suspend the driver until all GPU decode kernels on stream_ complete,
+  // then return the result on the next next() call (see state machine above).
+  // completedRows_ is updated inside emitAsync.
+  return emitAsync(std::move(output));
 }
 
 void CudfHiveDataSource::totalScanTimeCalculator(void* userData) {
@@ -662,9 +736,14 @@ CudfParquetReaderPtr CudfHiveDataSource::createSplitReader() {
   setupCudfDataSourceAndOptions();
   stream_ = cudfGlobalStreamPool().get_stream();
 
-  // Create a parquet reader
+  // Use adaptive chunk limit; falls back to config value on first split.
+  const auto chunkLimit = std::min(
+      chunkSizeAdaptor_.currentChunkLimit,
+      static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit()) > 0
+          ? static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit())
+          : std::numeric_limits<int64_t>::max());
   return std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimit(),
+      static_cast<std::size_t>(chunkLimit),
       cudfHiveConfig_->maxPassReadLimit(),
       readerOptions_,
       stream_,
@@ -706,6 +785,8 @@ void CudfHiveDataSource::resetSplit() {
   exptMetadataInitialized_ = false;
   exptFilteredRowGroups_.clear();
   exptNextRGIndex_ = 0;
+  // Reset the adaptor per split so ratio learning starts fresh for each file.
+  chunkSizeAdaptor_ = ChunkSizeAdaptor{};
 }
 
 std::unordered_map<std::string, RuntimeMetric>
@@ -831,12 +912,19 @@ void CudfHiveDataSource::createCoalescedMultiSourceReader() {
     readerOptions_.set_column_names(readColumnNames_);
   }
 
-  splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimit(),
-      cudfHiveConfig_->maxPassReadLimit(),
-      readerOptions_,
-      stream_,
-      cudf::get_current_device_resource_ref());
+  {
+    const auto chunkLimit = std::min(
+        chunkSizeAdaptor_.currentChunkLimit,
+        static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit()) > 0
+            ? static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit())
+            : std::numeric_limits<int64_t>::max());
+    splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+        static_cast<std::size_t>(chunkLimit),
+        cudfHiveConfig_->maxPassReadLimit(),
+        readerOptions_,
+        stream_,
+        cudf::get_current_device_resource_ref());
+  }
 
   coalescedMultiSourcePending_ = false;
 
@@ -938,12 +1026,19 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
                 pageIndexBytes->data(), pageIndexBytes->size()});
       }
     } else {
-      splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-          cudfHiveConfig_->maxChunkReadLimit(),
-          cudfHiveConfig_->maxPassReadLimit(),
-          readerOptions_,
-          stream_,
-          cudf::get_current_device_resource_ref());
+      {
+        const auto chunkLimit = std::min(
+            chunkSizeAdaptor_.currentChunkLimit,
+            static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit()) > 0
+                ? static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit())
+                : std::numeric_limits<int64_t>::max());
+        splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+            static_cast<std::size_t>(chunkLimit),
+            cudfHiveConfig_->maxPassReadLimit(),
+            readerOptions_,
+            stream_,
+            cudf::get_current_device_resource_ref());
+      }
     }
   } else {
     // No async pre-read available; read from disk synchronously.
@@ -965,12 +1060,19 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
       }
     } else {
       setupCudfDataSourceAndOptions();
-      splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-          cudfHiveConfig_->maxChunkReadLimit(),
-          cudfHiveConfig_->maxPassReadLimit(),
-          readerOptions_,
-          stream_,
-          cudf::get_current_device_resource_ref());
+      {
+        const auto chunkLimit = std::min(
+            chunkSizeAdaptor_.currentChunkLimit,
+            static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit()) > 0
+                ? static_cast<int64_t>(cudfHiveConfig_->maxChunkReadLimit())
+                : std::numeric_limits<int64_t>::max());
+        splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+            static_cast<std::size_t>(chunkLimit),
+            cudfHiveConfig_->maxPassReadLimit(),
+            readerOptions_,
+            stream_,
+            cudf::get_current_device_resource_ref());
+      }
     }
   }
 

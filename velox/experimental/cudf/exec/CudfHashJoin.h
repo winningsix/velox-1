@@ -17,8 +17,10 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/JoinBridge.h"
 #include "velox/exec/Operator.h"
@@ -31,6 +33,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <deque>
 #include <memory>
 
 namespace facebook::velox::cudf_velox {
@@ -70,12 +73,25 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  // NEW: CUDA event recorded on the build stream after hash table construction.
+  // The probe driver calls buildDoneEvent->waitOn(probeStream) for GPU-side
+  // ordering instead of CPU-blocking stream.synchronize().
+  void setBuildDoneEvent(CudaEvent event);
+
+  // Returns the raw CUDA event handle for GPU-side stream ordering, or
+  // a null handle (nullptr) if not yet set. The bridge's CudaEvent RAII
+  // object owns the lifetime; callers use the handle only with
+  // cudaStreamWaitEvent and must not destroy it.
+  cudaEvent_t getBuildDoneEvent();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
+  /** @brief CUDA event signaling hash table construction completion */
+  std::optional<CudaEvent> buildDoneEvent_;
 };
 
 /**
@@ -214,6 +230,25 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief CUDA event for coordinating stream synchronization */
   std::unique_ptr<CudaEvent> cudaEvent_;
+
+  // Async GPU stream state — no GpuGuard needed.
+  // Pattern: submit kernel to stream, cudaLaunchHostFunc sets streamDone_ and
+  // fulfills streamPromise_ to wake the Velox driver via kWaitForStream.
+  bool streamDone_{false};
+  bool streamPending_{false};
+  ContinuePromise streamPromise_{ContinuePromise::makeEmpty()};
+  ContinueFuture streamFuture_{ContinueFuture::makeEmpty()};
+  /** @brief Output batches produced by the async join kernel, returned one per
+   * getOutput() call */
+  std::deque<RowVectorPtr> pendingJoinOutputs_;
+  /** @brief Raw build-done event handle retrieved from bridge.
+   *  The bridge's CudaEvent RAII object owns the lifetime; this is a borrowed
+   *  handle valid until the task (and bridge) are torn down. */
+  cudaEvent_t buildDoneEvent_{nullptr};
+  /** @brief Right join matched-flag columns computed by the async stream;
+   * assigned to rightMatchedFlags_ when streamDone_ becomes true */
+  std::vector<std::pair<size_t, std::unique_ptr<cudf::column>>>
+      pendingRightMatchedFlags_;
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one

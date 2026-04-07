@@ -48,6 +48,25 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
 
+// Tracks the compression ratio observed across read_chunk() calls and
+// dynamically adjusts chunk_read_limit to keep decoded batches within the
+// configured GPU memory budget.  A high ratio (e.g. 32×) means each 64 MB
+// compressed chunk expands to 2+ GB; without adaptation that triggers cuDF's
+// internal cudaDeviceSynchronize() OOM path which stalls the pipeline.
+struct ChunkSizeAdaptor {
+  int64_t compressedBytesRead{0};
+  int64_t decodedBytesProduced{0};
+  int64_t currentChunkLimit;
+  static constexpr double kSafetyFactor = 0.7;
+
+  ChunkSizeAdaptor();
+
+  void onChunkDecoded(int64_t compressedBytes, int64_t decodedBytes);
+
+  // Called when an OOM is detected after read_chunk(); halves the limit.
+  void onDecodeOOM();
+};
+
 using CudfParquetReader = cudf::io::chunked_parquet_reader;
 using CudfParquetReaderPtr = std::unique_ptr<CudfParquetReader>;
 
@@ -78,7 +97,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   std::optional<RowVectorPtr> next(
       uint64_t size,
-      velox::ContinueFuture& /* future */) override;
+      velox::ContinueFuture& future) override;
 
   uint64_t getCompletedRows() override {
     return completedRows_;
@@ -180,6 +199,25 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // Host callback function to calculate total scan time
   static void totalScanTimeCalculator(void* userData);
 
+  // --- Phase 2: Async GPU decode state ---
+  // After read_chunk() enqueues GPU kernels, we store the result and register
+  // asyncDecodeCompleteCallback on the stream. The driver blocks via
+  // ContinueFuture until the callback fires, signalling that all decode kernels
+  // have completed.  next() is then called again to collect the result.
+
+  // True while a GPU decode is in-flight (callback not yet fired).
+  bool streamPending_{false};
+  // Set to true by asyncDecodeCompleteCallback once all stream work completes.
+  std::atomic<bool> streamDone_{false};
+  // Fulfilled by asyncDecodeCompleteCallback to unblock the Velox driver.
+  ContinuePromise streamDecodePromise_{ContinuePromise::makeEmpty()};
+  // Buffered result awaiting GPU decode completion before being returned.
+  std::optional<RowVectorPtr> pendingNextResult_;
+
+  // CUDA host callback: fires after all GPU kernels enqueued to stream_ are
+  // done. Sets streamDone_ and fulfills streamDecodePromise_.
+  static void asyncDecodeCompleteCallback(void* userData);
+
   // --- Cross-split accumulation for coalesced multi-file reads ---
   // Pending file ranges from a coalesced split, processed one at a time.
   std::vector<CoalescedFileRange> pendingFiles_;
@@ -243,6 +281,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   std::vector<cudf::size_type> exptFilteredRowGroups_;
   size_t exptNextRGIndex_{0};
   cudf::io::parquet_reader_options exptResolvedOptions_;
+
+  // Adaptive chunk-size controller: adjusts chunk_read_limit per split based
+  // on the observed compression ratio to avoid GPU OOM on high-compression
+  // Parquet files.
+  ChunkSizeAdaptor chunkSizeAdaptor_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive
