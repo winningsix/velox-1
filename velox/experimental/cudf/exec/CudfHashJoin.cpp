@@ -1107,7 +1107,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     VLOG(2) << "Calling CudfHashJoinProbe::getOutput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
 
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
@@ -1226,6 +1225,13 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
     return nullptr;
   }
+
+  // Acquire GPU semaphore only now: input_ is confirmed non-null, meaning
+  // coalesced probe data is ready. We must not hold the semaphore while
+  // returning nullptr (the common "waiting for more data" path), otherwise
+  // all GPU slots are occupied by probe tasks waiting for shuffle I/O,
+  // causing a deadlock (Hold-and-Wait on the GPU semaphore).
+  GpuGuard gpuGuard;
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
