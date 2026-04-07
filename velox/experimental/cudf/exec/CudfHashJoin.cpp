@@ -246,9 +246,9 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   auto stream = cudfInput->stream();
 
   // Pack GPU table into one contiguous device buffer, then D2H to pinned
-  // host memory. This frees GPU memory immediately — the bridge holds only
-  // host-resident data, so build accumulation consumes zero GPU memory.
-  GpuGuard gpuGuard;
+  // host memory. No GpuGuard here — the data is already on GPU from the
+  // upstream operator, and the net effect is freeing GPU memory. Skipping
+  // the semaphore allows parallel D2H across tasks for faster cleanup.
   auto packed = cudf::pack(cudfInput->getTableView(), stream);
   auto devSize = packed.gpu_data->size();
   auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
