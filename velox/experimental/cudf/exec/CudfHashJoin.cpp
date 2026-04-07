@@ -62,10 +62,6 @@ void CudfHashJoinProbe::close() {
   }
   hashObject_.reset();
   buildBatches_.reset();
-  if (gpuSlotHeld_) {
-    gluten::unlockGpu();
-    gpuSlotHeld_ = false;
-  }
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -1112,18 +1108,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
-  // Lazily build hash table on first getOutput() call. This runs under an
-  // operator-level GpuGuard that stays held until close()/isFinished(),
-  // protecting the hash table's GPU memory for the probe's lifetime.
-  if (!hashObject_.has_value() && buildBatches_.has_value()) {
-    if (!gpuSlotHeld_) {
-      gluten::lockGpu();
-      gpuSlotHeld_ = true;
-    }
-    buildHashTable();
+  if (finished_) {
+    return nullptr;
   }
-
-  if (finished_ || !hashObject_.has_value()) {
+  // Need either a built hash table or pending build batches.
+  if (!hashObject_.has_value() && !buildBatches_.has_value()) {
     return nullptr;
   }
 
@@ -1188,7 +1177,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           continue;
         }
         auto& flags = rightMatchedFlags_[i];
-        // Build a boolean mask: unmatched = NOT(flags)
         auto boolMask = cudf::unary_operation(
             flags->view(), cudf::unary_operator::NOT, stream);
 
@@ -1200,10 +1188,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         if (m == 0) {
           continue;
         }
-        // Build left null columns
         std::vector<std::unique_ptr<cudf::column>> outCols(outputType_->size());
-        // Left side nulls (types derive from probe schema at the matching
-        // channel indices)
         auto probeType = joinNode_->sources()[0]->outputType();
         for (int li = 0; li < leftColumnOutputIndices_.size(); ++li) {
           auto outIdx = leftColumnOutputIndices_[li];
@@ -1215,7 +1200,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           outCols[outIdx] = cudf::make_column_from_scalar(
               *nullScalar, m, stream, cudf::get_current_device_resource_ref());
         }
-        // Right side
         auto rightCols = unmatchedRight->release();
         for (int ri = 0; ri < rightColumnOutputIndices_.size(); ++ri) {
           auto outIdx = rightColumnOutputIndices_[ri];
@@ -1242,8 +1226,15 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     return nullptr;
   }
 
-  // Re-entrant: operator-level lock is already held (gpuSlotHeld_).
+  // Both build and probe data are ready — acquire GPU lock NOW.
+  // Lock is per-batch: held only during actual GPU compute, released when
+  // getOutput() returns. Never held while waiting for I/O.
   GpuGuard gpuGuard;
+
+  // Build hash table lazily on first batch (under the same lock as probe).
+  if (!hashObject_.has_value()) {
+    buildHashTable();
+  }
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
@@ -1389,10 +1380,6 @@ bool CudfHashJoinProbe::isFinished() {
   if (isFinished) {
     hashObject_.reset();
     buildBatches_.reset();
-    if (gpuSlotHeld_) {
-      gluten::unlockGpu();
-      gpuSlotHeld_ = false;
-    }
   }
   return isFinished;
 }

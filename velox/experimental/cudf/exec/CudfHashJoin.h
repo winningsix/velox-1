@@ -213,9 +213,6 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief CUDA event for coordinating stream synchronization */
   std::unique_ptr<CudaEvent> cudaEvent_;
-  /** @brief True when this probe holds an operator-level GPU semaphore slot
-   * (from buildHashTable through close). */
-  bool gpuSlotHeld_{false};
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one
