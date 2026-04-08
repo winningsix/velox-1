@@ -30,6 +30,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/caching/CacheTTLController.h"
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
@@ -208,6 +209,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
 
   const bool hasCoalescedFiles = !pendingFiles_.empty();
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
+  const bool debugEnabled = CudfConfig::getInstance().debugEnabled;
+  uint64_t lastTableBytes = 0;
+  uint64_t lastFilteredBytes = 0;
 
   // GPU guard for single-file and experimental paths; emplaced before first
   // GPU operation and held through common post-processing.
@@ -231,36 +235,62 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       gpuTimer_.start(stream_);
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
-        auto tableWithMetadata = splitReader_->read_chunk();
-        if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
-          auto& tbl = tableWithMetadata.tbl;
-          if (remainingFilterExprSet_) {
-            auto cols = tbl->release();
-            const auto originalNumColumns = cols.size();
-            auto filterResult = cudfExpressionEvaluator_->eval(
-                cols, stream_, cudf::get_current_device_resource_ref());
-            std::vector<std::unique_ptr<cudf::column>> origCols;
-            origCols.reserve(originalNumColumns);
-            std::move(
-                cols.begin(),
-                cols.begin() + originalNumColumns,
-                std::back_inserter(origCols));
-            auto origTable =
-                std::make_unique<cudf::table>(std::move(origCols));
-            tbl = cudf::apply_boolean_mask(
-                *origTable,
-                asView(filterResult),
-                stream_,
-                cudf::get_current_device_resource_ref());
-          }
-          if (tbl->num_rows() > 0) {
-            auto tableBytes = estimateTableBytes(tbl);
-            accumulatedTables_.push_back(std::move(tbl));
-            accumulatedBytes_ += tableBytes;
-            if (accumulatedBytes_ >= effectiveTarget) {
-              break;
+        try {
+          auto tableWithMetadata = splitReader_->read_chunk();
+          if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
+            auto& tbl = tableWithMetadata.tbl;
+            lastTableBytes = estimateTableBytes(tbl);
+            if (remainingFilterExprSet_) {
+              auto cols = tbl->release();
+              const auto originalNumColumns = cols.size();
+              auto filterResult = cudfExpressionEvaluator_->eval(
+                  cols, stream_, cudf::get_current_device_resource_ref());
+              std::vector<std::unique_ptr<cudf::column>> origCols;
+              origCols.reserve(originalNumColumns);
+              std::move(
+                  cols.begin(),
+                  cols.begin() + originalNumColumns,
+                  std::back_inserter(origCols));
+              auto origTable =
+                  std::make_unique<cudf::table>(std::move(origCols));
+              tbl = cudf::apply_boolean_mask(
+                  *origTable,
+                  asView(filterResult),
+                  stream_,
+                  cudf::get_current_device_resource_ref());
+            }
+            if (tbl->num_rows() > 0) {
+              auto tableBytes = estimateTableBytes(tbl);
+              lastFilteredBytes = tableBytes;
+              accumulatedTables_.push_back(std::move(tbl));
+              accumulatedBytes_ += tableBytes;
+              if (accumulatedBytes_ >= effectiveTarget) {
+                if (debugEnabled) {
+                  LOG(INFO) << "CudfHiveDataSource::next coalesced threshold: "
+                            << "accumulatedBytes="
+                            << succinctBytes(accumulatedBytes_)
+                            << ", preFilterBytes="
+                            << succinctBytes(lastTableBytes)
+                            << ", filteredBytes="
+                            << succinctBytes(lastFilteredBytes)
+                            << ", targetBytes="
+                            << succinctBytes(effectiveTarget)
+                            << ", " << gpuMemorySnapshotString();
+                }
+                break;
+              }
             }
           }
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "CudfHiveDataSource::next coalesced read failed: "
+                     << e.what()
+                     << ", split=" << split_->filePath
+                     << ", accumulatedBytes=" << succinctBytes(accumulatedBytes_)
+                     << ", preFilterBytes=" << succinctBytes(lastTableBytes)
+                     << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
+                     << ", targetBytes=" << succinctBytes(effectiveTarget)
+                     << ", " << gpuMemorySnapshotString();
+          throw;
         }
       }
       totalCoalesceBufferTimeNs_.fetch_add(
@@ -287,9 +317,28 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
     gpuGuard.emplace();
     gpuTimer_.start(stream_);
-    auto tableWithMetadata = splitReader_->read_chunk();
+    auto tableWithMetadata = [&]() {
+      try {
+        return splitReader_->read_chunk();
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "CudfHiveDataSource::next read_chunk failed: "
+                   << e.what()
+                   << ", split=" << split_->filePath
+                   << ", targetBytes=" << succinctBytes(targetBytes)
+                   << ", " << gpuMemorySnapshotString();
+        throw;
+      }
+    }();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
+    lastTableBytes = estimateTableBytes(cudfTable);
+    if (debugEnabled) {
+      LOG(INFO) << "CudfHiveDataSource::next post-read: rows="
+                << (cudfTable ? cudfTable->num_rows() : 0)
+                << ", tableBytes=" << succinctBytes(lastTableBytes)
+                << ", targetBytes=" << succinctBytes(targetBytes)
+                << ", " << gpuMemorySnapshotString();
+    }
   } else {
     // Chunked experimental reader: process row groups in batches.
     // Loops across coalesced files when the current file is exhausted.
@@ -304,8 +353,27 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       }
 
       if (exptNextRGIndex_ < exptFilteredRowGroups_.size()) {
-        cudfTable = readNextExperimentalBatch(metadata);
+        cudfTable = [&]() {
+          try {
+            return readNextExperimentalBatch(metadata);
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "CudfHiveDataSource::next experimental batch failed: "
+                       << e.what()
+                       << ", split=" << split_->filePath
+                       << ", targetBytes=" << succinctBytes(targetBytes)
+                       << ", " << gpuMemorySnapshotString();
+            throw;
+          }
+        }();
         if (cudfTable && cudfTable->num_rows() > 0) {
+          lastTableBytes = estimateTableBytes(cudfTable);
+          if (debugEnabled) {
+            LOG(INFO) << "CudfHiveDataSource::next experimental post-read: rows="
+                      << cudfTable->num_rows()
+                      << ", tableBytes=" << succinctBytes(lastTableBytes)
+                      << ", targetBytes=" << succinctBytes(targetBytes)
+                      << ", " << gpuMemorySnapshotString();
+          }
           break;
         }
       }
@@ -330,27 +398,44 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Apply remaining filter if present
   if (remainingFilterExprSet_) {
     MicrosecondTimer filterTimer(&filterTimeUs);
-    auto cudfTableColumns = cudfTable->release();
-    const auto originalNumColumns = cudfTableColumns.size();
-    // Filter may need addtional computed columns which are added to
-    // cudfTableColumns
-    auto filterResult = cudfExpressionEvaluator_->eval(
-        cudfTableColumns, stream_, cudf::get_current_device_resource_ref());
-    // discard computed columns
-    std::vector<std::unique_ptr<cudf::column>> originalColumns;
-    originalColumns.reserve(originalNumColumns);
-    std::move(
-        cudfTableColumns.begin(),
-        cudfTableColumns.begin() + originalNumColumns,
-        std::back_inserter(originalColumns));
-    auto originalTable =
-        std::make_unique<cudf::table>(std::move(originalColumns));
-    // Keep only rows where the filter is true
-    cudfTable = cudf::apply_boolean_mask(
-        *originalTable,
-        asView(filterResult),
-        stream_,
-        cudf::get_current_device_resource_ref());
+    try {
+      auto cudfTableColumns = cudfTable->release();
+      const auto originalNumColumns = cudfTableColumns.size();
+      // Filter may need addtional computed columns which are added to
+      // cudfTableColumns
+      auto filterResult = cudfExpressionEvaluator_->eval(
+          cudfTableColumns, stream_, cudf::get_current_device_resource_ref());
+      // discard computed columns
+      std::vector<std::unique_ptr<cudf::column>> originalColumns;
+      originalColumns.reserve(originalNumColumns);
+      std::move(
+          cudfTableColumns.begin(),
+          cudfTableColumns.begin() + originalNumColumns,
+          std::back_inserter(originalColumns));
+      auto originalTable =
+          std::make_unique<cudf::table>(std::move(originalColumns));
+      // Keep only rows where the filter is true
+      cudfTable = cudf::apply_boolean_mask(
+          *originalTable,
+          asView(filterResult),
+          stream_,
+          cudf::get_current_device_resource_ref());
+      lastFilteredBytes = estimateTableBytes(cudfTable);
+      if (debugEnabled) {
+        LOG(INFO) << "CudfHiveDataSource::next post-filter: rows="
+                  << (cudfTable ? cudfTable->num_rows() : 0)
+                  << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
+                  << ", preFilterBytes=" << succinctBytes(lastTableBytes)
+                  << ", " << gpuMemorySnapshotString();
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "CudfHiveDataSource::next filter failed: " << e.what()
+                 << ", split=" << split_->filePath
+                 << ", preFilterBytes=" << succinctBytes(lastTableBytes)
+                 << ", targetBytes=" << succinctBytes(targetBytes)
+                 << ", " << gpuMemorySnapshotString();
+      throw;
+    }
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
