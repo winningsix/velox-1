@@ -23,10 +23,27 @@ void unlockGpu();
 
 namespace facebook::velox::cudf_velox {
 
-/// RAII guard that limits concurrent GPU usage across Velox pipeline tasks.
-/// Forwards to gluten::lockGpu / unlockGpu which are ref-counted per thread.
+/// Pipeline-level GPU region — thread-local boolean.
+///
+/// beginGpuRegion() is idempotent: first call acquires the semaphore,
+/// subsequent calls are no-ops. endGpuRegion() releases once.
+/// This lets the semaphore span an entire pipeline iteration [H2D, D2H]
+/// even when accumulating operators cause the source to be called N times
+/// before the sink produces output.
+void beginGpuRegion();
+void endGpuRegion();
+bool isInGpuRegion();
+
+/// RAII guard for GPU work. Automatically starts a GPU region on
+/// construction (idempotent — only the first GpuGuard in a pipeline
+/// iteration actually acquires the semaphore). The nested lockGpu/unlockGpu
+/// keeps refcount > 0 so the semaphore is never released between operators.
+///
+/// The region is ended explicitly by calling endGpuRegion() at D2H points
+/// (CudfToVelox, HashJoinBuild::addInput, etc.), NOT by ~GpuGuard.
 struct GpuGuard {
   GpuGuard() {
+    beginGpuRegion();
     gluten::lockGpu();
   }
   ~GpuGuard() {
@@ -35,24 +52,5 @@ struct GpuGuard {
   GpuGuard(const GpuGuard&) = delete;
   GpuGuard& operator=(const GpuGuard&) = delete;
 };
-
-/// Pipeline-level GPU region using thread-local state.
-///
-/// A GPU region brackets a contiguous sequence of GPU work across multiple
-/// operators within one pipeline iteration. It exploits the existing
-/// thread-local ref-counting in lockGpu/unlockGpu: beginGpuRegion() bumps
-/// the refcount, so all nested GpuGuard acquisitions become free (refcount
-/// 1→2→1→2→1). The actual semaphore is never released between operators.
-///
-/// Usage pattern:
-///   Source operator (after I/O, before H2D): beginGpuRegion()
-///   Intermediate operators: GpuGuard as usual (nested, no-op on semaphore)
-///   Sink / D2H point: endGpuRegion()
-///
-/// This gives the Spark-Rapids scope: [H2D acquire, D2H release] without
-/// holding the lock during I/O at either end.
-void beginGpuRegion();
-void endGpuRegion();
-bool isInGpuRegion();
 
 } // namespace facebook::velox::cudf_velox

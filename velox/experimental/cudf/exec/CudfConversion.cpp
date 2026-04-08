@@ -197,8 +197,6 @@ RowVectorPtr CudfFromVelox::getOutput() {
     return nullptr;
   }
 
-  // All early returns passed — begin GPU region before actual H2D work.
-  beginGpuRegion();
   GpuGuard gpuGuard;
 
   auto stream = cudfGlobalStreamPool().get_stream();

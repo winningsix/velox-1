@@ -58,7 +58,6 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-using cudf_velox::beginGpuRegion;
 using cudf_velox::endGpuRegion;
 using cudf_velox::GpuGuard;
 
@@ -228,7 +227,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       const auto effectiveTarget = (targetBytes > 0)
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
-      beginGpuRegion();
       GpuGuard coalescedGpuGuard;
       gpuTimer_.start(stream_);
       auto coalesceLoopStartUs = getCurrentTimeMicro();
@@ -287,7 +285,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     if (not splitReader_->has_next()) {
       return nullptr;
     }
-    beginGpuRegion();
     gpuGuard.emplace();
     gpuTimer_.start(stream_);
     auto tableWithMetadata = splitReader_->read_chunk();
@@ -299,7 +296,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     VELOX_CHECK_NOT_NULL(
         exptSplitReader_, "Experimental cudf split reader not present");
 
-    beginGpuRegion();
     gpuGuard.emplace();
     gpuTimer_.start(stream_);
     while (true) {
