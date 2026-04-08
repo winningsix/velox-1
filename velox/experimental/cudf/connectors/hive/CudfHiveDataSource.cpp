@@ -216,7 +216,7 @@ FilterEstimate estimateFilterSelectivity(
     return {1.0, "no-stats"};
   }
 
-  if (!dwio::common::testFilter(
+  if (!common::testFilter(
           &filter,
           const_cast<dwio::common::ColumnStatistics*>(stats),
           totalRows,
@@ -862,7 +862,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                             << succinctBytes(lastFilteredBytes)
                             << ", targetBytes="
                             << succinctBytes(effectiveTarget)
-                            << ", " << gpuMemorySnapshotString();
+                            << ", "
+                            << gpuMemoryBreakdownString(accumulatedBytes_);
                 }
                 break;
               }
@@ -876,7 +877,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                      << ", preFilterBytes=" << succinctBytes(lastTableBytes)
                      << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
                      << ", targetBytes=" << succinctBytes(effectiveTarget)
-                     << ", " << gpuMemorySnapshotString();
+                     << ", "
+                     << gpuMemoryBreakdownString(accumulatedBytes_);
           throw;
         }
       }
@@ -912,7 +914,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                    << e.what()
                    << ", split=" << split_->filePath
                    << ", targetBytes=" << succinctBytes(targetBytes)
-                   << ", " << gpuMemorySnapshotString();
+                   << ", " << gpuMemoryBreakdownString(0);
         throw;
       }
     }();
@@ -924,7 +926,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                 << (cudfTable ? cudfTable->num_rows() : 0)
                 << ", tableBytes=" << succinctBytes(lastTableBytes)
                 << ", targetBytes=" << succinctBytes(targetBytes)
-                << ", " << gpuMemorySnapshotString();
+                << ", " << gpuMemoryBreakdownString(lastTableBytes);
     }
   } else {
     // Chunked experimental reader: process row groups in batches.
@@ -948,7 +950,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                        << e.what()
                        << ", split=" << split_->filePath
                        << ", targetBytes=" << succinctBytes(targetBytes)
-                       << ", " << gpuMemorySnapshotString();
+                       << ", " << gpuMemoryBreakdownString(0);
             throw;
           }
         }();
@@ -959,7 +961,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                       << cudfTable->num_rows()
                       << ", tableBytes=" << succinctBytes(lastTableBytes)
                       << ", targetBytes=" << succinctBytes(targetBytes)
-                      << ", " << gpuMemorySnapshotString();
+                      << ", " << gpuMemoryBreakdownString(lastTableBytes);
           }
           break;
         }
@@ -1013,14 +1015,14 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                   << (cudfTable ? cudfTable->num_rows() : 0)
                   << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
                   << ", preFilterBytes=" << succinctBytes(lastTableBytes)
-                  << ", " << gpuMemorySnapshotString();
+                  << ", " << gpuMemoryBreakdownString(lastFilteredBytes);
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "CudfHiveDataSource::next filter failed: " << e.what()
                  << ", split=" << split_->filePath
                  << ", preFilterBytes=" << succinctBytes(lastTableBytes)
                  << ", targetBytes=" << succinctBytes(targetBytes)
-                 << ", " << gpuMemorySnapshotString();
+                 << ", " << gpuMemoryBreakdownString(lastTableBytes);
       throw;
     }
   }

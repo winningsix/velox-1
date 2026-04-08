@@ -105,6 +105,10 @@ getConcatenatedTableBatched(
 /// This reflects actual device pressure and complements table-size estimates.
 [[nodiscard]] std::string gpuMemorySnapshotString();
 
+/// Returns a snapshot that combines actual device pressure with allocator-side
+/// live / retained proxies for a known visible payload.
+[[nodiscard]] std::string gpuMemoryBreakdownString(uint64_t visiblePayloadBytes);
+
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.
  *

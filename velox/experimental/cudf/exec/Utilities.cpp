@@ -48,9 +48,15 @@
 #include <sstream>
 #include <string_view>
 
+namespace gluten {
+std::string gpuMemoryTrackerBreakdownString(uint64_t visiblePayloadBytes)
+    __attribute__((weak));
+}
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
 /// \brief Makes a cuda resource
 [[nodiscard]] auto makeCudaMr() {
   return std::make_shared<rmm::mr::cuda_memory_resource>();
@@ -203,6 +209,19 @@ std::string gpuMemorySnapshotString() {
   out << "gpuMem{free=" << succinctBytes(freeMem)
       << ", used=" << succinctBytes(usedMem)
       << ", total=" << succinctBytes(totalMem) << "}";
+  return out.str();
+}
+
+std::string gpuMemoryBreakdownString(uint64_t visiblePayloadBytes) {
+  std::ostringstream out;
+  out << gpuMemorySnapshotString();
+  if (gluten::gpuMemoryTrackerBreakdownString != nullptr) {
+    auto trackerBreakdown =
+        gluten::gpuMemoryTrackerBreakdownString(visiblePayloadBytes);
+    if (!trackerBreakdown.empty()) {
+      out << ", " << trackerBreakdown;
+    }
+  }
   return out.str();
 }
 
