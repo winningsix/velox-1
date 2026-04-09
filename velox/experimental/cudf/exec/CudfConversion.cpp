@@ -288,6 +288,16 @@ std::optional<uint64_t> CudfToVelox::averageRowSize() {
 RowVectorPtr CudfToVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
+  // Ensure endGpuRegion() is called on ALL exit paths, including
+  // exceptions from toVeloxColumn() or getConcatenatedTable().
+  // Without this, an exception bypasses explicit endGpuRegion() calls,
+  // ~GpuGuard only calls unlockGpu() (not endGpuRegion()), and the
+  // leaked gpuRegionActive=true causes per-operator permit churn that
+  // deadlocks under contention. endGpuRegion() is idempotent so the
+  // double-call on normal paths is harmless.
+  SCOPE_EXIT {
+    endGpuRegion();
+  };
   std::cerr << "GPU_MEM_SNAPSHOT [CudfToVelox-D2H] "
                << gpuMemorySnapshotString()
                << " inputs=" << inputs_.size()
