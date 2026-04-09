@@ -241,8 +241,12 @@ std::unique_ptr<cudf::table> concatenateTables(
       tables.end(),
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
-  return cudf::concatenate(
+  auto result = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
+  // Sync before source tables go out of scope — cudf::concatenate reads
+  // from tableViews asynchronously, and RMM pool deallocate is immediate.
+  stream.synchronize();
+  return result;
 }
 
 std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {

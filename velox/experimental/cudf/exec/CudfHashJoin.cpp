@@ -17,14 +17,12 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
-#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
-#include "velox/common/base/SuccinctPrinter.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/type/TypeUtil.h"
@@ -33,7 +31,6 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
-#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
@@ -52,8 +49,6 @@
 #include <rmm/exec_policy.hpp>
 
 #include <nvtx3/nvtx3.hpp>
-
-#include <iostream>
 
 namespace facebook::velox::cudf_velox {
 
@@ -76,172 +71,54 @@ void CudfHashJoinProbe::close() {
   accumulatedProbeBytes_ = 0;
 }
 
-void CudfHashJoinProbe::buildHashTable() {
-  VELOX_CHECK(buildBatches_.has_value());
-  VELOX_CHECK(!hashObject_.has_value());
-  VELOX_NVTX_OPERATOR_FUNC_RANGE();
-
-  auto& hostBatches = buildBatches_.value();
-  auto buildType = joinNode_->sources()[1]->outputType();
-
-  if (hostBatches.empty()) {
-    std::vector<std::unique_ptr<cudf::column>> emptyCols;
-    for (int i = 0; i < buildType->size(); ++i) {
-      auto cudfType = cudf::data_type{veloxToCudfTypeId(buildType->childAt(i))};
-      emptyCols.push_back(cudf::make_empty_column(cudfType));
-    }
-    auto emptyTbl = std::make_unique<cudf::table>(std::move(emptyCols));
-    std::vector<std::shared_ptr<cudf::table>> emptyTbls;
-    emptyTbls.push_back(std::move(emptyTbl));
-    std::vector<std::shared_ptr<cudf::hash_join>> emptyHashObjs;
-    emptyHashObjs.push_back(nullptr);
-    hashObject_ = std::make_pair(
-        std::move(emptyTbls), std::move(emptyHashObjs));
-    buildBatches_.reset();
-    return;
-  }
-
-  auto stream = cudfGlobalStreamPool().get_stream();
-  buildStream_ = stream;
-
-  size_t totalHostBytes = 0;
-  for (auto& hb : hostBatches) {
-    totalHostBytes += hb.data->size();
-  }
-  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-pre-H2D] "
-               << gpuMemorySnapshotString()
-               << " hostBatches=" << hostBatches.size()
-               << " totalHostBytes=" << succinctBytes(totalHostBytes)
-               << std::endl;
-
+void CudfHashJoinBridge::setHashTable(
+    std::optional<CudfHashJoinBridge::hash_type> hashObject) {
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "CudfHashJoinProbe::buildHashTable hostBatches="
-            << hostBatches.size();
+    VLOG(2) << "Calling CudfHashJoinBridge::setHashTable";
   }
-
-  // H2D: copy each host-pinned batch back to GPU and reconstruct CudfVectors.
-  std::vector<CudfVectorPtr> gpuBatches;
-  gpuBatches.reserve(hostBatches.size());
-  for (auto& hb : hostBatches) {
-    rmm::device_buffer devBuf(hb.data->size(), stream);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-        devBuf.data(),
-        hb.data->data(),
-        hb.data->size(),
-        cudaMemcpyHostToDevice,
-        stream.value()));
-    auto metadata = std::make_unique<std::vector<uint8_t>>(
-        std::move(hb.metadata));
-    cudf::packed_columns pc{std::move(metadata),
-                            std::make_unique<rmm::device_buffer>(
-                                std::move(devBuf))};
-    auto unpacked = std::make_unique<cudf::packed_table>(cudf::unpack(pc));
-    auto numRows = hb.numRows;
-    gpuBatches.push_back(std::make_shared<CudfVector>(
-        operatorCtx_->pool(),
-        buildType,
-        numRows,
-        std::move(unpacked),
-        stream));
-  }
-  // Wait for all async H2D copies to complete before freeing the source
-  // pinned host buffers. Without this, the GPU DMA engine may still be
-  // reading from pinned addresses that the pool reclaims and reuses,
-  // causing SEGV_ACCERR in cudaMemcpyAsync on Blackwell GPUs.
-  stream.synchronize();
-  buildBatches_.reset();
-  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-post-H2D] "
-               << gpuMemorySnapshotString()
-               << " gpuBatches=" << gpuBatches.size()
-               << " (all build data now on GPU, about to concatenate)"
-               << std::endl;
-
-  auto tbls = getConcatenatedTableBatched(gpuBatches, buildType, stream);
-  // Release individual GPU batches immediately — the concatenated tables in
-  // `tbls` own all the data now. Without this, both gpuBatches (~N bytes)
-  // and tbls (~N bytes) coexist on GPU during hash_join construction,
-  // doubling peak memory vs v4 which cleared inputs_ here.
-  gpuBatches.clear();
-
-  for (auto const& tbl : tbls) {
-    VELOX_CHECK_NOT_NULL(tbl);
-  }
-
-  auto rightKeys = joinNode_->rightKeys();
-  auto buildKeyIndices = std::vector<cudf::size_type>(rightKeys.size());
-  for (size_t i = 0; i < buildKeyIndices.size(); i++) {
-    buildKeyIndices[i] = static_cast<cudf::size_type>(
-        buildType->getChildIdx(rightKeys[i]->name()));
-  }
-
-  bool needsHashJoin =
-      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
-       joinNode_->isRightJoin());
-
-  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
-  for (size_t i = 0; i < tbls.size(); i++) {
-    hashObjects.push_back(
-        needsHashJoin ? std::make_shared<cudf::hash_join>(
-                            tbls[i]->view().select(buildKeyIndices),
-                            cudf::null_equality::UNEQUAL,
-                            stream)
-                      : nullptr);
-  }
-
-  std::vector<std::shared_ptr<cudf::table>> shared_tbls;
-  for (auto& tbl : tbls) {
-    shared_tbls.push_back(std::move(tbl));
-  }
-
-  hashObject_ = std::make_pair(
-      std::move(shared_tbls), std::move(hashObjects));
-  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-post-build] "
-               << gpuMemorySnapshotString()
-               << " (hash table built, concatenated tables + hash objects on GPU)"
-               << std::endl;
-
-  // Initialize right-join matched flags under the same GpuGuard.
-  if (joinNode_->isRightJoin()) {
-    auto& rightTables = hashObject_.value().first;
-    rightMatchedFlags_.clear();
-    rightMatchedFlags_.reserve(rightTables.size());
-    for (auto& rt : rightTables) {
-      auto n = rt->num_rows();
-      auto false_scalar = cudf::numeric_scalar<bool>(false, true, stream);
-      auto flags_col = cudf::make_column_from_scalar(
-          false_scalar, n, stream, cudf::get_current_device_resource_ref());
-      rightMatchedFlags_.push_back(std::move(flags_col));
-    }
-  }
-}
-
-void CudfHashJoinBridge::setBuildBatches(
-    std::vector<HostBuildBatch> batches) {
-  VLOG_IF(2, CudfConfig::getInstance().debugEnabled)
-      << "CudfHashJoinBridge::setBuildBatches  batches=" << batches.size();
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     VELOX_CHECK(
-        !buildBatches_.has_value(),
-        "setBuildBatches may be called only once");
-    buildBatches_ = std::move(batches);
+        !hashObject_.has_value(),
+        "CudfHashJoinBridge already has a hash table");
+    hashObject_ = std::move(hashObject);
     promises = std::move(promises_);
   }
   notify(std::move(promises));
 }
 
-std::optional<std::vector<HostBuildBatch>>
-CudfHashJoinBridge::buildBatchesOrFuture(ContinueFuture* future) {
-  VLOG_IF(2, CudfConfig::getInstance().debugEnabled)
-      << "CudfHashJoinBridge::buildBatchesOrFuture";
-  std::lock_guard<std::mutex> l(mutex_);
-  if (buildBatches_.has_value()) {
-    return std::move(buildBatches_);
+std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
+    ContinueFuture* future) {
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
   }
-  promises_.emplace_back("CudfHashJoinBridge::buildBatchesOrFuture");
+  std::lock_guard<std::mutex> l(mutex_);
+  if (hashObject_.has_value()) {
+    return hashObject_;
+  }
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture constructing promise";
+  }
+  promises_.emplace_back("CudfHashJoinBridge::hashOrFuture");
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture getSemiFuture";
+  }
   *future = promises_.back().getSemiFuture();
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning nullopt";
+  }
   return std::nullopt;
+}
+
+void CudfHashJoinBridge::setBuildStream(rmm::cuda_stream_view buildStream) {
+  std::lock_guard<std::mutex> l(mutex_);
+  buildStream_ = buildStream;
+}
+
+std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return buildStream_;
 }
 
 CudfHashJoinBuild::CudfHashJoinBuild(
@@ -269,35 +146,12 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBuild::addInput";
   }
-  if (input->size() == 0) {
-    endGpuRegion();
-    return;
+  // Queue inputs, process all at once.
+  if (input->size() > 0) {
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    inputs_.push_back(std::move(cudfInput));
   }
-  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-  VELOX_CHECK_NOT_NULL(cudfInput);
-
-  auto stream = cudfInput->stream();
-
-  // D2H: pack into contiguous device buffer, copy to pinned host memory.
-  // Runs under the GPU region started by the source operator (scan).
-  auto packed = cudf::pack(cudfInput->getTableView(), stream);
-  auto devSize = packed.gpu_data->size();
-  auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      hostBuf->data(),
-      packed.gpu_data->data(),
-      devSize,
-      cudaMemcpyDeviceToHost,
-      stream.value()));
-  stream.synchronize();
-
-  auto numRows = static_cast<vector_size_t>(cudfInput->size());
-  hostInputs_.push_back(
-      {std::move(*packed.metadata), std::move(hostBuf), numRows});
-
-  // D2H complete — end the GPU region started by the source operator.
-  // All GPU data for this batch is now on host; semaphore released.
-  endGpuRegion();
 }
 
 bool CudfHashJoinBuild::needsInput() const {
@@ -319,36 +173,109 @@ void CudfHashJoinBuild::noMoreInput() {
   Operator::noMoreInput();
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
+  // Only last driver collects all answers.
+  // Do NOT hold GpuGuard here — allPeersFinished may set a future and return,
+  // leaving the semaphore held while waiting for peer drivers.
   if (!operatorCtx_->task()->allPeersFinished(
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
     return;
   }
-  // Collect host-resident batches from all peers (pointer moves, no GPU work).
+  // All peers finished — acquire GPU semaphore for hash table build.
+  GpuGuard gpuGuard;
+  // Collect results from peers
   for (auto& peer : peers) {
     auto op = peer->findOperator(planNodeId());
     auto* build = dynamic_cast<CudfHashJoinBuild*>(op);
     VELOX_CHECK_NOT_NULL(build);
-    hostInputs_.insert(
-        hostInputs_.end(),
-        std::make_move_iterator(build->hostInputs_.begin()),
-        std::make_move_iterator(build->hostInputs_.end()));
+    inputs_.insert(inputs_.end(), build->inputs_.begin(), build->inputs_.end());
   }
 
   SCOPE_EXIT {
+    // Realize the promises so that the other Drivers (which were not
+    // the last to finish) can continue from the barrier and finish.
     peers.clear();
     for (auto& promise : promises) {
       promise.setValue();
     }
   };
 
-  // Pass host-pinned batches to bridge — probe side does H2D + hash table
-  // build lazily under its own GpuGuard. Build pipeline never holds the
-  // GPU semaphore beyond the brief pack+D2H in addInput().
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBuild: build batches";
+    VLOG(1) << "Build batches number of columns: "
+            << inputs_[0]->getTableView().num_columns();
+    for (auto i = 0; i < inputs_.size(); i++) {
+      VLOG(1) << "Build batch " << i
+              << ": number of rows: " << inputs_[i]->getTableView().num_rows();
+    }
+  }
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto tbls = getConcatenatedTableBatched(
+      inputs_, joinNode_->sources()[1]->outputType(), stream);
+  inputs_.clear();
+
+  for (auto const& tbl : tbls) {
+    VELOX_CHECK_NOT_NULL(tbl);
+  }
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
+    for (auto i = 0; i < tbls.size(); i++) {
+      VLOG(1) << "Build table " << i
+              << ": number of rows: " << tbls[i]->num_rows();
+    }
+  }
+
+  auto buildType = joinNode_->sources()[1]->outputType();
+  auto rightKeys = joinNode_->rightKeys();
+
+  auto buildKeyIndices = std::vector<cudf::size_type>(rightKeys.size());
+  for (size_t i = 0; i < buildKeyIndices.size(); i++) {
+    buildKeyIndices[i] = static_cast<cudf::size_type>(
+        buildType->getChildIdx(rightKeys[i]->name()));
+  }
+
+  // Only need to construct hash_join object if it's an inner join, left join or
+  // right join.
+  // All other cases use a standalone function in cudf
+  bool buildHashJoin =
+      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+       joinNode_->isRightJoin());
+
+  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  for (auto i = 0; i < tbls.size(); i++) {
+    hashObjects.push_back(
+        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
+                              tbls[i]->view().select(buildKeyIndices),
+                              cudf::null_equality::UNEQUAL,
+                              stream)
+                        : nullptr);
+    if (buildHashJoin) {
+      VELOX_CHECK_NOT_NULL(hashObjects.back());
+    }
+    if (CudfConfig::getInstance().debugEnabled) {
+      if (hashObjects.back() != nullptr) {
+        VLOG(2) << "hashObject " << i << " is not nullptr "
+                << hashObjects.back().get() << "\n";
+      } else {
+        VLOG(2) << "hashObject " << i << " is *** nullptr\n";
+      }
+    }
+  }
+
+  std::vector<std::shared_ptr<cudf::table>> shared_tbls;
+  for (auto& tbl : tbls) {
+    shared_tbls.push_back(std::move(tbl));
+  }
+  // set hash table to CudfHashJoinBridge
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-  cudfHashJoinBridge->setBuildBatches(std::move(hostInputs_));
+
+  cudfHashJoinBridge->setBuildStream(stream);
+  cudfHashJoinBridge->setHashTable(
+      std::make_optional(
+          std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -1193,11 +1120,12 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
-  if (finished_) {
-    return nullptr;
-  }
-  // Need either a built hash table or pending build batches.
-  if (!hashObject_.has_value() && !buildBatches_.has_value()) {
+  // GpuGuard is NOT acquired here — it was the root cause of the Q21
+  // deadlock (semaphore held while waiting for shuffle I/O data from
+  // other tasks that themselves need the semaphore for H2D). The guard
+  // is acquired below, only after data is confirmed ready for GPU work.
+
+  if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
 
@@ -1250,7 +1178,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   if (!input_) {
     // If no more input, emit unmatched-right rows if needed.
     if (joinNode_->isRightJoin() && noMoreInput_ && !finished_ &&
-        isLastDriver_ && hashObject_.has_value()) {
+        isLastDriver_) {
       GpuGuard gpuGuard;
       auto& rightTables = hashObject_.value().first;
       auto stream = cudfGlobalStreamPool().get_stream();
@@ -1262,6 +1190,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           continue;
         }
         auto& flags = rightMatchedFlags_[i];
+        // Build a boolean mask: unmatched = NOT(flags)
         auto boolMask = cudf::unary_operation(
             flags->view(), cudf::unary_operator::NOT, stream);
 
@@ -1273,7 +1202,10 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         if (m == 0) {
           continue;
         }
+        // Build left null columns
         std::vector<std::unique_ptr<cudf::column>> outCols(outputType_->size());
+        // Left side nulls (types derive from probe schema at the matching
+        // channel indices)
         auto probeType = joinNode_->sources()[0]->outputType();
         for (int li = 0; li < leftColumnOutputIndices_.size(); ++li) {
           auto outIdx = leftColumnOutputIndices_[li];
@@ -1285,6 +1217,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           outCols[outIdx] = cudf::make_column_from_scalar(
               *nullScalar, m, stream, cudf::get_current_device_resource_ref());
         }
+        // Right side
         auto rightCols = unmatchedRight->release();
         for (int ri = 0; ri < rightColumnOutputIndices_.size(); ++ri) {
           auto outIdx = rightColumnOutputIndices_[ri];
@@ -1311,15 +1244,10 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     return nullptr;
   }
 
-  // Both build and probe data are ready — acquire GPU lock NOW.
-  // Lock is per-batch: held only during actual GPU compute, released when
-  // getOutput() returns. Never held while waiting for I/O.
+  // Acquire GPU semaphore now — data is ready, actual GPU join work begins.
+  // This is the Spark Rapids-style pattern: acquire before GPU compute,
+  // hold through the entire join kernel, release when getOutput() returns.
   GpuGuard gpuGuard;
-
-  // Build hash table lazily on first batch (under the same lock as probe).
-  if (!hashObject_.has_value()) {
-    buildHashTable();
-  }
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
@@ -1414,7 +1342,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kWaitForJoinProbe;
   }
 
-  if (hashObject_.has_value() || buildBatches_.has_value()) {
+  if (hashObject_.has_value()) {
     return exec::BlockingReason::kNotBlocked;
   }
 
@@ -1424,21 +1352,36 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(cudfJoinBridge);
   VELOX_CHECK_NOT_NULL(future);
-  auto batches = cudfJoinBridge->buildBatchesOrFuture(future);
+  auto hashObject = cudfJoinBridge->hashOrFuture(future);
 
-  if (!batches.has_value()) {
-    VLOG_IF(2, CudfConfig::getInstance().debugEnabled)
-        << "CudfHashJoinProbe is blocked, waiting for join build";
+  if (!hashObject.has_value()) {
+    if (CudfConfig::getInstance().debugEnabled) {
+      VLOG(2) << "CudfHashJoinProbe is blocked, waiting for join build";
+    }
     return exec::BlockingReason::kWaitForJoinBuild;
   }
-  buildBatches_ = std::move(batches);
+  hashObject_ = std::move(hashObject);
+  buildStream_ = cudfJoinBridge->getBuildStream();
 
-  // Detect empty build from raw batch row counts (no GPU work needed).
-  int64_t totalBuildRows = 0;
-  for (auto& batch : buildBatches_.value()) {
-    totalBuildRows += batch.numRows;
+  // Lazy initialize matched flags only when build side is done
+  if (joinNode_->isRightJoin()) {
+    auto& rightTablesInit = hashObject_.value().first;
+    rightMatchedFlags_.clear();
+    rightMatchedFlags_.reserve(rightTablesInit.size());
+    auto initStream = cudfGlobalStreamPool().get_stream();
+    for (auto& rt : rightTablesInit) {
+      auto n = rt->num_rows();
+      auto false_scalar = cudf::numeric_scalar<bool>(false, true, initStream);
+      auto flags_col = cudf::make_column_from_scalar(
+          false_scalar, n, initStream, cudf::get_current_device_resource_ref());
+      rightMatchedFlags_.push_back(std::move(flags_col));
+    }
+    initStream.synchronize();
   }
-  if (totalBuildRows == 0) {
+  auto& rightTables = hashObject_.value().first;
+  // should be rightTable->numDistinct() but it needs compute,
+  // so we use num_rows()
+  if (rightTables[0]->num_rows() == 0) {
     if (skipProbeOnEmptyBuild()) {
       if (operatorCtx_->driverCtx()
               ->queryConfig()
@@ -1449,7 +1392,6 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       }
     }
   }
-
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) &&
       future_.valid()) {
     *future = std::move(future_);
@@ -1462,9 +1404,9 @@ bool CudfHashJoinProbe::isFinished() {
   auto const isFinished = finished_ ||
       (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty());
 
+  // Release hashObject_ if finished
   if (isFinished) {
     hashObject_.reset();
-    buildBatches_.reset();
   }
   return isFinished;
 }

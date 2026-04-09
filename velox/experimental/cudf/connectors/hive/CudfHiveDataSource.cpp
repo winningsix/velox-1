@@ -30,22 +30,17 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/caching/CacheTTLController.h"
-#include "velox/common/base/Exceptions.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveConnectorUtil.h"
 #include "velox/connectors/hive/TableHandle.h"
-#include "velox/dwio/common/ScanSpec.h"
-#include "velox/dwio/parquet/reader/Metadata.h"
-#include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
 #include "velox/expression/FieldReference.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/io/types.hpp>
@@ -56,602 +51,17 @@
 
 #include <cuda_runtime.h>
 
-#include <thrift/protocol/TCompactProtocol.h>
-#include <thrift/transport/TBufferTransports.h>
-
-#include <algorithm>
-#include <cmath>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-using cudf_velox::endGpuRegion;
 using cudf_velox::GpuGuard;
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
-
-namespace {
-
-namespace pqthrift = facebook::velox::parquet::thrift;
-
-struct FilterEstimate {
-  double selectivity{1.0};
-  std::string note{"unknown"};
-};
-
-struct RowGroupBudgetEstimate {
-  int rowGroupIndex{0};
-  int64_t rows{0};
-  int64_t compressedBytes{0};
-  int64_t uncompressedBytes{0};
-  double pushdownSelectivity{1.0};
-  uint64_t postReadBytes{0};
-  uint64_t predictedPeakBytes{0};
-  std::string notes;
-};
-
-double clamp01(double value) {
-  return std::max(0.0, std::min(1.0, value));
-}
-
-std::string topLevelColumnName(const std::vector<std::string>& pathInSchema) {
-  return pathInSchema.empty() ? "" : pathInSchema.front();
-}
-
-uint64_t filterMaskBytesEstimate(int64_t rows) {
-  if (rows <= 0) {
-    return 0;
-  }
-  return static_cast<uint64_t>(rows) +
-      cudf::bitmask_allocation_size_bytes(rows);
-}
-
-RowTypePtr buildScanBudgetType(
-    const std::shared_ptr<const hive::HiveTableHandle>& tableHandle,
-    const RowTypePtr& fallbackType,
-    const std::vector<std::string>& readColumnNames) {
-  if (!tableHandle || !tableHandle->dataColumns()) {
-    return fallbackType;
-  }
-
-  std::vector<std::string> names;
-  std::vector<TypePtr> types;
-  names.reserve(readColumnNames.size());
-  types.reserve(readColumnNames.size());
-  for (const auto& name : readColumnNames) {
-    auto parsedType = tableHandle->dataColumns()->findChild(name);
-    if (!parsedType) {
-      continue;
-    }
-    names.push_back(name);
-    types.push_back(parsedType);
-  }
-  return names.empty() ? fallbackType : ROW(std::move(names), std::move(types));
-}
-
-pqthrift::FileMetaData parseParquetFooterMetadata(
-    cudf::io::datasource* dataSource) {
-  VELOX_CHECK_NOT_NULL(dataSource, "Null datasource for footer metadata");
-
-  using namespace cudf::io::parquet;
-  constexpr auto headerLen = sizeof(file_header_s);
-  constexpr auto enderLen = sizeof(file_ender_s);
-  constexpr uint32_t parquetMagic =
-      (('P' << 0) | ('A' << 8) | ('R' << 16) | ('1' << 24));
-
-  const size_t len = dataSource->size();
-  VELOX_CHECK_GT(len, headerLen + enderLen, "Incorrect data source");
-
-  const auto headerBuffer = dataSource->host_read(0, headerLen);
-  const auto enderBuffer = dataSource->host_read(len - enderLen, enderLen);
-  const auto header =
-      reinterpret_cast<const file_header_s*>(headerBuffer->data());
-  const auto ender =
-      reinterpret_cast<const file_ender_s*>(enderBuffer->data());
-  VELOX_CHECK(
-      header->magic == parquetMagic && ender->magic == parquetMagic,
-      "Corrupted header or footer");
-  VELOX_CHECK(
-      ender->footer_len != 0 &&
-          ender->footer_len <= (len - headerLen - enderLen),
-      "Incorrect footer length");
-
-  auto footerBuffer = dataSource->host_read(
-      len - ender->footer_len - enderLen, ender->footer_len);
-  pqthrift::FileMetaData metadata;
-  auto transport =
-      std::make_shared<apache::thrift::transport::TMemoryBuffer>(
-          const_cast<uint8_t*>(footerBuffer->data()),
-          static_cast<uint32_t>(ender->footer_len),
-          apache::thrift::transport::TMemoryBuffer::OBSERVE);
-  apache::thrift::protocol::TCompactProtocolT<
-      apache::thrift::transport::TMemoryBuffer>
-      protocol(transport);
-  metadata.read(&protocol);
-  return metadata;
-}
-
-std::pair<double, double> nullAndNonNullFractions(
-    const dwio::common::ColumnStatistics* stats,
-    uint64_t totalRows) {
-  if (!stats || totalRows == 0) {
-    return {0.0, 1.0};
-  }
-
-  if (auto valueCount = stats->getNumberOfValues(); valueCount.has_value()) {
-    const auto nonNullCount =
-        std::min<uint64_t>(valueCount.value(), totalRows);
-    const double nonNullFraction =
-        static_cast<double>(nonNullCount) / static_cast<double>(totalRows);
-    return {1.0 - nonNullFraction, nonNullFraction};
-  }
-  return {0.0, 1.0};
-}
-
-double finalizeNonNullSelectivity(
-    double nonNullSelectivity,
-    const common::Filter& filter,
-    double nullFraction,
-    double nonNullFraction) {
-  auto result = clamp01(nonNullSelectivity) * nonNullFraction;
-  if (filter.testNull()) {
-    result = clamp01(result + nullFraction);
-  }
-  return clamp01(result);
-}
-
-FilterEstimate estimateFilterSelectivity(
-    const common::Filter& filter,
-    const dwio::common::ColumnStatistics* stats,
-    uint64_t totalRows,
-    const TypePtr& type) {
-  if (!stats || totalRows == 0) {
-    return {1.0, "no-stats"};
-  }
-
-  if (!common::testFilter(
-          &filter,
-          const_cast<dwio::common::ColumnStatistics*>(stats),
-          totalRows,
-          type)) {
-    return {0.0, "stats-pruned"};
-  }
-
-  const auto [nullFraction, nonNullFraction] =
-      nullAndNonNullFractions(stats, totalRows);
-
-  switch (filter.kind()) {
-    case common::FilterKind::kIsNull:
-      return {nullFraction > 0 ? nullFraction : 0.0, "is-null"};
-    case common::FilterKind::kIsNotNull:
-      return {nonNullFraction, "is-not-null"};
-    case common::FilterKind::kBoolValue: {
-      auto* boolStats =
-          dynamic_cast<const dwio::common::BooleanColumnStatistics*>(stats);
-      auto* boolFilter = dynamic_cast<const common::BoolValue*>(&filter);
-      if (boolStats && boolFilter) {
-        if (auto trueCount = boolStats->getTrueCount();
-            trueCount.has_value()) {
-          const auto matched = boolFilter->testBool(true)
-              ? trueCount.value()
-              : boolStats->getFalseCount().value_or(0);
-          return {
-              clamp01(
-                  static_cast<double>(matched) /
-                  static_cast<double>(totalRows)),
-              "bool-counts"};
-        }
-      }
-      return {0.5, "bool-heuristic"};
-    }
-    case common::FilterKind::kBigintRange: {
-      auto* intStats =
-          dynamic_cast<const dwio::common::IntegerColumnStatistics*>(stats);
-      auto* range = dynamic_cast<const common::BigintRange*>(&filter);
-      if (intStats && range && intStats->getMinimum() && intStats->getMaximum()) {
-        const auto statsMin = intStats->getMinimum().value();
-        const auto statsMax = intStats->getMaximum().value();
-        if (statsMin == statsMax) {
-          const double nonNullSel = range->testInt64(statsMin) ? 1.0 : 0.0;
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "int-const"};
-        }
-        const auto overlapLow = std::max<int64_t>(statsMin, range->lower());
-        const auto overlapHigh = std::min<int64_t>(statsMax, range->upper());
-        if (overlapHigh < overlapLow) {
-          return {0.0, "int-disjoint"};
-        }
-        const long double statsSpan =
-            static_cast<long double>(statsMax) -
-            static_cast<long double>(statsMin) + 1.0L;
-        const long double overlapSpan =
-            static_cast<long double>(overlapHigh) -
-            static_cast<long double>(overlapLow) + 1.0L;
-        const double nonNullSel =
-            statsSpan > 0 ? static_cast<double>(overlapSpan / statsSpan) : 1.0;
-        return {
-            finalizeNonNullSelectivity(
-                nonNullSel, filter, nullFraction, nonNullFraction),
-            "int-range"};
-      }
-      return {1.0, "int-no-minmax"};
-    }
-    case common::FilterKind::kBigintValuesUsingBitmask: {
-      auto* intStats =
-          dynamic_cast<const dwio::common::IntegerColumnStatistics*>(stats);
-      auto* valuesFilter =
-          dynamic_cast<const common::BigintValuesUsingBitmask*>(&filter);
-      if (intStats && valuesFilter && intStats->getMinimum() &&
-          intStats->getMaximum()) {
-        const auto statsMin = intStats->getMinimum().value();
-        const auto statsMax = intStats->getMaximum().value();
-        if (statsMin == statsMax) {
-          const double nonNullSel = valuesFilter->testInt64(statsMin) ? 1.0 : 0.0;
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "int-set-const"};
-        }
-        size_t matches = 0;
-        for (const auto& value : valuesFilter->values()) {
-          if (value >= statsMin && value <= statsMax) {
-            ++matches;
-          }
-        }
-        if (matches == 0) {
-          return {0.0, "int-set-disjoint"};
-        }
-        const long double statsSpan =
-            static_cast<long double>(statsMax) -
-            static_cast<long double>(statsMin) + 1.0L;
-        const double nonNullSel = std::max(
-            static_cast<double>(1.0L / std::max<long double>(1.0L, statsSpan)),
-            static_cast<double>(matches / std::max<long double>(1.0L, statsSpan)));
-        return {
-            finalizeNonNullSelectivity(
-                nonNullSel, filter, nullFraction, nonNullFraction),
-            "int-set"};
-      }
-      return {1.0, "int-set-no-minmax"};
-    }
-    case common::FilterKind::kDoubleRange:
-    case common::FilterKind::kFloatRange: {
-      auto* doubleStats =
-          dynamic_cast<const dwio::common::DoubleColumnStatistics*>(stats);
-      auto* range = dynamic_cast<const common::AbstractRange*>(&filter);
-      if (doubleStats && range && doubleStats->getMinimum() &&
-          doubleStats->getMaximum()) {
-        const auto statsMin = doubleStats->getMinimum().value();
-        const auto statsMax = doubleStats->getMaximum().value();
-        if (statsMin == statsMax) {
-          const double nonNullSel = filter.testDouble(statsMin) ? 1.0 : 0.0;
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "fp-const"};
-        }
-        double lower = std::numeric_limits<double>::lowest();
-        double upper = std::numeric_limits<double>::max();
-        if (!range->lowerUnbounded()) {
-          if (auto* doubleRange =
-                  dynamic_cast<const common::FloatingPointRange<double>*>(
-                      &filter)) {
-            lower = doubleRange->lower();
-          } else if (
-              auto* floatRange =
-                  dynamic_cast<const common::FloatingPointRange<float>*>(
-                      &filter)) {
-            lower = floatRange->lower();
-          }
-        }
-        if (!range->upperUnbounded()) {
-          if (auto* doubleRange =
-                  dynamic_cast<const common::FloatingPointRange<double>*>(
-                      &filter)) {
-            upper = doubleRange->upper();
-          } else if (
-              auto* floatRange =
-                  dynamic_cast<const common::FloatingPointRange<float>*>(
-                      &filter)) {
-            upper = floatRange->upper();
-          }
-        }
-        const auto overlapLow = std::max(statsMin, lower);
-        const auto overlapHigh = std::min(statsMax, upper);
-        if (overlapHigh < overlapLow) {
-          return {0.0, "fp-disjoint"};
-        }
-        const auto statsSpan = std::max(statsMax - statsMin, 1e-12);
-        const auto overlapSpan = std::max(overlapHigh - overlapLow, 0.0);
-        const double nonNullSel = clamp01(overlapSpan / statsSpan);
-        return {
-            finalizeNonNullSelectivity(
-                nonNullSel, filter, nullFraction, nonNullFraction),
-            "fp-range"};
-      }
-      return {1.0, "fp-no-minmax"};
-    }
-    case common::FilterKind::kBytesRange: {
-      auto* stringStats =
-          dynamic_cast<const dwio::common::StringColumnStatistics*>(stats);
-      auto* range = dynamic_cast<const common::BytesRange*>(&filter);
-      if (stringStats && range && stringStats->getMinimum() &&
-          stringStats->getMaximum()) {
-        const auto& statsMin = stringStats->getMinimum().value();
-        const auto& statsMax = stringStats->getMaximum().value();
-        if (statsMin == statsMax) {
-          const double nonNullSel =
-              filter.testBytes(statsMin.data(), statsMin.size()) ? 1.0 : 0.0;
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "string-const"};
-        }
-        if (!range->lowerUnbounded() && !range->upperUnbounded() &&
-            !range->lowerExclusive() && !range->upperExclusive() &&
-            range->lower() == range->upper()) {
-          const double nonNullSel =
-              std::max(1.0 / static_cast<double>(std::max<uint64_t>(1, totalRows)),
-                       0.01);
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "string-single"};
-        }
-        const bool coversWholeSpan =
-            (range->lowerUnbounded() || range->lower() <= statsMin) &&
-            (range->upperUnbounded() || range->upper() >= statsMax);
-        const double nonNullSel = coversWholeSpan ? 1.0 : 0.25;
-        return {
-            finalizeNonNullSelectivity(
-                nonNullSel, filter, nullFraction, nonNullFraction),
-            coversWholeSpan ? "string-cover" : "string-range-heuristic"};
-      }
-      return {1.0, "string-no-minmax"};
-    }
-    case common::FilterKind::kBytesValues: {
-      auto* stringStats =
-          dynamic_cast<const dwio::common::StringColumnStatistics*>(stats);
-      auto* valuesFilter = dynamic_cast<const common::BytesValues*>(&filter);
-      if (stringStats && valuesFilter && stringStats->getMinimum() &&
-          stringStats->getMaximum()) {
-        const auto& statsMin = stringStats->getMinimum().value();
-        const auto& statsMax = stringStats->getMaximum().value();
-        size_t matches = 0;
-        for (const auto& value : valuesFilter->values()) {
-          if (value >= statsMin && value <= statsMax) {
-            ++matches;
-          }
-        }
-        if (matches == 0) {
-          return {0.0, "string-set-disjoint"};
-        }
-        if (statsMin == statsMax) {
-          const double nonNullSel =
-              valuesFilter->values().contains(statsMin) ? 1.0 : 0.0;
-          return {
-              finalizeNonNullSelectivity(
-                  nonNullSel, filter, nullFraction, nonNullFraction),
-              "string-set-const"};
-        }
-        const double nonNullSel = clamp01(std::max(
-            1.0 / static_cast<double>(std::max<uint64_t>(1, totalRows)),
-            std::min(1.0, static_cast<double>(matches) * 0.05)));
-        return {
-            finalizeNonNullSelectivity(
-                nonNullSel, filter, nullFraction, nonNullFraction),
-            "string-set"};
-      }
-      return {1.0, "string-set-no-minmax"};
-    }
-    default:
-      return {1.0, "unsupported-kind"};
-  }
-}
-
-std::vector<RowGroupBudgetEstimate> estimateRowGroupBudgets(
-    const pqthrift::FileMetaData& footer,
-    const RowTypePtr& scanBudgetType,
-    const std::vector<std::string>& readColumnNames,
-    const common::SubfieldFilters& subfieldFilters,
-    bool hasRemainingFilter) {
-  std::unordered_set<std::string> selectedColumns(
-      readColumnNames.begin(), readColumnNames.end());
-  std::unordered_map<std::string, TypePtr> scanTypes;
-  if (scanBudgetType) {
-    for (int i = 0; i < scanBudgetType->size(); ++i) {
-      scanTypes.emplace(scanBudgetType->nameOf(i), scanBudgetType->childAt(i));
-    }
-  }
-
-  std::vector<RowGroupBudgetEstimate> estimates;
-  estimates.reserve(footer.row_groups.size());
-  for (size_t rgIndex = 0; rgIndex < footer.row_groups.size(); ++rgIndex) {
-    const auto& rowGroup = footer.row_groups[rgIndex];
-    if (rowGroup.num_rows <= 0) {
-      continue;
-    }
-
-    int64_t compressedBytes = 0;
-    int64_t uncompressedBytes = 0;
-    double pushdownSelectivity = 1.0;
-    std::vector<std::string> notes;
-
-    for (const auto& column : rowGroup.columns) {
-      const auto columnName = topLevelColumnName(column.meta_data.path_in_schema);
-      if (!selectedColumns.empty() && !selectedColumns.count(columnName)) {
-        continue;
-      }
-      compressedBytes += column.meta_data.total_compressed_size;
-      uncompressedBytes += column.meta_data.total_uncompressed_size;
-    }
-
-    for (const auto& [subfield, filterPtr] : subfieldFilters) {
-      if (!filterPtr) {
-        continue;
-      }
-      const auto columnName = subfield.toString();
-      auto typeIt = scanTypes.find(columnName);
-      if (typeIt == scanTypes.end()) {
-        notes.push_back(columnName + "=no-type");
-        continue;
-      }
-
-      const pqthrift::ColumnChunk* matchingChunk = nullptr;
-      for (const auto& column : rowGroup.columns) {
-        if (topLevelColumnName(column.meta_data.path_in_schema) == columnName) {
-          matchingChunk = &column;
-          break;
-        }
-      }
-      if (!matchingChunk) {
-        notes.push_back(columnName + "=no-chunk");
-        continue;
-      }
-
-      facebook::velox::parquet::ColumnChunkMetaDataPtr chunkMeta(matchingChunk);
-      if (!chunkMeta.hasStatistics()) {
-        notes.push_back(columnName + "=no-stats");
-        continue;
-      }
-
-      auto stats =
-          chunkMeta.getColumnStatistics(typeIt->second, rowGroup.num_rows);
-      auto estimate = estimateFilterSelectivity(
-          *filterPtr, stats.get(), rowGroup.num_rows, typeIt->second);
-      pushdownSelectivity =
-          clamp01(pushdownSelectivity * estimate.selectivity);
-      notes.push_back(fmt::format(
-          "{}={:.2f}({})", columnName, estimate.selectivity, estimate.note));
-    }
-
-    const auto decodedInputBytes =
-        static_cast<uint64_t>(std::max<int64_t>(0, uncompressedBytes));
-    const auto postReadBytes = static_cast<uint64_t>(std::llround(
-        static_cast<long double>(decodedInputBytes) * pushdownSelectivity));
-    const auto pushdownMaskBytes =
-        subfieldFilters.empty() ? 0 : filterMaskBytesEstimate(rowGroup.num_rows);
-    const auto remainingMaskBytes =
-        hasRemainingFilter ? filterMaskBytesEstimate(rowGroup.num_rows) : 0;
-    const auto scanReaderPeakBytes = subfieldFilters.empty()
-        ? decodedInputBytes
-        : decodedInputBytes + postReadBytes + pushdownMaskBytes;
-    const auto remainingFilterPeakBytes = hasRemainingFilter
-        ? postReadBytes + postReadBytes + remainingMaskBytes
-        : postReadBytes;
-
-    RowGroupBudgetEstimate estimate;
-    estimate.rowGroupIndex = static_cast<int>(rgIndex);
-    estimate.rows = rowGroup.num_rows;
-    estimate.compressedBytes = compressedBytes;
-    estimate.uncompressedBytes = uncompressedBytes;
-    estimate.pushdownSelectivity = pushdownSelectivity;
-    estimate.postReadBytes = postReadBytes;
-    estimate.predictedPeakBytes =
-        std::max(scanReaderPeakBytes, remainingFilterPeakBytes);
-    if (notes.empty()) {
-      estimate.notes = "no-pushdown-filters";
-    } else {
-      std::ostringstream out;
-      for (size_t i = 0; i < notes.size(); ++i) {
-        if (i > 0) {
-          out << ",";
-        }
-        out << notes[i];
-      }
-      estimate.notes = out.str();
-    }
-    estimates.push_back(std::move(estimate));
-  }
-
-  std::sort(
-      estimates.begin(),
-      estimates.end(),
-      [](const RowGroupBudgetEstimate& lhs, const RowGroupBudgetEstimate& rhs) {
-        return lhs.predictedPeakBytes > rhs.predictedPeakBytes;
-      });
-  return estimates;
-}
-
-void maybeLogFooterBudgetEstimate(
-    cudf::io::datasource* dataSource,
-    const std::string& filePath,
-    const RowTypePtr& scanBudgetType,
-    const std::vector<std::string>& readColumnNames,
-    const common::SubfieldFilters& subfieldFilters,
-    bool hasRemainingFilter,
-    uint64_t splitStart,
-    uint64_t splitSize,
-    int64_t targetBytes) {
-  if (!dataSource) {
-    return;
-  }
-
-  try {
-    auto footer = parseParquetFooterMetadata(dataSource);
-    auto budgets = estimateRowGroupBudgets(
-        footer,
-        scanBudgetType,
-        readColumnNames,
-        subfieldFilters,
-        hasRemainingFilter);
-    if (budgets.empty()) {
-      return;
-    }
-
-    int64_t totalCompressedBytes = 0;
-    int64_t totalUncompressedBytes = 0;
-    for (const auto& budget : budgets) {
-      totalCompressedBytes += budget.compressedBytes;
-      totalUncompressedBytes += budget.uncompressedBytes;
-    }
-
-    std::ostringstream topBudgets;
-    const auto topN = std::min<size_t>(3, budgets.size());
-    for (size_t i = 0; i < topN; ++i) {
-      if (i > 0) {
-        topBudgets << "; ";
-      }
-      const auto& budget = budgets[i];
-      topBudgets << "rg" << budget.rowGroupIndex
-                 << "{rows=" << budget.rows
-                 << ", comp=" << succinctBytes(budget.compressedBytes)
-                 << ", uncomp=" << succinctBytes(budget.uncompressedBytes)
-                 << ", postRead=" << succinctBytes(budget.postReadBytes)
-                 << ", sel=" << fmt::format("{:.2f}", budget.pushdownSelectivity)
-                 << ", peak=" << succinctBytes(budget.predictedPeakBytes)
-                 << ", notes=" << budget.notes << "}";
-    }
-
-    LOG(INFO) << "CudfHiveDataSource::footer budget: file=" << filePath
-              << ", splitStart=" << splitStart
-              << ", splitSize="
-              << (splitSize == std::numeric_limits<uint64_t>::max()
-                      ? std::string("full")
-                      : succinctBytes(splitSize))
-              << ", targetBytes=" << succinctBytes(targetBytes)
-              << ", rowGroups=" << budgets.size()
-              << ", totalCompressed=" << succinctBytes(totalCompressedBytes)
-              << ", totalUncompressed=" << succinctBytes(totalUncompressedBytes)
-              << ", remainingFilter=" << hasRemainingFilter
-              << ", topBudgets=[" << topBudgets.str() << "]";
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "CudfHiveDataSource::footer budget estimation failed for "
-                 << filePath << ": " << e.what();
-  }
-}
-
-} // namespace
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
@@ -797,15 +207,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
 
   const bool hasCoalescedFiles = !pendingFiles_.empty();
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
-  const bool debugEnabled = CudfConfig::getInstance().debugEnabled;
-  uint64_t lastTableBytes = 0;
-  uint64_t lastFilteredBytes = 0;
-
-  std::cerr << "GPU_MEM_SNAPSHOT [scan-entry] "
-               << gpuMemorySnapshotString()
-               << " split=" << split_->filePath
-               << " targetBytes=" << succinctBytes(targetBytes)
-               << std::endl;
 
   // GPU guard for single-file and experimental paths; emplaced before first
   // GPU operation and held through common post-processing.
@@ -833,64 +234,36 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                    << std::endl;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
-        try {
-          auto tableWithMetadata = splitReader_->read_chunk();
-          if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
-            auto& tbl = tableWithMetadata.tbl;
-            lastTableBytes = estimateTableBytes(tbl);
-            if (remainingFilterExprSet_) {
-              auto cols = tbl->release();
-              const auto originalNumColumns = cols.size();
-              auto filterResult = cudfExpressionEvaluator_->eval(
-                  cols, stream_, cudf::get_current_device_resource_ref());
-              std::vector<std::unique_ptr<cudf::column>> origCols;
-              origCols.reserve(originalNumColumns);
-              std::move(
-                  cols.begin(),
-                  cols.begin() + originalNumColumns,
-                  std::back_inserter(origCols));
-              auto origTable =
-                  std::make_unique<cudf::table>(std::move(origCols));
-              tbl = cudf::apply_boolean_mask(
-                  *origTable,
-                  asView(filterResult),
-                  stream_,
-                  cudf::get_current_device_resource_ref());
-            }
-            if (tbl->num_rows() > 0) {
-              auto tableBytes = estimateTableBytes(tbl);
-              lastFilteredBytes = tableBytes;
-              accumulatedTables_.push_back(std::move(tbl));
-              accumulatedBytes_ += tableBytes;
-              if (accumulatedBytes_ >= effectiveTarget) {
-                if (debugEnabled) {
-                  LOG(INFO) << "CudfHiveDataSource::next coalesced threshold: "
-                            << "accumulatedBytes="
-                            << succinctBytes(accumulatedBytes_)
-                            << ", preFilterBytes="
-                            << succinctBytes(lastTableBytes)
-                            << ", filteredBytes="
-                            << succinctBytes(lastFilteredBytes)
-                            << ", targetBytes="
-                            << succinctBytes(effectiveTarget)
-                            << ", "
-                            << gpuMemoryBreakdownString(accumulatedBytes_);
-                }
-                break;
-              }
+        auto tableWithMetadata = splitReader_->read_chunk();
+        if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
+          auto& tbl = tableWithMetadata.tbl;
+          if (remainingFilterExprSet_) {
+            auto cols = tbl->release();
+            const auto originalNumColumns = cols.size();
+            auto filterResult = cudfExpressionEvaluator_->eval(
+                cols, stream_, cudf::get_current_device_resource_ref());
+            std::vector<std::unique_ptr<cudf::column>> origCols;
+            origCols.reserve(originalNumColumns);
+            std::move(
+                cols.begin(),
+                cols.begin() + originalNumColumns,
+                std::back_inserter(origCols));
+            auto origTable =
+                std::make_unique<cudf::table>(std::move(origCols));
+            tbl = cudf::apply_boolean_mask(
+                *origTable,
+                asView(filterResult),
+                stream_,
+                cudf::get_current_device_resource_ref());
+          }
+          if (tbl->num_rows() > 0) {
+            auto tableBytes = estimateTableBytes(tbl);
+            accumulatedTables_.push_back(std::move(tbl));
+            accumulatedBytes_ += tableBytes;
+            if (accumulatedBytes_ >= effectiveTarget) {
+              break;
             }
           }
-        } catch (const std::exception& e) {
-          LOG(ERROR) << "CudfHiveDataSource::next coalesced read failed: "
-                     << e.what()
-                     << ", split=" << split_->filePath
-                     << ", accumulatedBytes=" << succinctBytes(accumulatedBytes_)
-                     << ", preFilterBytes=" << succinctBytes(lastTableBytes)
-                     << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
-                     << ", targetBytes=" << succinctBytes(effectiveTarget)
-                     << ", "
-                     << gpuMemoryBreakdownString(accumulatedBytes_);
-          throw;
         }
       }
       totalCoalesceBufferTimeNs_.fetch_add(
@@ -899,7 +272,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       auto result = flushAccumulated();
       gpuTimer_.stop(stream_);
       if (result == nullptr) {
-        endGpuRegion();
         return nullptr;
       }
       TotalScanTimeCallbackData* callbackData =
@@ -935,14 +307,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
-    lastTableBytes = estimateTableBytes(cudfTable);
-    if (debugEnabled) {
-      LOG(INFO) << "CudfHiveDataSource::next post-read: rows="
-                << (cudfTable ? cudfTable->num_rows() : 0)
-                << ", tableBytes=" << succinctBytes(lastTableBytes)
-                << ", targetBytes=" << succinctBytes(targetBytes)
-                << ", " << gpuMemoryBreakdownString(lastTableBytes);
-    }
   } else {
     // Chunked experimental reader: process row groups in batches.
     // Loops across coalesced files when the current file is exhausted.
@@ -957,33 +321,13 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       }
 
       if (exptNextRGIndex_ < exptFilteredRowGroups_.size()) {
-        cudfTable = [&]() {
-          try {
-            return readNextExperimentalBatch(metadata);
-          } catch (const std::exception& e) {
-            LOG(ERROR) << "CudfHiveDataSource::next experimental batch failed: "
-                       << e.what()
-                       << ", split=" << split_->filePath
-                       << ", targetBytes=" << succinctBytes(targetBytes)
-                       << ", " << gpuMemoryBreakdownString(0);
-            throw;
-          }
-        }();
+        cudfTable = readNextExperimentalBatch(metadata);
         if (cudfTable && cudfTable->num_rows() > 0) {
-          lastTableBytes = estimateTableBytes(cudfTable);
-          if (debugEnabled) {
-            LOG(INFO) << "CudfHiveDataSource::next experimental post-read: rows="
-                      << cudfTable->num_rows()
-                      << ", tableBytes=" << succinctBytes(lastTableBytes)
-                      << ", targetBytes=" << succinctBytes(targetBytes)
-                      << ", " << gpuMemoryBreakdownString(lastTableBytes);
-          }
           break;
         }
       }
 
       if (!hasCoalescedFiles || !advanceToNextCoalescedFile()) {
-        endGpuRegion();
         return nullptr;
       }
     }
@@ -1002,44 +346,27 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Apply remaining filter if present
   if (remainingFilterExprSet_) {
     MicrosecondTimer filterTimer(&filterTimeUs);
-    try {
-      auto cudfTableColumns = cudfTable->release();
-      const auto originalNumColumns = cudfTableColumns.size();
-      // Filter may need addtional computed columns which are added to
-      // cudfTableColumns
-      auto filterResult = cudfExpressionEvaluator_->eval(
-          cudfTableColumns, stream_, cudf::get_current_device_resource_ref());
-      // discard computed columns
-      std::vector<std::unique_ptr<cudf::column>> originalColumns;
-      originalColumns.reserve(originalNumColumns);
-      std::move(
-          cudfTableColumns.begin(),
-          cudfTableColumns.begin() + originalNumColumns,
-          std::back_inserter(originalColumns));
-      auto originalTable =
-          std::make_unique<cudf::table>(std::move(originalColumns));
-      // Keep only rows where the filter is true
-      cudfTable = cudf::apply_boolean_mask(
-          *originalTable,
-          asView(filterResult),
-          stream_,
-          cudf::get_current_device_resource_ref());
-      lastFilteredBytes = estimateTableBytes(cudfTable);
-      if (debugEnabled) {
-        LOG(INFO) << "CudfHiveDataSource::next post-filter: rows="
-                  << (cudfTable ? cudfTable->num_rows() : 0)
-                  << ", filteredBytes=" << succinctBytes(lastFilteredBytes)
-                  << ", preFilterBytes=" << succinctBytes(lastTableBytes)
-                  << ", " << gpuMemoryBreakdownString(lastFilteredBytes);
-      }
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "CudfHiveDataSource::next filter failed: " << e.what()
-                 << ", split=" << split_->filePath
-                 << ", preFilterBytes=" << succinctBytes(lastTableBytes)
-                 << ", targetBytes=" << succinctBytes(targetBytes)
-                 << ", " << gpuMemoryBreakdownString(lastTableBytes);
-      throw;
-    }
+    auto cudfTableColumns = cudfTable->release();
+    const auto originalNumColumns = cudfTableColumns.size();
+    // Filter may need addtional computed columns which are added to
+    // cudfTableColumns
+    auto filterResult = cudfExpressionEvaluator_->eval(
+        cudfTableColumns, stream_, cudf::get_current_device_resource_ref());
+    // discard computed columns
+    std::vector<std::unique_ptr<cudf::column>> originalColumns;
+    originalColumns.reserve(originalNumColumns);
+    std::move(
+        cudfTableColumns.begin(),
+        cudfTableColumns.begin() + originalNumColumns,
+        std::back_inserter(originalColumns));
+    auto originalTable =
+        std::make_unique<cudf::table>(std::move(originalColumns));
+    // Keep only rows where the filter is true
+    cudfTable = cudf::apply_boolean_mask(
+        *originalTable,
+        asView(filterResult),
+        stream_,
+        cudf::get_current_device_resource_ref());
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
@@ -1359,18 +686,6 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
 CudfParquetReaderPtr CudfHiveDataSource::createSplitReader() {
   setupCudfDataSourceAndOptions();
   stream_ = cudfGlobalStreamPool().get_stream();
-  if (CudfConfig::getInstance().debugEnabled) {
-    maybeLogFooterBudgetEstimate(
-        dataSource_.get(),
-        split_->filePath,
-        buildScanBudgetType(tableHandle_, outputType_, readColumnNames_),
-        readColumnNames_,
-        subfieldFilters_,
-        remainingFilterExprSet_ != nullptr,
-        split_->start,
-        split_->size(),
-        CudfConfig::getInstance().gpuTargetBatchBytes);
-  }
 
   // Create a parquet reader
   return std::make_unique<cudf::io::chunked_parquet_reader>(
@@ -1658,29 +973,6 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
                 pageIndexBytes->data(), pageIndexBytes->size()});
       }
     } else {
-      if (CudfConfig::getInstance().debugEnabled) {
-        auto footerSource = std::move(makeDataSourcesFromSourceInfo(
-                                          cudf::io::source_info(
-                                              cudf::host_span<const std::byte>(
-                                                  reinterpret_cast<
-                                                      const std::byte*>(
-                                                      currentFilePinnedBuffer_
-                                                          ->data()),
-                                                  currentFilePinnedBuffer_
-                                                      ->size())))
-                                          .front());
-        maybeLogFooterBudgetEstimate(
-            footerSource.get(),
-            fileRange.filePath,
-            buildScanBudgetType(tableHandle_, outputType_, readColumnNames_),
-            readColumnNames_,
-            subfieldFilters_,
-            remainingFilterExprSet_ != nullptr,
-            isSelectiveBuffer ? 0 : asyncRead.start,
-            isSelectiveBuffer ? currentFilePinnedBuffer_->size()
-                              : asyncRead.length,
-            CudfConfig::getInstance().gpuTargetBatchBytes);
-      }
       splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
           cudfHiveConfig_->maxChunkReadLimit(),
           cudfHiveConfig_->maxPassReadLimit(),
@@ -1708,18 +1000,6 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
       }
     } else {
       setupCudfDataSourceAndOptions();
-      if (CudfConfig::getInstance().debugEnabled) {
-        maybeLogFooterBudgetEstimate(
-            dataSource_.get(),
-            fileRange.filePath,
-            buildScanBudgetType(tableHandle_, outputType_, readColumnNames_),
-            readColumnNames_,
-            subfieldFilters_,
-            remainingFilterExprSet_ != nullptr,
-            split_->start,
-            split_->size(),
-            CudfConfig::getInstance().gpuTargetBatchBytes);
-      }
       splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
           cudfHiveConfig_->maxChunkReadLimit(),
           cudfHiveConfig_->maxPassReadLimit(),
@@ -1854,11 +1134,6 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       columnChunkByteRanges.size());
   std::vector<std::future<size_t>> ioFutures{};
   ioFutures.reserve(columnChunkByteRanges.size());
-  // Keep pinned host buffers alive until async H2D copies complete.
-  // PinnedHostBuffer uses a pool allocator, so freed memory is immediately
-  // reusable by other threads. Without holding them here, the DMA engine
-  // may read from recycled addresses, causing SIGSEGV under concurrency.
-  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> hostBuffers;
   std::for_each(
       thrust::counting_iterator<size_t>(0),
       thrust::counting_iterator(columnChunkByteRanges.size()),
@@ -1895,7 +1170,6 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
               byteRange.size(),
               cudaMemcpyHostToDevice,
               stream_.value()));
-          hostBuffers.push_back(std::move(hostBuffer));
         }
       });
 
@@ -1906,12 +1180,6 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
     future.get();
   });
-  // Wait for all async H2D copies to complete before releasing pinned host
-  // buffers. The DMA engine may still be reading from them.
-  if (!hostBuffers.empty()) {
-    stream_.synchronize();
-    hostBuffers.clear();
-  }
 
   std::vector<cudf::device_span<uint8_t const>> columnChunkData;
   columnChunkData.reserve(columnChunkBuffers.size());
