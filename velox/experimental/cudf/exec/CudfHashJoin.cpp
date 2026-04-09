@@ -24,6 +24,7 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/base/SuccinctPrinter.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/type/TypeUtil.h"
@@ -101,6 +102,15 @@ void CudfHashJoinProbe::buildHashTable() {
   auto stream = cudfGlobalStreamPool().get_stream();
   buildStream_ = stream;
 
+  size_t totalHostBytes = 0;
+  for (auto& hb : hostBatches) {
+    totalHostBytes += hb.data->size();
+  }
+  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-pre-H2D] "
+               << gpuMemorySnapshotString()
+               << " hostBatches=" << hostBatches.size()
+               << " totalHostBytes=" << succinctBytes(totalHostBytes);
+
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinProbe::buildHashTable hostBatches="
             << hostBatches.size();
@@ -132,8 +142,17 @@ void CudfHashJoinProbe::buildHashTable() {
         stream));
   }
   buildBatches_.reset();
+  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-post-H2D] "
+               << gpuMemorySnapshotString()
+               << " gpuBatches=" << gpuBatches.size()
+               << " (all build data now on GPU, about to concatenate)";
 
   auto tbls = getConcatenatedTableBatched(gpuBatches, buildType, stream);
+  // Release individual GPU batches immediately — the concatenated tables in
+  // `tbls` own all the data now. Without this, both gpuBatches (~N bytes)
+  // and tbls (~N bytes) coexist on GPU during hash_join construction,
+  // doubling peak memory vs v4 which cleared inputs_ here.
+  gpuBatches.clear();
 
   for (auto const& tbl : tbls) {
     VELOX_CHECK_NOT_NULL(tbl);
@@ -167,6 +186,9 @@ void CudfHashJoinProbe::buildHashTable() {
 
   hashObject_ = std::make_pair(
       std::move(shared_tbls), std::move(hashObjects));
+  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-post-build] "
+               << gpuMemorySnapshotString()
+               << " (hash table built, concatenated tables + hash objects on GPU)";
 
   // Initialize right-join matched flags under the same GpuGuard.
   if (joinNode_->isRightJoin()) {

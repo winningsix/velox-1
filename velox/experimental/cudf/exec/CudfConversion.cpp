@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/SuccinctPrinter.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
@@ -198,6 +199,11 @@ RowVectorPtr CudfFromVelox::getOutput() {
   }
 
   GpuGuard gpuGuard;
+  LOG(ERROR) << "GPU_MEM_SNAPSHOT [CudfFromVelox-H2D] "
+               << gpuMemorySnapshotString()
+               << " batches=" << selectedInputs.size()
+               << " totalRows=" << totalSize
+               << " totalBytes=" << succinctBytes(totalBytes);
 
   auto stream = cudfGlobalStreamPool().get_stream();
 
@@ -279,6 +285,10 @@ std::optional<uint64_t> CudfToVelox::averageRowSize() {
 RowVectorPtr CudfToVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
+  LOG(ERROR) << "GPU_MEM_SNAPSHOT [CudfToVelox-D2H] "
+               << gpuMemorySnapshotString()
+               << " inputs=" << inputs_.size()
+               << " finished=" << finished_;
   if (finished_ || inputs_.empty()) {
     finished_ = noMoreInput_ && inputs_.empty();
     endGpuRegion();
