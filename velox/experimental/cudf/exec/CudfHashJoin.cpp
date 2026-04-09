@@ -144,6 +144,11 @@ void CudfHashJoinProbe::buildHashTable() {
         std::move(unpacked),
         stream));
   }
+  // Wait for all async H2D copies to complete before freeing the source
+  // pinned host buffers. Without this, the GPU DMA engine may still be
+  // reading from pinned addresses that the pool reclaims and reuses,
+  // causing SEGV_ACCERR in cudaMemcpyAsync on Blackwell GPUs.
+  stream.synchronize();
   buildBatches_.reset();
   std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-post-H2D] "
                << gpuMemorySnapshotString()
