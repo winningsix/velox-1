@@ -53,6 +53,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <iostream>
+
 namespace facebook::velox::cudf_velox {
 
 void CudfHashJoinProbe::close() {
@@ -106,10 +108,11 @@ void CudfHashJoinProbe::buildHashTable() {
   for (auto& hb : hostBatches) {
     totalHostBytes += hb.data->size();
   }
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-pre-H2D] "
+  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-pre-H2D] "
                << gpuMemorySnapshotString()
                << " hostBatches=" << hostBatches.size()
-               << " totalHostBytes=" << succinctBytes(totalHostBytes);
+               << " totalHostBytes=" << succinctBytes(totalHostBytes)
+               << std::endl;
 
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinProbe::buildHashTable hostBatches="
@@ -142,10 +145,11 @@ void CudfHashJoinProbe::buildHashTable() {
         stream));
   }
   buildBatches_.reset();
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-post-H2D] "
+  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-post-H2D] "
                << gpuMemorySnapshotString()
                << " gpuBatches=" << gpuBatches.size()
-               << " (all build data now on GPU, about to concatenate)";
+               << " (all build data now on GPU, about to concatenate)"
+               << std::endl;
 
   auto tbls = getConcatenatedTableBatched(gpuBatches, buildType, stream);
   // Release individual GPU batches immediately — the concatenated tables in
@@ -186,9 +190,10 @@ void CudfHashJoinProbe::buildHashTable() {
 
   hashObject_ = std::make_pair(
       std::move(shared_tbls), std::move(hashObjects));
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [buildHashTable-post-build] "
+  std::cerr << "GPU_MEM_SNAPSHOT [buildHashTable-post-build] "
                << gpuMemorySnapshotString()
-               << " (hash table built, concatenated tables + hash objects on GPU)";
+               << " (hash table built, concatenated tables + hash objects on GPU)"
+               << std::endl;
 
   // Initialize right-join matched flags under the same GpuGuard.
   if (joinNode_->isRightJoin()) {

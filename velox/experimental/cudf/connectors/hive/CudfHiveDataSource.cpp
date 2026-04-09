@@ -62,6 +62,7 @@
 #include <algorithm>
 #include <cmath>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -800,10 +801,11 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   uint64_t lastTableBytes = 0;
   uint64_t lastFilteredBytes = 0;
 
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [scan-entry] "
+  std::cerr << "GPU_MEM_SNAPSHOT [scan-entry] "
                << gpuMemorySnapshotString()
                << " split=" << split_->filePath
-               << " targetBytes=" << succinctBytes(targetBytes);
+               << " targetBytes=" << succinctBytes(targetBytes)
+               << std::endl;
 
   // GPU guard for single-file and experimental paths; emplaced before first
   // GPU operation and held through common post-processing.
@@ -825,9 +827,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           : std::numeric_limits<int64_t>::max();
       GpuGuard coalescedGpuGuard;
       gpuTimer_.start(stream_);
-      LOG(ERROR) << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
+      std::cerr << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
                    << gpuMemorySnapshotString()
-                   << " (coalesced path, GPU lock acquired)";
+                   << " (coalesced path, GPU lock acquired)"
+                   << std::endl;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         try {
@@ -914,9 +917,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
     gpuGuard.emplace();
     gpuTimer_.start(stream_);
-    LOG(ERROR) << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
+    std::cerr << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
                  << gpuMemorySnapshotString()
-                 << " (single-file path, GPU lock acquired)";
+                 << " (single-file path, GPU lock acquired)"
+                 << std::endl;
     auto tableWithMetadata = [&]() {
       try {
         return splitReader_->read_chunk();

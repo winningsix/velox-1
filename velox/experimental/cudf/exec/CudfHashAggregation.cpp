@@ -40,6 +40,7 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <iostream>
 #include <vector>
 
 namespace {
@@ -1049,11 +1050,12 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [hashAgg-addInput] "
+  std::cerr << "GPU_MEM_SNAPSHOT [hashAgg-addInput] "
                << cudf_velox::gpuMemorySnapshotString()
                << " rows=" << input->size()
                << " inputBytes=" << succinctBytes(cudfInput->estimateFlatSize())
-               << " totalInputRows=" << numInputRows_;
+               << " totalInputRows=" << numInputRows_
+               << std::endl;
 
   if (isPartialOutput_ && !isGlobal_) {
     const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
@@ -1211,11 +1213,12 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [hashAgg-getOutput] "
+  std::cerr << "GPU_MEM_SNAPSHOT [hashAgg-getOutput] "
                << cudf_velox::gpuMemorySnapshotString()
                << " inputs=" << inputs_.size()
                << " isPartial=" << isPartialOutput_
-               << " isGlobal=" << isGlobal_;
+               << " isGlobal=" << isGlobal_
+               << std::endl;
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {

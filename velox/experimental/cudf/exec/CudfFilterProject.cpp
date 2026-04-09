@@ -266,8 +266,9 @@ RowVectorPtr CudfFilterProject::getOutput() {
   vector_size_t inputRows = 0;
   vector_size_t outputRows = 0;
   GpuGuard gpuGuard;
-  LOG(ERROR) << "GPU_MEM_SNAPSHOT [filterProject-entry] "
-               << gpuMemorySnapshotString();
+  std::cerr << "GPU_MEM_SNAPSHOT [filterProject-entry] "
+               << gpuMemorySnapshotString()
+               << std::endl;
 
   try {
     if (allInputProcessed()) {
