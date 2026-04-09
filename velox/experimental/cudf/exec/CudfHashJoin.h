@@ -38,16 +38,6 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
-class PinnedHostBuffer;
-
-/// Build-side batch stored in pinned host memory (not GPU).
-/// Created by Build::addInput() via cudf::pack() + D2H.
-/// Consumed by Probe::buildHashTable() via H2D + cudf::unpack().
-struct HostBuildBatch {
-  std::vector<uint8_t> metadata;
-  std::shared_ptr<PinnedHostBuffer> data;
-  vector_size_t numRows;
-};
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -70,17 +60,17 @@ class CudfHashJoinBridge : public exec::JoinBridge {
       std::vector<std::shared_ptr<cudf::table>>,
       std::vector<std::shared_ptr<cudf::hash_join>>>;
 
-  /// Set build-side batches (host pinned memory). The hash table is built
-  /// lazily on the probe side under its GpuGuard via H2D + unpack.
-  void setBuildBatches(std::vector<HostBuildBatch> batches);
+  void setHashTable(std::optional<hash_type> hashObject);
 
-  /// Get the build batches, or register a future to be notified when
-  /// they become available.
-  std::optional<std::vector<HostBuildBatch>> buildBatchesOrFuture(
-      ContinueFuture* future);
+  std::optional<hash_type> hashOrFuture(ContinueFuture* future);
+
+  void setBuildStream(rmm::cuda_stream_view buildStream);
+
+  std::optional<rmm::cuda_stream_view> getBuildStream();
 
  private:
-  std::optional<std::vector<HostBuildBatch>> buildBatches_;
+  std::optional<hash_type> hashObject_;
+  std::optional<rmm::cuda_stream_view> buildStream_;
 };
 
 /**
@@ -114,7 +104,7 @@ class CudfHashJoinBuild : public exec::Operator, public NvtxHelper {
 
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
-  std::vector<HostBuildBatch> hostInputs_;
+  std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
@@ -214,10 +204,6 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   // probe input from the sources have been processed. It prevents the exchange
   // hanging problem at the producer side caused by the early query finish.
   bool skipInput_{false};
-
-  /// Build-side batches in pinned host memory, received from the bridge.
-  /// Consumed once by buildHashTable() (H2D + unpack + hash_join build).
-  std::optional<std::vector<HostBuildBatch>> buildBatches_;
 
   /** @brief CUDA stream used during hash table construction */
   std::optional<rmm::cuda_stream_view> buildStream_;
@@ -328,10 +314,6 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
           std::vector<std::unique_ptr<cudf::column>>&&,
           cudf::column_view)> func,
       rmm::cuda_stream_view stream);
-
-  /// Build hash table from raw batches received via the bridge. Called
-  /// lazily on the first getOutput() under operator-level GpuGuard.
-  void buildHashTable();
 
   std::unique_ptr<cudf::table> filteredOutputIndices(
       cudf::table_view leftTableView,
