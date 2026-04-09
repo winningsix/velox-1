@@ -579,6 +579,10 @@ struct ApproxDistinctAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             cuda::std::span<cuda::std::byte>(
                 static_cast<cuda::std::byte*>(temp_sketch.data()), size),
             stream);
+        // Wait for merge kernel to finish reading temp_sketch before it goes
+        // out of scope. The RMM pool deallocator returns memory immediately,
+        // so another thread could reuse the address while merge is in flight.
+        stream.synchronize();
       }
     }
 

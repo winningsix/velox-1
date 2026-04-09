@@ -1854,6 +1854,11 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       columnChunkByteRanges.size());
   std::vector<std::future<size_t>> ioFutures{};
   ioFutures.reserve(columnChunkByteRanges.size());
+  // Keep pinned host buffers alive until async H2D copies complete.
+  // PinnedHostBuffer uses a pool allocator, so freed memory is immediately
+  // reusable by other threads. Without holding them here, the DMA engine
+  // may read from recycled addresses, causing SIGSEGV under concurrency.
+  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> hostBuffers;
   std::for_each(
       thrust::counting_iterator<size_t>(0),
       thrust::counting_iterator(columnChunkByteRanges.size()),
@@ -1890,6 +1895,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
               byteRange.size(),
               cudaMemcpyHostToDevice,
               stream_.value()));
+          hostBuffers.push_back(std::move(hostBuffer));
         }
       });
 
@@ -1900,6 +1906,12 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
     future.get();
   });
+  // Wait for all async H2D copies to complete before releasing pinned host
+  // buffers. The DMA engine may still be reading from them.
+  if (!hostBuffers.empty()) {
+    stream_.synchronize();
+    hostBuffers.clear();
+  }
 
   std::vector<cudf::device_span<uint8_t const>> columnChunkData;
   columnChunkData.reserve(columnChunkBuffers.size());
