@@ -15,6 +15,8 @@
  */
 
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include <iostream>
+#include <thread>
 
 namespace facebook::velox::cudf_velox {
 
@@ -23,16 +25,28 @@ thread_local bool gpuRegionActive = false;
 } // namespace
 
 void beginGpuRegion() {
+  auto tid = std::this_thread::get_id();
   if (!gpuRegionActive) {
+    std::cerr << "GPU_REGION [begin-acquire] tid=" << tid
+              << " caller=" << __builtin_return_address(0) << std::endl;
     gluten::lockGpu();
     gpuRegionActive = true;
+  } else {
+    std::cerr << "GPU_REGION [begin-noop] tid=" << tid
+              << " caller=" << __builtin_return_address(0) << std::endl;
   }
 }
 
 void endGpuRegion() {
+  auto tid = std::this_thread::get_id();
   if (gpuRegionActive) {
     gpuRegionActive = false;
+    std::cerr << "GPU_REGION [end-release] tid=" << tid
+              << " caller=" << __builtin_return_address(0) << std::endl;
     gluten::unlockGpu();
+  } else {
+    std::cerr << "GPU_REGION [end-noop] tid=" << tid
+              << " caller=" << __builtin_return_address(0) << std::endl;
   }
 }
 
