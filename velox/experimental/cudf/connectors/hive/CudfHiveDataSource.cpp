@@ -1170,6 +1170,10 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
               byteRange.size(),
               cudaMemcpyHostToDevice,
               stream_.value()));
+          // Sync before hostBuffer goes out of scope — cudaMemcpyAsync
+          // reads from pinned host memory asynchronously, and the pool
+          // allocator recycles the address immediately on free.
+          stream_.synchronize();
         }
       });
 
