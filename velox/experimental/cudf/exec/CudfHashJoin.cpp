@@ -61,7 +61,6 @@ void CudfHashJoinProbe::close() {
         RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
   }
   hashObject_.reset();
-  buildBatches_.reset();
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
