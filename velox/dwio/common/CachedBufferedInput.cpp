@@ -15,6 +15,7 @@
  */
 
 #include "velox/dwio/common/CachedBufferedInput.h"
+#include <folly/futures/Future.h>
 #include "velox/common/Casts.h"
 #include "velox/common/memory/Allocation.h"
 #include "velox/common/process/TraceContext.h"
@@ -402,19 +403,111 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
     if (pins.empty()) {
       return pins;
     }
-    auto stats = cache::readPins(
-        pins,
-        maxCoalesceDistance_,
-        1000,
-        [&](int32_t i) { return pins[i].entry()->offset(); },
-        [&](const std::vector<CachePin>& /*pins*/,
-            int32_t /*begin*/,
-            int32_t /*end*/,
-            uint64_t offset,
-            const std::vector<folly::Range<char*>>& buffers) {
-          input_->read(buffers, offset, LogType::FILE);
-        });
-    updateStats(stats, prefetch, false);
+
+    if (input_->hasReadAsync()) {
+      // Parallel read path for cache miss (e.g. S3 with executor wired).
+      // Phase 1: Use readPins to coalesce pins and build buffer lists,
+      // but collect the read operations instead of executing them inline.
+      struct ReadOp {
+        uint64_t offset;
+        std::vector<folly::Range<char*>> buffers;
+      };
+      std::vector<ReadOp> readOps;
+
+      auto stats = cache::readPins(
+          pins,
+          maxCoalesceDistance_,
+          1000,
+          [&](int32_t i) { return pins[i].entry()->offset(); },
+          [&](const std::vector<CachePin>& /*pins*/,
+              int32_t /*begin*/,
+              int32_t /*end*/,
+              uint64_t offset,
+              const std::vector<folly::Range<char*>>& buffers) {
+            readOps.push_back(ReadOp{offset, buffers});
+          });
+
+      // Phase 2: Issue all reads in parallel, splitting large ones into
+      // 8MB sub-reads (same pattern as DirectCoalescedLoad::loadData).
+      constexpr int64_t kParallelChunkSize = 8 << 20; // 8 MB per sub-read
+      std::vector<folly::SemiFuture<uint64_t>> futures;
+
+      for (auto& op : readOps) {
+        int64_t totalBytes = 0;
+        for (const auto& buf : op.buffers) {
+          totalBytes += buf.size();
+        }
+
+        if (totalBytes <= kParallelChunkSize) {
+          // Small read — issue as single async read.
+          futures.push_back(
+              input_->readAsync(op.buffers, op.offset, LogType::FILE));
+        } else {
+          // Large read — split into parallel 8MB sub-reads.
+          int64_t chunkStart = 0;
+          size_t bufIdx = 0;
+          int64_t bufConsumed = 0;
+
+          while (chunkStart < totalBytes) {
+            const int64_t chunkEnd =
+                std::min(chunkStart + kParallelChunkSize, totalBytes);
+            int64_t remaining = chunkEnd - chunkStart;
+
+            std::vector<folly::Range<char*>> chunkBuffers;
+            while (remaining > 0 && bufIdx < op.buffers.size()) {
+              const auto& buf = op.buffers[bufIdx];
+              const int64_t available =
+                  static_cast<int64_t>(buf.size()) - bufConsumed;
+              const int64_t take = std::min(remaining, available);
+
+              if (buf.data() == nullptr) {
+                // Gap range — null sub-range of 'take' bytes.
+                chunkBuffers.push_back(folly::Range<char*>(
+                    nullptr,
+                    reinterpret_cast<char*>(static_cast<uint64_t>(take))));
+              } else {
+                chunkBuffers.push_back(
+                    folly::Range<char*>(buf.data() + bufConsumed, take));
+              }
+
+              bufConsumed += take;
+              remaining -= take;
+              if (bufConsumed >= static_cast<int64_t>(buf.size())) {
+                ++bufIdx;
+                bufConsumed = 0;
+              }
+            }
+
+            futures.push_back(input_->readAsync(
+                chunkBuffers, op.offset + chunkStart, LogType::FILE));
+            chunkStart = chunkEnd;
+          }
+        }
+      }
+
+      // Wait for all parallel sub-reads to complete.
+      auto results = folly::collectAll(std::move(futures)).wait().value();
+      for (auto& result : results) {
+        result.throwUnlessValue();
+      }
+
+      updateStats(stats, prefetch, false);
+    } else {
+      // Synchronous fallback (no async support on underlying file).
+      auto stats = cache::readPins(
+          pins,
+          maxCoalesceDistance_,
+          1000,
+          [&](int32_t i) { return pins[i].entry()->offset(); },
+          [&](const std::vector<CachePin>& /*pins*/,
+              int32_t /*begin*/,
+              int32_t /*end*/,
+              uint64_t offset,
+              const std::vector<folly::Range<char*>>& buffers) {
+            input_->read(buffers, offset, LogType::FILE);
+          });
+      updateStats(stats, prefetch, false);
+    }
     return pins;
   }
 
