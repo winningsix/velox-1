@@ -225,7 +225,11 @@ class S3ReadFile ::Impl {
   int64_t length_ = -1;
 };
 
-S3ReadFile::S3ReadFile(std::string_view path, Aws::S3::S3Client* client) {
+S3ReadFile::S3ReadFile(
+    std::string_view path,
+    Aws::S3::S3Client* client,
+    folly::Executor* executor)
+    : executor_(executor) {
   impl_ = std::make_shared<Impl>(path, client);
 }
 
@@ -255,6 +259,35 @@ uint64_t S3ReadFile::preadv(
     const std::vector<folly::Range<char*>>& buffers,
     const FileIoContext& context) const {
   return impl_->preadv(offset, buffers, context);
+}
+
+folly::SemiFuture<uint64_t> S3ReadFile::preadvAsync(
+    uint64_t offset,
+    const std::vector<folly::Range<char*>>& buffers,
+    const FileIoContext& context) const {
+  if (!executor_) {
+    return ReadFile::preadvAsync(offset, buffers, context);
+  }
+  auto impl = impl_; // prevent Impl destruction while async in-flight
+  auto [promise, future] = folly::makePromiseContract<uint64_t>();
+  executor_->add([impl,
+                  _promise = std::move(promise),
+                  _offset = offset,
+                  _buffers = buffers,
+                  _context = context]() mutable {
+    try {
+      auto result = impl->preadv(_offset, _buffers, _context);
+      _promise.setValue(result);
+    } catch (...) {
+      _promise.setException(
+          folly::exception_wrapper(std::current_exception()));
+    }
+  });
+  return std::move(future);
+}
+
+bool S3ReadFile::hasPreadvAsync() const {
+  return executor_ != nullptr;
 }
 
 uint64_t S3ReadFile::size() const {
