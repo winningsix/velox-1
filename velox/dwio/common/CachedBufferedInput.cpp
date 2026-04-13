@@ -201,8 +201,14 @@ void CachedBufferedInput::load(const LogType /*unused*/) {
           part->ssdPin.clear();
         }
         if (!part->ssdPin.empty()) {
+          if (ioStatistics_) {
+            ioStatistics_->ssdCacheHit().increment(part->size);
+          }
           ssdLoad[loadIndex].push_back(part);
           continue;
+        }
+        if (ioStatistics_) {
+          ioStatistics_->ssdCacheMiss().increment(part->size);
         }
       }
       storageLoad[loadIndex].push_back(part);

@@ -118,6 +118,8 @@ void IoStatistics::merge(const IoStatistics& other) {
   read_.merge(other.read_);
   ramHit_.merge(other.ramHit_);
   ssdRead_.merge(other.ssdRead_);
+  ssdCacheHit_.merge(other.ssdCacheHit_);
+  ssdCacheMiss_.merge(other.ssdCacheMiss_);
   queryThreadIoLatencyUs_.merge(other.queryThreadIoLatencyUs_);
   storageReadLatencyUs_.merge(other.storageReadLatencyUs_);
   ssdCacheReadLatencyUs_.merge(other.ssdCacheReadLatencyUs_);

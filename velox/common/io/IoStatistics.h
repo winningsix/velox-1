@@ -141,6 +141,14 @@ class IoStatistics {
     return ramHit_;
   }
 
+  IoCounter& ssdCacheHit() {
+    return ssdCacheHit_;
+  }
+
+  IoCounter& ssdCacheMiss() {
+    return ssdCacheMiss_;
+  }
+
   IoCounter& queryThreadIoLatencyUs() {
     return queryThreadIoLatencyUs_;
   }
@@ -204,6 +212,10 @@ class IoStatistics {
   // Read from SSD cache instead of storage. Includes both random and planned
   // reads.
   IoCounter ssdRead_;
+
+  // Number of entries found in SSD cache (hit) vs not found (miss).
+  IoCounter ssdCacheHit_;
+  IoCounter ssdCacheMiss_;
 
   // Time spent by a query processing thread waiting for synchronously issued IO
   // or for an in-progress read-ahead to finish.

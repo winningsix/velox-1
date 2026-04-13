@@ -536,6 +536,15 @@ HiveDataSource::getRuntimeStats() {
              ioStatistics_->ramHit().max(),
              RuntimeCounter::Unit::kBytes)});
   }
+  if (ioStatistics_->ssdCacheHit().count() > 0 ||
+      ioStatistics_->ssdCacheMiss().count() > 0) {
+    res.insert(
+        {"ssdCacheHits",
+         RuntimeMetric(ioStatistics_->ssdCacheHit().count())});
+    res.insert(
+        {"ssdCacheMisses",
+         RuntimeMetric(ioStatistics_->ssdCacheMiss().count())});
+  }
   if (numBucketConversion_ > 0) {
     res.insert({"numBucketConversion", RuntimeMetric(numBucketConversion_)});
   }
