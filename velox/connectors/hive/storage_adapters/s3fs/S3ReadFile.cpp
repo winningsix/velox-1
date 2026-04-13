@@ -130,7 +130,7 @@ class S3ReadFile ::Impl {
   }
 
   bool shouldCoalesce() const {
-    return false;
+    return true;
   }
 
   std::string getName() const {
