@@ -290,6 +290,10 @@ bool S3ReadFile::hasPreadvAsync() const {
   return executor_ != nullptr;
 }
 
+void S3ReadFile::setExecutor(folly::Executor* executor) {
+  executor_ = executor;
+}
+
 uint64_t S3ReadFile::size() const {
   return impl_->size();
 }

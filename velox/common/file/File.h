@@ -155,6 +155,10 @@ class ReadFile {
     return false;
   }
 
+  // Sets an executor for async read operations. Subclasses that support
+  // async reads (e.g. S3ReadFile) use this to enable preadvAsync().
+  virtual void setExecutor(folly::Executor* /*executor*/) {}
+
   // Whether preads should be coalesced where possible. E.g. remote disk would
   // set to true, in-memory to false.
   virtual bool shouldCoalesce() const = 0;

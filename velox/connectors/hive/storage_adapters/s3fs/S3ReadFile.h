@@ -57,6 +57,8 @@ class S3ReadFile : public ReadFile {
 
   bool hasPreadvAsync() const override;
 
+  void setExecutor(folly::Executor* executor) override;
+
   uint64_t size() const final;
 
   uint64_t memoryUsage() const final;
