@@ -36,6 +36,8 @@
 #include <folly/Executor.h>
 #include <folly/futures/Future.h>
 
+#include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/caching/FileIds.h"
 #include "velox/common/file/File.h"
 
 #include <list>
@@ -656,10 +658,97 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   size_t dstOffset = kHeaderLen;
 
   // Step 7: Read needed column chunks from file and write to buffer.
-  // Use parallel pread when an executor is available and there are multiple
-  // chunks, since each chunk is an independent S3 GET request.
-  if (executor && chunksToRead.size() > 1) {
+  // Try cache-aware reads first; fall back to direct S3 reads if cache is
+  // unavailable or on error.
+  auto* cache = cache::AsyncDataCache::getInstance();
+  if (cache) {
+    // Map file path to a numeric ID for cache keys.
+    cache::StringIdLease fileId(cache::fileIds(), filePath);
+
     // Pre-compute destination offsets for each chunk.
+    std::vector<size_t> dstOffsets(chunksToRead.size());
+    {
+      size_t off = dstOffset;
+      for (size_t i = 0; i < chunksToRead.size(); ++i) {
+        dstOffsets[i] = off;
+        off += chunksToRead[i].size;
+      }
+    }
+
+    // Process each chunk through the cache.
+    for (size_t i = 0; i < chunksToRead.size(); ++i) {
+      const auto& chunk = chunksToRead[i];
+      uint8_t* chunkDst = dst + dstOffsets[i];
+      const auto chunkBytes = static_cast<size_t>(chunk.size);
+      const auto chunkSize = static_cast<uint64_t>(chunk.size);
+
+      try {
+        cache::RawFileCacheKey key{fileId.id(),
+                                   static_cast<uint64_t>(chunk.srcOffset)};
+        auto pin = cache->findOrCreate(key, chunkSize, nullptr);
+
+        if (pin.empty()) {
+          // Contention or cache full — fall back to direct read.
+          readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
+        } else if (pin.checkedEntry()->isExclusive()) {
+          // Cache miss — we have exclusive access, fill the entry.
+          auto* entry = pin.checkedEntry();
+          if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize) {
+            // Tiny entry — read into tinyData buffer.
+            readFile->pread(chunk.srcOffset, chunk.size, entry->tinyData());
+            std::memcpy(chunkDst, entry->tinyData(), chunkBytes);
+          } else {
+            // Large entry — read into Allocation page runs, then copy out.
+            auto& alloc = entry->data();
+            size_t remaining = chunkBytes;
+            int64_t srcPos = chunk.srcOffset;
+            for (uint32_t r = 0; r < alloc.numRuns() && remaining > 0; ++r) {
+              auto run = alloc.runAt(r);
+              auto bytes = std::min(
+                  static_cast<size_t>(run.numBytes()), remaining);
+              readFile->pread(srcPos, bytes, run.data());
+              srcPos += bytes;
+              remaining -= bytes;
+            }
+            // Copy from Allocation to destination buffer.
+            size_t copied = 0;
+            for (uint32_t r = 0; r < alloc.numRuns() && copied < chunkBytes; ++r) {
+              auto run = alloc.runAt(r);
+              auto bytes = std::min(
+                  static_cast<size_t>(run.numBytes()), chunkBytes - copied);
+              std::memcpy(chunkDst + copied, run.data(), bytes);
+              copied += bytes;
+            }
+          }
+          entry->setExclusiveToShared(/*ssdSavable=*/true);
+        } else {
+          // Cache hit — copy data from shared entry.
+          auto* entry = pin.checkedEntry();
+          if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize &&
+              entry->tinyData()) {
+            std::memcpy(chunkDst, entry->tinyData(), chunkBytes);
+          } else {
+            auto& alloc = entry->data();
+            size_t copied = 0;
+            for (uint32_t r = 0; r < alloc.numRuns() && copied < chunkBytes; ++r) {
+              auto run = alloc.runAt(r);
+              auto bytes = std::min(
+                  static_cast<size_t>(run.numBytes()), chunkBytes - copied);
+              std::memcpy(chunkDst + copied, run.data(), bytes);
+              copied += bytes;
+            }
+          }
+        }
+      } catch (const std::exception&) {
+        // Cache operation failed — fall back to direct read.
+        readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
+      }
+    }
+    dstOffset += totalChunkBytes;
+  } else if (executor && chunksToRead.size() > 1) {
+    // No cache available — use parallel pread when an executor is available
+    // and there are multiple chunks, since each chunk is an independent S3
+    // GET request.
     std::vector<size_t> dstOffsets(chunksToRead.size());
     for (size_t i = 0; i < chunksToRead.size(); ++i) {
       dstOffsets[i] = dstOffset;
