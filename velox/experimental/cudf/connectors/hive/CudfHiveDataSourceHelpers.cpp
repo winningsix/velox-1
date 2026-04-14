@@ -33,6 +33,7 @@
 #include <thrift/protocol/TCompactProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
 
+#include <folly/Executor.h>
 #include <folly/futures/Future.h>
 
 #include "velox/common/file/File.h"
@@ -420,7 +421,8 @@ std::string getTopLevelColumnName(
 std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
-    uint64_t splitStart) {
+    uint64_t splitStart,
+    folly::Executor* executor) {
   const auto filePath = readFile->getName();
   const auto fileSize = readFile->size();
 
@@ -653,10 +655,40 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   std::memcpy(dst, &magic, kHeaderLen);
   size_t dstOffset = kHeaderLen;
 
-  // Step 7: Read needed column chunks from file and write to buffer
-  for (const auto& chunk : chunksToRead) {
-    readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
-    dstOffset += chunk.size;
+  // Step 7: Read needed column chunks from file and write to buffer.
+  // Use parallel pread when an executor is available and there are multiple
+  // chunks, since each chunk is an independent S3 GET request.
+  if (executor && chunksToRead.size() > 1) {
+    // Pre-compute destination offsets for each chunk.
+    std::vector<size_t> dstOffsets(chunksToRead.size());
+    for (size_t i = 0; i < chunksToRead.size(); ++i) {
+      dstOffsets[i] = dstOffset;
+      dstOffset += chunksToRead[i].size;
+    }
+
+    std::vector<folly::SemiFuture<folly::Unit>> futures;
+    futures.reserve(chunksToRead.size());
+    for (size_t i = 0; i < chunksToRead.size(); ++i) {
+      auto promise = std::make_shared<folly::Promise<folly::Unit>>();
+      futures.push_back(promise->getSemiFuture());
+      executor->add(
+          [promise, readFile, offset = chunksToRead[i].srcOffset,
+           size = chunksToRead[i].size, dest = dst + dstOffsets[i]]() {
+            try {
+              readFile->pread(offset, size, dest);
+              promise->setValue(folly::Unit{});
+            } catch (...) {
+              promise->setException(
+                  folly::exception_wrapper(std::current_exception()));
+            }
+          });
+    }
+    folly::collectAll(std::move(futures)).wait();
+  } else {
+    for (const auto& chunk : chunksToRead) {
+      readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
+      dstOffset += chunk.size;
+    }
   }
 
   // Write footer
@@ -672,7 +704,9 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
             << " full=" << fileSize
             << " selective=" << totalBufSize
             << " saved=" << (fileSize - totalBufSize)
-            << " (" << (100 - totalBufSize * 100 / fileSize) << "%)";
+            << " (" << (100 - totalBufSize * 100 / fileSize) << "%)"
+            << " chunks=" << chunksToRead.size()
+            << " parallel=" << (executor && chunksToRead.size() > 1);
 
   return buf;
 }

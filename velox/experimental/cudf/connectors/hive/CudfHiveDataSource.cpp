@@ -509,7 +509,8 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
             [promise, readFile, colNames = std::move(colNames), start]() {
               try {
                 auto buf =
-                    selectiveParquetRead(readFile.get(), colNames, start);
+                    selectiveParquetRead(
+                        readFile.get(), colNames, start, executor_);
                 promise->set_value(std::move(buf));
               } catch (...) {
                 promise->set_exception(std::current_exception());
@@ -520,7 +521,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                 std::move(readFile)};
       }
 
-      // Fallback: no executor — run synchronously.
+      // Fallback: no executor — run synchronously (no parallel sub-reads).
       auto buf = selectiveParquetRead(readFile.get(), colNames, start);
       std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
       promise.set_value(std::move(buf));

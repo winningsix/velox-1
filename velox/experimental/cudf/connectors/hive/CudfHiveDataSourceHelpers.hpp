@@ -33,6 +33,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace folly {
+class Executor;
+} // namespace folly
+
 namespace facebook::velox {
 class ReadFile;
 } // namespace facebook::velox
@@ -162,6 +166,7 @@ std::shared_ptr<facebook::velox::cudf_velox::PinnedHostBuffer>
 selectiveParquetRead(
     facebook::velox::ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
-    uint64_t splitStart = 0);
+    uint64_t splitStart = 0,
+    folly::Executor* executor = nullptr);
 
 } // namespace facebook::velox::cudf_velox::connector::hive
