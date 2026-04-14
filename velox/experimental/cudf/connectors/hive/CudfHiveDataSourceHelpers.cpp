@@ -68,6 +68,34 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 
   return stdFuture;
 }
+
+using VD = facebook::velox::cudf_velox::VeloxDomain;
+
+struct DeferredStreamResources {
+  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> sourceBuffers;
+  std::vector<std::shared_ptr<PinnedHostBuffer>> pinnedHostBuffers;
+  std::vector<rmm::device_buffer> stagingBuffers;
+};
+
+void releaseDeferredStreamResources(void* ctx) {
+  delete static_cast<DeferredStreamResources*>(ctx);
+}
+
+void enqueueDeferredStreamRelease(
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<DeferredStreamResources> resources) {
+  if (!resources) {
+    return;
+  }
+  if (
+      resources->sourceBuffers.empty() &&
+      resources->pinnedHostBuffers.empty() &&
+      resources->stagingBuffers.empty()) {
+    return;
+  }
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(
+      stream.value(), releaseDeferredStreamResources, resources.release()));
+}
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -102,41 +130,57 @@ void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
     totalBytes += chunk.size;
   }
 
+  auto deferredResources = std::make_unique<DeferredStreamResources>();
   auto pinnedBuf = std::make_shared<PinnedHostBuffer>(totalBytes);
   if (pinnedBuf->isPinned()) {
     pinnedAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
   } else {
     pageableAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
   }
+  deferredResources->pinnedHostBuffers.push_back(pinnedBuf);
 
-  uint64_t hostOffset = 0;
-  for (auto& chunk : pendingChunks_) {
-    chunk.stream->readFully(
-        reinterpret_cast<char*>(pinnedBuf->data() + hostOffset), chunk.size);
-    hostOffset += chunk.size;
+  {
+    nvtx3::scoped_range_in<VD> hostFillRange(nvtx3::event_attributes{
+        "Scan::payloadHostFill", nvtx3::rgb{100, 180, 255}});
+    uint64_t hostOffset = 0;
+    for (auto& chunk : pendingChunks_) {
+      chunk.stream->readFully(
+          reinterpret_cast<char*>(pinnedBuf->data() + hostOffset), chunk.size);
+      hostOffset += chunk.size;
+    }
   }
 
   // Phase 2 (GPU): one bulk H2D into a staging device buffer, then D2D scatter.
-  rmm::device_buffer staging(totalBytes, stream);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      staging.data(),
-      pinnedBuf->data(),
-      totalBytes,
-      cudaMemcpyHostToDevice,
-      stream.value()));
-
-  hostOffset = 0;
-  for (const auto& chunk : pendingChunks_) {
+  deferredResources->stagingBuffers.emplace_back(totalBytes, stream);
+  auto& staging = deferredResources->stagingBuffers.back();
+  {
+    nvtx3::scoped_range_in<VD> h2dRange(nvtx3::event_attributes{
+        "Scan::payloadBulkH2D", nvtx3::rgb{220, 20, 60}});
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-        chunk.deviceDst,
-        static_cast<uint8_t*>(staging.data()) + hostOffset,
-        chunk.size,
-        cudaMemcpyDeviceToDevice,
+        staging.data(),
+        pinnedBuf->data(),
+        totalBytes,
+        cudaMemcpyHostToDevice,
         stream.value()));
-    hostOffset += chunk.size;
+  }
+
+  {
+    nvtx3::scoped_range_in<VD> d2dRange(nvtx3::event_attributes{
+        "Scan::payloadD2DScatter", nvtx3::rgb{255, 165, 0}});
+    uint64_t hostOffset = 0;
+    for (const auto& chunk : pendingChunks_) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          chunk.deviceDst,
+          static_cast<uint8_t*>(staging.data()) + hostOffset,
+          chunk.size,
+          cudaMemcpyDeviceToDevice,
+          stream.value()));
+      hostOffset += chunk.size;
+    }
   }
 
   pendingChunks_.clear();
+  enqueueDeferredStreamRelease(stream, std::move(deferredResources));
 }
 
 std::unique_ptr<cudf::io::datasource::buffer>
@@ -189,20 +233,34 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   auto future = folly::via(input_->executor())
                     .thenValue([this, offset, size, dst, stream](auto&&) {
-                      auto hostBuffer = this->host_read(offset, size);
-                      CUDF_CUDA_TRY(cudaMemcpyAsync(
-                          dst,
-                          hostBuffer->data(),
-                          hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
-                          stream.value()));
-                      // Wait for the async H2D copy to complete before
-                      // hostBuffer goes out of scope. PinnedHostBuffer uses a
-                      // pool allocator, so freed memory is immediately reusable
-                      // by other threads — the DMA engine would read from
-                      // recycled addresses without this sync.
-                      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
-                      return hostBuffer->size();
+                      auto deferredResources =
+                          std::make_unique<DeferredStreamResources>();
+                      std::unique_ptr<cudf::io::datasource::buffer> hostBuffer;
+                      {
+                        nvtx3::scoped_range_in<VD> hostReadRange(
+                            nvtx3::event_attributes{
+                                "Scan::payloadHostRead",
+                                nvtx3::rgb{100, 180, 255}});
+                        hostBuffer = this->host_read(offset, size);
+                      }
+                      {
+                        nvtx3::scoped_range_in<VD> h2dRange(
+                            nvtx3::event_attributes{
+                                "Scan::payloadDeviceReadH2D",
+                                nvtx3::rgb{220, 20, 60}});
+                        CUDF_CUDA_TRY(cudaMemcpyAsync(
+                            dst,
+                            hostBuffer->data(),
+                            hostBuffer->size(),
+                            cudaMemcpyHostToDevice,
+                            stream.value()));
+                      }
+                      auto hostBufferSize = hostBuffer->size();
+                      deferredResources->sourceBuffers.emplace_back(
+                          std::move(hostBuffer));
+                      enqueueDeferredStreamRelease(
+                          stream, std::move(deferredResources));
+                      return hostBufferSize;
                     });
   return toStdFuture(std::move(future));
 }
@@ -688,7 +746,14 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
       }
     }
 
-    // Process each chunk through the cache.
+    // Phase 1: Probe cache for all chunks. Serve cache hits immediately,
+    // collect cache misses for parallel S3 reads.
+    struct CacheMiss {
+      size_t idx;
+      cache::CachePin pin; // exclusive pin to fill
+    };
+    std::vector<CacheMiss> misses;
+
     for (size_t i = 0; i < chunksToRead.size(); ++i) {
       const auto& chunk = chunksToRead[i];
       uint8_t* chunkDst = dst + dstOffsets[i];
@@ -701,45 +766,13 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
         auto pin = cache->findOrCreate(key, chunkSize, nullptr);
 
         if (pin.empty()) {
-          // Contention or cache full — fall back to direct read.
-          readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
+          // Contention or cache full — will read directly in Phase 2.
+          misses.push_back({i, cache::CachePin{}});
         } else if (pin.checkedEntry()->isExclusive()) {
-          // Cache miss — we have exclusive access, fill the entry.
-          nvtx3::scoped_range_in<VD> cacheMissRange(nvtx3::event_attributes{
-              "IO::cacheMiss_S3Read", nvtx3::rgb{255, 80, 80}});
-          auto* entry = pin.checkedEntry();
-          if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize) {
-            // Tiny entry — read into tinyData buffer.
-            readFile->pread(chunk.srcOffset, chunk.size, entry->tinyData());
-            std::memcpy(chunkDst, entry->tinyData(), chunkBytes);
-          } else {
-            // Large entry — read into Allocation page runs, then copy out.
-            auto& alloc = entry->data();
-            size_t remaining = chunkBytes;
-            int64_t srcPos = chunk.srcOffset;
-            for (uint32_t r = 0; r < alloc.numRuns() && remaining > 0; ++r) {
-              auto run = alloc.runAt(r);
-              auto bytes = std::min(
-                  static_cast<size_t>(run.numBytes()), remaining);
-              readFile->pread(srcPos, bytes, run.data());
-              srcPos += bytes;
-              remaining -= bytes;
-            }
-            // Copy from Allocation to destination buffer.
-            size_t copied = 0;
-            for (uint32_t r = 0; r < alloc.numRuns() && copied < chunkBytes; ++r) {
-              auto run = alloc.runAt(r);
-              auto bytes = std::min(
-                  static_cast<size_t>(run.numBytes()), chunkBytes - copied);
-              std::memcpy(chunkDst + copied, run.data(), bytes);
-              copied += bytes;
-            }
-          }
-          entry->setExclusiveToShared(/*ssdSavable=*/true);
+          // Cache miss — save for parallel fill in Phase 2.
+          misses.push_back({i, std::move(pin)});
         } else {
-          // Cache hit — copy data from shared entry.
-          nvtx3::scoped_range_in<VD> cacheHitRange(nvtx3::event_attributes{
-              "IO::cacheRead", nvtx3::rgb{0, 200, 200}});
+          // Cache hit — copy from cache to destination immediately.
           auto* entry = pin.checkedEntry();
           if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize &&
               entry->tinyData()) {
@@ -747,7 +780,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
           } else {
             auto& alloc = entry->data();
             size_t copied = 0;
-            for (uint32_t r = 0; r < alloc.numRuns() && copied < chunkBytes; ++r) {
+            for (uint32_t r = 0; r < alloc.numRuns() && copied < chunkBytes;
+                 ++r) {
               auto run = alloc.runAt(r);
               auto bytes = std::min(
                   static_cast<size_t>(run.numBytes()), chunkBytes - copied);
@@ -757,8 +791,86 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
           }
         }
       } catch (const std::exception&) {
-        // Cache operation failed — fall back to direct read.
+        // Cache probe failed — will read directly in Phase 2.
+        misses.push_back({i, cache::CachePin{}});
+      }
+    }
+
+    // Phase 2: Fill cache misses. Use executor for parallel S3 reads when
+    // available (critical for AWS/S3 performance).
+    if (!misses.empty() && executor && misses.size() > 1) {
+      std::vector<folly::SemiFuture<folly::Unit>> futures;
+      futures.reserve(misses.size());
+      for (auto& miss : misses) {
+        auto promise = std::make_shared<folly::Promise<folly::Unit>>();
+        futures.push_back(promise->getSemiFuture());
+        const auto& chunk = chunksToRead[miss.idx];
+        uint8_t* chunkDst = dst + dstOffsets[miss.idx];
+        executor->add([promise, readFile, &chunk, chunkDst]() {
+          try {
+            readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
+            promise->setValue(folly::Unit{});
+          } catch (...) {
+            promise->setException(
+                folly::exception_wrapper(std::current_exception()));
+          }
+        });
+      }
+      folly::collectAll(std::move(futures)).wait();
+
+      // Now fill cache entries from the data we just read into dst.
+      for (auto& miss : misses) {
+        if (miss.pin.empty()) {
+          continue; // No pin — was a direct fallback read.
+        }
+        auto* entry = miss.pin.checkedEntry();
+        const auto& chunk = chunksToRead[miss.idx];
+        const uint8_t* src = dst + dstOffsets[miss.idx];
+        const auto chunkBytes = static_cast<size_t>(chunk.size);
+        if (chunkBytes <= cache::AsyncDataCacheEntry::kTinyDataSize) {
+          std::memcpy(entry->tinyData(), src, chunkBytes);
+        } else {
+          auto& alloc = entry->data();
+          size_t remaining = chunkBytes;
+          size_t srcOff = 0;
+          for (uint32_t r = 0; r < alloc.numRuns() && remaining > 0; ++r) {
+            auto run = alloc.runAt(r);
+            auto bytes =
+                std::min(static_cast<size_t>(run.numBytes()), remaining);
+            std::memcpy(run.data(), src + srcOff, bytes);
+            srcOff += bytes;
+            remaining -= bytes;
+          }
+        }
+        entry->setExclusiveToShared(/*ssdSavable=*/true);
+      }
+    } else {
+      // Serial fallback: single miss or no executor.
+      for (auto& miss : misses) {
+        const auto& chunk = chunksToRead[miss.idx];
+        uint8_t* chunkDst = dst + dstOffsets[miss.idx];
         readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
+        // Fill cache entry if we have a pin.
+        if (!miss.pin.empty()) {
+          auto* entry = miss.pin.checkedEntry();
+          const auto chunkBytes = static_cast<size_t>(chunk.size);
+          if (chunkBytes <= cache::AsyncDataCacheEntry::kTinyDataSize) {
+            std::memcpy(entry->tinyData(), chunkDst, chunkBytes);
+          } else {
+            auto& alloc = entry->data();
+            size_t remaining = chunkBytes;
+            size_t srcOff = 0;
+            for (uint32_t r = 0; r < alloc.numRuns() && remaining > 0; ++r) {
+              auto run = alloc.runAt(r);
+              auto bytes =
+                  std::min(static_cast<size_t>(run.numBytes()), remaining);
+              std::memcpy(run.data(), chunkDst + srcOff, bytes);
+              srcOff += bytes;
+              remaining -= bytes;
+            }
+          }
+          entry->setExclusiveToShared(/*ssdSavable=*/true);
+        }
       }
     }
     dstOffset += totalChunkBytes;

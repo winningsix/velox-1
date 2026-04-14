@@ -50,6 +50,7 @@
 #include <cudf/transform.hpp>
 
 #include <cuda_runtime.h>
+#include <rmm/device_buffer.hpp>
 
 #include <future>
 #include <limits>
@@ -62,6 +63,37 @@ using cudf_velox::GpuGuard;
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
+
+namespace {
+
+constexpr size_t kPayloadBufferPaddingMultiple = 8;
+constexpr size_t kSmallPayloadRangeBytes = 256 * 1024;
+constexpr size_t kPayloadCoalesceGapBytes = 64 * 1024;
+constexpr size_t kPayloadCoalesceSpanBytes = 4 * 1024 * 1024;
+
+struct DeferredPayloadResources {
+  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> hostBuffers;
+  std::vector<rmm::device_buffer> stagingBuffers;
+};
+
+void releaseDeferredPayloadResources(void* ctx) {
+  delete static_cast<DeferredPayloadResources*>(ctx);
+}
+
+void enqueueDeferredPayloadRelease(
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<DeferredPayloadResources> resources) {
+  if (!resources) {
+    return;
+  }
+  if (resources->hostBuffers.empty() && resources->stagingBuffers.empty()) {
+    return;
+  }
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(
+      stream.value(), releaseDeferredPayloadResources, resources.release()));
+}
+
+} // namespace
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
@@ -236,35 +268,40 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                    << " (coalesced path, GPU lock acquired)"
                    << std::endl;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
-      while (splitReader_->has_next()) {
-        auto tableWithMetadata = splitReader_->read_chunk();
-        if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
-          auto& tbl = tableWithMetadata.tbl;
-          if (remainingFilterExprSet_) {
-            auto cols = tbl->release();
-            const auto originalNumColumns = cols.size();
-            auto filterResult = cudfExpressionEvaluator_->eval(
-                cols, stream_, cudf::get_current_device_resource_ref());
-            std::vector<std::unique_ptr<cudf::column>> origCols;
-            origCols.reserve(originalNumColumns);
-            std::move(
-                cols.begin(),
-                cols.begin() + originalNumColumns,
-                std::back_inserter(origCols));
-            auto origTable =
-                std::make_unique<cudf::table>(std::move(origCols));
-            tbl = cudf::apply_boolean_mask(
-                *origTable,
-                asView(filterResult),
-                stream_,
-                cudf::get_current_device_resource_ref());
-          }
-          if (tbl->num_rows() > 0) {
-            auto tableBytes = estimateTableBytes(tbl);
-            accumulatedTables_.push_back(std::move(tbl));
-            accumulatedBytes_ += tableBytes;
-            if (accumulatedBytes_ >= effectiveTarget) {
-              break;
+      {
+        nvtx3::scoped_range_in<VeloxDomain> coalescedGpuReadRange(
+            nvtx3::event_attributes{
+                "Scan::gpuReadCoalesced", nvtx3::rgb{80, 171, 241}});
+        while (splitReader_->has_next()) {
+          auto tableWithMetadata = splitReader_->read_chunk();
+          if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
+            auto& tbl = tableWithMetadata.tbl;
+            if (remainingFilterExprSet_) {
+              auto cols = tbl->release();
+              const auto originalNumColumns = cols.size();
+              auto filterResult = cudfExpressionEvaluator_->eval(
+                  cols, stream_, cudf::get_current_device_resource_ref());
+              std::vector<std::unique_ptr<cudf::column>> origCols;
+              origCols.reserve(originalNumColumns);
+              std::move(
+                  cols.begin(),
+                  cols.begin() + originalNumColumns,
+                  std::back_inserter(origCols));
+              auto origTable =
+                  std::make_unique<cudf::table>(std::move(origCols));
+              tbl = cudf::apply_boolean_mask(
+                  *origTable,
+                  asView(filterResult),
+                  stream_,
+                  cudf::get_current_device_resource_ref());
+            }
+            if (tbl->num_rows() > 0) {
+              auto tableBytes = estimateTableBytes(tbl);
+              accumulatedTables_.push_back(std::move(tbl));
+              accumulatedBytes_ += tableBytes;
+              if (accumulatedBytes_ >= effectiveTarget) {
+                break;
+              }
             }
           }
         }
@@ -512,12 +549,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         // Capture readFile by value (shared_ptr copy) to keep the file
         // handle alive for the duration of the async read.
         executor_->add(
-            [promise, readFile, colNames = std::move(colNames), start,
-             executor = executor_]() {
+            [promise, readFile, colNames = std::move(colNames), start]() {
               try {
                 auto buf =
-                    selectiveParquetRead(
-                        readFile.get(), colNames, start, executor);
+                    selectiveParquetRead(readFile.get(), colNames, start);
                 promise->set_value(std::move(buf));
               } catch (...) {
                 promise->set_exception(std::current_exception());
@@ -528,7 +563,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                 std::move(readFile)};
       }
 
-      // Fallback: no executor — run synchronously (no parallel sub-reads).
+      // Fallback: no executor — run synchronously.
       auto buf = selectiveParquetRead(readFile.get(), colNames, start);
       std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
       promise.set_value(std::move(buf));
@@ -1138,60 +1173,172 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       exptSplitReader_->payload_column_chunks_byte_ranges(
           batchSpan, exptResolvedOptions_);
 
-  std::vector<rmm::device_buffer> columnChunkBuffers(
-      columnChunkByteRanges.size());
+  std::vector<rmm::device_buffer> columnChunkBuffers;
+  columnChunkBuffers.reserve(columnChunkByteRanges.size());
   std::vector<std::future<size_t>> ioFutures{};
   ioFutures.reserve(columnChunkByteRanges.size());
-  std::for_each(
-      thrust::counting_iterator<size_t>(0),
-      thrust::counting_iterator(columnChunkByteRanges.size()),
-      [&](auto idx) {
+  for (const auto& byteRange : columnChunkByteRanges) {
+    columnChunkBuffers.emplace_back(
+        cudf::util::round_up_safe<size_t>(
+            byteRange.size(), kPayloadBufferPaddingMultiple),
+        stream_,
+        cudf::get_current_device_resource_ref());
+  }
+
+  auto* bufferedInput =
+      dynamic_cast<BufferedInputDataSource*>(dataSource_.get());
+  auto deferredResources = std::make_unique<DeferredPayloadResources>();
+  auto enqueueDirectHostCopy = [&](size_t idx) {
+    const auto& byteRange = columnChunkByteRanges[idx];
+    auto& buffer = columnChunkBuffers[idx];
+    std::unique_ptr<cudf::io::datasource::buffer> hostBuffer;
+    {
+      nvtx3::scoped_range_in<VeloxDomain> hostReadRange(
+          nvtx3::event_attributes{
+              "Scan::payloadHostRead", nvtx3::rgb{100, 180, 255}});
+      hostBuffer = dataSource_->host_read(byteRange.offset(), byteRange.size());
+    }
+    {
+      nvtx3::scoped_range_in<VeloxDomain> h2dRange(
+          nvtx3::event_attributes{
+              "Scan::payloadDirectH2D", nvtx3::rgb{220, 20, 60}});
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          buffer.data(),
+          hostBuffer->data(),
+          byteRange.size(),
+          cudaMemcpyHostToDevice,
+          stream_.value()));
+    }
+    deferredResources->hostBuffers.emplace_back(std::move(hostBuffer));
+  };
+  auto enqueueCoalescedHostCopy = [&](size_t beginIdx, size_t endIdx) {
+    const auto startOffset =
+        static_cast<size_t>(columnChunkByteRanges[beginIdx].offset());
+    const auto endOffset = static_cast<size_t>(
+        columnChunkByteRanges[endIdx - 1].offset() +
+        columnChunkByteRanges[endIdx - 1].size());
+    const auto spanBytes = endOffset - startOffset;
+
+    std::unique_ptr<cudf::io::datasource::buffer> hostBuffer;
+    {
+      nvtx3::scoped_range_in<VeloxDomain> hostReadRange(
+          nvtx3::event_attributes{
+              "Scan::payloadHostReadCoalesced", nvtx3::rgb{100, 180, 255}});
+      hostBuffer = dataSource_->host_read(startOffset, spanBytes);
+    }
+
+    deferredResources->stagingBuffers.emplace_back(
+        cudf::util::round_up_safe<size_t>(
+            spanBytes, kPayloadBufferPaddingMultiple),
+        stream_,
+        cudf::get_current_device_resource_ref());
+    auto& staging = deferredResources->stagingBuffers.back();
+    {
+      nvtx3::scoped_range_in<VeloxDomain> h2dRange(
+          nvtx3::event_attributes{
+              "Scan::payloadCoalescedH2D", nvtx3::rgb{220, 20, 60}});
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          staging.data(),
+          hostBuffer->data(),
+          spanBytes,
+          cudaMemcpyHostToDevice,
+          stream_.value()));
+    }
+    {
+      nvtx3::scoped_range_in<VeloxDomain> d2dRange(
+          nvtx3::event_attributes{
+              "Scan::payloadD2DScatter", nvtx3::rgb{255, 165, 0}});
+      for (size_t idx = beginIdx; idx < endIdx; ++idx) {
         const auto& byteRange = columnChunkByteRanges[idx];
         auto& buffer = columnChunkBuffers[idx];
+        const auto relativeOffset =
+            static_cast<size_t>(byteRange.offset()) - startOffset;
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            buffer.data(),
+            static_cast<uint8_t*>(staging.data()) + relativeOffset,
+            byteRange.size(),
+            cudaMemcpyDeviceToDevice,
+            stream_.value()));
+      }
+    }
+    deferredResources->hostBuffers.emplace_back(std::move(hostBuffer));
+  };
 
-        constexpr size_t bufferPaddingMultiple = 8;
-        buffer = rmm::device_buffer(
-            cudf::util::round_up_safe<size_t>(
-                byteRange.size(), bufferPaddingMultiple),
-            stream_,
-            cudf::get_current_device_resource_ref());
-        if (auto bufferedInput =
-                dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
-          bufferedInput->enqueueForDevice(
-              static_cast<uint64_t>(byteRange.offset()),
-              static_cast<uint64_t>(byteRange.size()),
-              static_cast<uint8_t*>(buffer.data()));
-        } else if (
-            dataSource_->supports_device_read() and
-            dataSource_->is_device_read_preferred(byteRange.size())) {
-          ioFutures.emplace_back(dataSource_->device_read_async(
-              byteRange.offset(),
-              byteRange.size(),
-              static_cast<uint8_t*>(buffer.data()),
-              stream_));
-        } else {
-          auto hostBuffer =
-              dataSource_->host_read(byteRange.offset(), byteRange.size());
-          CUDF_CUDA_TRY(cudaMemcpyAsync(
-              buffer.data(),
-              hostBuffer->data(),
-              byteRange.size(),
-              cudaMemcpyHostToDevice,
-              stream_.value()));
-          // Sync before hostBuffer goes out of scope — cudaMemcpyAsync
-          // reads from pinned host memory asynchronously, and the pool
-          // allocator recycles the address immediately on free.
-          stream_.synchronize();
+  if (bufferedInput != nullptr) {
+    for (size_t idx = 0; idx < columnChunkByteRanges.size(); ++idx) {
+      const auto& byteRange = columnChunkByteRanges[idx];
+      auto& buffer = columnChunkBuffers[idx];
+      bufferedInput->enqueueForDevice(
+          static_cast<uint64_t>(byteRange.offset()),
+          static_cast<uint64_t>(byteRange.size()),
+          static_cast<uint8_t*>(buffer.data()));
+    }
+  } else {
+    size_t idx = 0;
+    while (idx < columnChunkByteRanges.size()) {
+      const auto& byteRange = columnChunkByteRanges[idx];
+      const bool useDeviceRead =
+          dataSource_->supports_device_read() &&
+          dataSource_->is_device_read_preferred(byteRange.size());
+      if (useDeviceRead) {
+        ioFutures.emplace_back(dataSource_->device_read_async(
+            byteRange.offset(),
+            byteRange.size(),
+            static_cast<uint8_t*>(columnChunkBuffers[idx].data()),
+            stream_));
+        ++idx;
+        continue;
+      }
+
+      const auto currentSize = static_cast<size_t>(byteRange.size());
+      size_t groupEnd = idx + 1;
+      size_t groupStartOffset = static_cast<size_t>(byteRange.offset());
+      size_t groupEndOffset = groupStartOffset + currentSize;
+      while (groupEnd < columnChunkByteRanges.size()) {
+        const auto& nextRange = columnChunkByteRanges[groupEnd];
+        if (
+            dataSource_->supports_device_read() &&
+            dataSource_->is_device_read_preferred(nextRange.size())) {
+          break;
         }
-      });
+        const auto nextOffset = static_cast<size_t>(nextRange.offset());
+        if (nextOffset < groupEndOffset) {
+          break;
+        }
+        const auto gapBytes = nextOffset - groupEndOffset;
+        const auto nextEndOffset =
+            nextOffset + static_cast<size_t>(nextRange.size());
+        const auto spanBytes = nextEndOffset - groupStartOffset;
+        const auto prevSize =
+            static_cast<size_t>(columnChunkByteRanges[groupEnd - 1].size());
+        const bool smallCopyCandidate =
+            prevSize <= kSmallPayloadRangeBytes ||
+            static_cast<size_t>(nextRange.size()) <= kSmallPayloadRangeBytes;
+        if (
+            !smallCopyCandidate || gapBytes > kPayloadCoalesceGapBytes ||
+            spanBytes > kPayloadCoalesceSpanBytes) {
+          break;
+        }
+        groupEndOffset = nextEndOffset;
+        ++groupEnd;
+      }
 
-  if (auto bufferedInput =
-          dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+      if (groupEnd - idx > 1) {
+        enqueueCoalescedHostCopy(idx, groupEnd);
+      } else {
+        enqueueDirectHostCopy(idx);
+      }
+      idx = groupEnd;
+    }
+  }
+
+  if (bufferedInput != nullptr) {
     bufferedInput->load(stream_);
   }
   std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
     future.get();
   });
+  enqueueDeferredPayloadRelease(stream_, std::move(deferredResources));
 
   std::vector<cudf::device_span<uint8_t const>> columnChunkData;
   columnChunkData.reserve(columnChunkBuffers.size());
@@ -1210,14 +1357,19 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   auto allTrueRowMask =
       cudf::make_column_from_scalar(scalarTrue, totalRows, stream_);
 
-  auto tableWithMetadata = exptSplitReader_->materialize_payload_columns(
-      batchSpan,
-      columnChunkData,
-      allTrueRowMask->view(),
-      cudf::io::parquet::experimental::use_data_page_mask::NO,
-      readerOptions_,
-      stream_,
-      cudf::get_current_device_resource_ref());
+  auto tableWithMetadata = [&]() {
+    nvtx3::scoped_range_in<VeloxDomain> materializeRange(
+        nvtx3::event_attributes{
+            "Scan::payloadMaterialize", nvtx3::rgb{50, 205, 50}});
+    return exptSplitReader_->materialize_payload_columns(
+        batchSpan,
+        columnChunkData,
+        allTrueRowMask->view(),
+        cudf::io::parquet::experimental::use_data_page_mask::NO,
+        readerOptions_,
+        stream_,
+        cudf::get_current_device_resource_ref());
+  }();
 
   metadata = std::move(tableWithMetadata.metadata);
 
