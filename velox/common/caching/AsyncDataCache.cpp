@@ -20,6 +20,7 @@
 #include "velox/common/caching/SsdFile.h"
 
 #include "velox/common/base/Counters.h"
+#include <nvtx3/nvtx3.hpp>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/base/SuccinctPrinter.h"
@@ -746,6 +747,9 @@ CachePin AsyncDataCache::findOrCreate(
     RawFileCacheKey key,
     uint64_t size,
     folly::SemiFuture<bool>* wait) {
+  nvtx3::scoped_range range(nvtx3::event_attributes{
+      "Cache::findOrCreate",
+      nvtx3::rgb{0, 200, 200}});
   const int shard = std::hash<RawFileCacheKey>()(key) & shardMask_;
   return shards_[shard]->findOrCreate(key, size, wait);
 }
@@ -763,6 +767,9 @@ bool AsyncDataCache::exists(RawFileCacheKey key) const {
 bool AsyncDataCache::makeSpace(
     MachinePageCount numPages,
     std::function<bool(memory::Allocation& allocation)> allocate) {
+  nvtx3::scoped_range range(nvtx3::event_attributes{
+      "Cache::makeSpace",
+      nvtx3::rgb{200, 0, 200}});
   // Try to allocate and if failed, evict the desired amount and
   // retry. This is without synchronization, so that other threads may
   // get what one thread evicted but this will usually work in a

@@ -20,6 +20,8 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 
 #include <algorithm>
+#include <fmt/format.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
@@ -101,6 +103,9 @@ class S3ReadFile ::Impl {
   // Gets the length of the file.
   // Checks if there are any issues reading the file.
   void initialize(const filesystems::FileOptions& options) {
+    nvtx3::scoped_range range(nvtx3::event_attributes{
+        "S3::HeadObject",
+        nvtx3::rgb{200, 200, 50}});
     if (options.fileSize.has_value()) {
       VELOX_CHECK_GE(
           options.fileSize.value(), 0, "File size must be non-negative");
@@ -196,6 +201,9 @@ class S3ReadFile ::Impl {
       uint64_t offset,
       uint64_t length,
       Aws::IOStreamFactory streamFactory) const {
+    const auto nvtxMsg = fmt::format("S3::GetObject [off={} len={} key={}]", offset, length, key_.substr(key_.rfind('/') + 1));
+    nvtx3::scoped_range range(nvtx3::event_attributes{
+        nvtxMsg, nvtx3::rgb{255, 50, 50}});
     Aws::S3::Model::GetObjectRequest request;
     request.SetBucket(awsString(bucket_));
     request.SetKey(awsString(key_));

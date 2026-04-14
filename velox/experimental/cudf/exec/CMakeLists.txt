@@ -25,6 +25,7 @@ add_library(
   CudfOrderBy.cpp
   CudfShufflePartition.cpp
   CudfTopN.cpp
+  SparkTaskContext.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp

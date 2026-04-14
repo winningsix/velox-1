@@ -27,6 +27,7 @@
 
 #include <fmt/format.h>
 #include <glog/logging.h>
+#include <nvtx3/nvtx3.hpp>
 #include <memory>
 #include <stdexcept>
 
@@ -471,6 +472,9 @@ std::unique_ptr<ReadFile> S3FileSystem::openFileForRead(
     std::string_view s3Path,
     const FileOptions& options) {
   const auto path = getPath(s3Path);
+  const auto nvtxMsg = fmt::format("S3::openFile [{}]", path.substr(path.rfind('/') + 1));
+  nvtx3::scoped_range range(nvtx3::event_attributes{
+      nvtxMsg, nvtx3::rgb{150, 150, 255}});
   auto s3file = std::make_unique<S3ReadFile>(path, impl_->s3Client());
   s3file->initialize(options);
   return s3file;

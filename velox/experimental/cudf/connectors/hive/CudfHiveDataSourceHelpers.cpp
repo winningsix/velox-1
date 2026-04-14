@@ -20,6 +20,7 @@
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+#include "velox/experimental/cudf/exec/SparkTaskContext.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -430,9 +431,13 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   const auto filePath = readFile->getName();
   const auto fileSize = readFile->size();
   const auto shortName = filePath.substr(filePath.rfind('/') + 1);
+  const auto nvtxMsg = fmt::format(
+      "IO::selectiveParquetRead [s={} t={} {}]",
+      cudf_velox::SparkTaskContext::stageId,
+      cudf_velox::SparkTaskContext::taskAttemptId,
+      shortName);
   nvtx3::scoped_range_in<VD> outerRange(nvtx3::event_attributes{
-      fmt::format("IO::selectiveParquetRead [{}]", shortName),
-      nvtx3::rgb{50, 200, 50}});
+      nvtxMsg, nvtx3::rgb{50, 200, 50}});
 
   auto fullRead = [&]() {
     auto buf = std::make_shared<PinnedHostBuffer>(fileSize);

@@ -17,6 +17,7 @@
 #include "velox/common/caching/SsdFile.h"
 
 #include <folly/portability/SysUio.h>
+#include <nvtx3/nvtx3.hpp>
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Crc.h"
 #include "velox/common/base/SuccinctPrinter.h"
@@ -245,6 +246,9 @@ void SsdFile::read(
     uint64_t offset,
     const std::vector<folly::Range<char*>>& buffers) {
   process::TraceContext trace("SsdFile::read");
+  nvtx3::scoped_range range(nvtx3::event_attributes{
+      "SSDCache::read",
+      nvtx3::rgb{50, 200, 50}});
   readFile_->preadv(offset, buffers);
 }
 
@@ -357,6 +361,9 @@ void SsdFile::clearRegionEntriesLocked(const std::vector<int32_t>& regions) {
 
 void SsdFile::write(std::vector<CachePin>& pins) {
   process::TraceContext trace("SsdFile::write");
+  nvtx3::scoped_range range(nvtx3::event_attributes{
+      "SSDCache::write",
+      nvtx3::rgb{255, 165, 0}});
 
   if (state_.load() == State::kNoSpace) {
     ++stats_.writeSsdDropped;
