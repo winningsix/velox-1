@@ -215,6 +215,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   if (not useExperimentalSplitReader_) {
     // Lazily create the multi-source reader on first next() call.
     if (coalescedMultiSourcePending_) {
+      nvtx3::scoped_range_in<VeloxDomain> createReaderRange(
+          nvtx3::event_attributes{
+              "Scan::createReader", nvtx3::rgb{100, 200, 100}});
       createCoalescedMultiSourceReader();
     }
 
@@ -294,6 +297,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
                  << " (single-file path, GPU lock acquired)"
                  << std::endl;
     auto tableWithMetadata = [&]() {
+      nvtx3::scoped_range_in<VeloxDomain> gpuReadRange(
+          nvtx3::event_attributes{
+              "Scan::gpuRead", nvtx3::rgb{80, 171, 241}});
       try {
         return splitReader_->read_chunk();
       } catch (const std::exception& e) {
@@ -506,11 +512,12 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         // Capture readFile by value (shared_ptr copy) to keep the file
         // handle alive for the duration of the async read.
         executor_->add(
-            [promise, readFile, colNames = std::move(colNames), start]() {
+            [promise, readFile, colNames = std::move(colNames), start,
+             executor = executor_]() {
               try {
                 auto buf =
                     selectiveParquetRead(
-                        readFile.get(), colNames, start, executor_);
+                        readFile.get(), colNames, start, executor);
                 promise->set_value(std::move(buf));
               } catch (...) {
                 promise->set_exception(std::current_exception());

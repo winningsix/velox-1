@@ -18,6 +18,7 @@
 
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
@@ -425,8 +426,13 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart,
     folly::Executor* executor) {
+  using VD = cudf_velox::VeloxDomain;
   const auto filePath = readFile->getName();
   const auto fileSize = readFile->size();
+  const auto shortName = filePath.substr(filePath.rfind('/') + 1);
+  nvtx3::scoped_range_in<VD> outerRange(nvtx3::event_attributes{
+      fmt::format("IO::selectiveParquetRead [{}]", shortName),
+      nvtx3::rgb{50, 200, 50}});
 
   auto fullRead = [&]() {
     auto buf = std::make_shared<PinnedHostBuffer>(fileSize);
@@ -452,7 +458,9 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   // Step 1: Read and parse the Parquet footer using Velox Thrift types,
   // avoiding any dependency on cuDF internal APIs.
   pqthrift::FileMetaData metadata;
-  {
+  { // readFooter scope
+    nvtx3::scoped_range_in<VD> footerRange(nvtx3::event_attributes{
+        "IO::readFooter", nvtx3::rgb{100, 180, 255}});
     // Read the ender (footer_len + magic) from the end of the file.
     uint8_t enderBuf[kEnderLen];
     readFile->pread(fileSize - kEnderLen, kEnderLen, enderBuf);
@@ -663,7 +671,7 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   auto* cache = cache::AsyncDataCache::getInstance();
   if (cache) {
     // Map file path to a numeric ID for cache keys.
-    cache::StringIdLease fileId(cache::fileIds(), filePath);
+    StringIdLease fileId(fileIds(), filePath);
 
     // Pre-compute destination offsets for each chunk.
     std::vector<size_t> dstOffsets(chunksToRead.size());
@@ -692,6 +700,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
           readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
         } else if (pin.checkedEntry()->isExclusive()) {
           // Cache miss — we have exclusive access, fill the entry.
+          nvtx3::scoped_range_in<VD> cacheMissRange(nvtx3::event_attributes{
+              "IO::cacheMiss_S3Read", nvtx3::rgb{255, 80, 80}});
           auto* entry = pin.checkedEntry();
           if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize) {
             // Tiny entry — read into tinyData buffer.
@@ -723,6 +733,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
           entry->setExclusiveToShared(/*ssdSavable=*/true);
         } else {
           // Cache hit — copy data from shared entry.
+          nvtx3::scoped_range_in<VD> cacheHitRange(nvtx3::event_attributes{
+              "IO::cacheRead", nvtx3::rgb{0, 200, 200}});
           auto* entry = pin.checkedEntry();
           if (chunkSize <= cache::AsyncDataCacheEntry::kTinyDataSize &&
               entry->tinyData()) {
@@ -749,6 +761,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     // No cache available — use parallel pread when an executor is available
     // and there are multiple chunks, since each chunk is an independent S3
     // GET request.
+    nvtx3::scoped_range_in<VD> directRange(nvtx3::event_attributes{
+        "IO::directPread", nvtx3::rgb{255, 150, 50}});
     std::vector<size_t> dstOffsets(chunksToRead.size());
     for (size_t i = 0; i < chunksToRead.size(); ++i) {
       dstOffsets[i] = dstOffset;
@@ -774,6 +788,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     }
     folly::collectAll(std::move(futures)).wait();
   } else {
+    nvtx3::scoped_range_in<VD> directRange(nvtx3::event_attributes{
+        "IO::directPread", nvtx3::rgb{255, 150, 50}});
     for (const auto& chunk : chunksToRead) {
       readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
       dstOffset += chunk.size;
