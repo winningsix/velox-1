@@ -796,27 +796,16 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
       }
     }
 
-    // Phase 2: Fill cache misses. Use executor for parallel S3 reads when
-    // available (critical for AWS/S3 performance).
-    if (!misses.empty() && executor && misses.size() > 1) {
-      std::vector<folly::SemiFuture<folly::Unit>> futures;
-      futures.reserve(misses.size());
+    // Phase 2: Fill cache misses sequentially.
+    // (Cannot use executor for parallel pread here — selectiveParquetRead
+    //  already runs ON the executor, so nested submissions deadlock when
+    //  the thread pool is exhausted by concurrent stages.)
+    if (!misses.empty()) {
       for (auto& miss : misses) {
-        auto promise = std::make_shared<folly::Promise<folly::Unit>>();
-        futures.push_back(promise->getSemiFuture());
         const auto& chunk = chunksToRead[miss.idx];
         uint8_t* chunkDst = dst + dstOffsets[miss.idx];
-        executor->add([promise, readFile, &chunk, chunkDst]() {
-          try {
-            readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
-            promise->setValue(folly::Unit{});
-          } catch (...) {
-            promise->setException(
-                folly::exception_wrapper(std::current_exception()));
-          }
-        });
+        readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
       }
-      folly::collectAll(std::move(futures)).wait();
 
       // Now fill cache entries from the data we just read into dst.
       for (auto& miss : misses) {
@@ -844,67 +833,12 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
         }
         entry->setExclusiveToShared(/*ssdSavable=*/true);
       }
-    } else {
-      // Serial fallback: single miss or no executor.
-      for (auto& miss : misses) {
-        const auto& chunk = chunksToRead[miss.idx];
-        uint8_t* chunkDst = dst + dstOffsets[miss.idx];
-        readFile->pread(chunk.srcOffset, chunk.size, chunkDst);
-        // Fill cache entry if we have a pin.
-        if (!miss.pin.empty()) {
-          auto* entry = miss.pin.checkedEntry();
-          const auto chunkBytes = static_cast<size_t>(chunk.size);
-          if (chunkBytes <= cache::AsyncDataCacheEntry::kTinyDataSize) {
-            std::memcpy(entry->tinyData(), chunkDst, chunkBytes);
-          } else {
-            auto& alloc = entry->data();
-            size_t remaining = chunkBytes;
-            size_t srcOff = 0;
-            for (uint32_t r = 0; r < alloc.numRuns() && remaining > 0; ++r) {
-              auto run = alloc.runAt(r);
-              auto bytes =
-                  std::min(static_cast<size_t>(run.numBytes()), remaining);
-              std::memcpy(run.data(), chunkDst + srcOff, bytes);
-              srcOff += bytes;
-              remaining -= bytes;
-            }
-          }
-          entry->setExclusiveToShared(/*ssdSavable=*/true);
-        }
-      }
     }
     dstOffset += totalChunkBytes;
-  } else if (executor && chunksToRead.size() > 1) {
-    // No cache available — use parallel pread when an executor is available
-    // and there are multiple chunks, since each chunk is an independent S3
-    // GET request.
-    nvtx3::scoped_range_in<VD> directRange(nvtx3::event_attributes{
-        "IO::directPread", nvtx3::rgb{255, 150, 50}});
-    std::vector<size_t> dstOffsets(chunksToRead.size());
-    for (size_t i = 0; i < chunksToRead.size(); ++i) {
-      dstOffsets[i] = dstOffset;
-      dstOffset += chunksToRead[i].size;
-    }
-
-    std::vector<folly::SemiFuture<folly::Unit>> futures;
-    futures.reserve(chunksToRead.size());
-    for (size_t i = 0; i < chunksToRead.size(); ++i) {
-      auto promise = std::make_shared<folly::Promise<folly::Unit>>();
-      futures.push_back(promise->getSemiFuture());
-      executor->add(
-          [promise, readFile, offset = chunksToRead[i].srcOffset,
-           size = chunksToRead[i].size, dest = dst + dstOffsets[i]]() {
-            try {
-              readFile->pread(offset, size, dest);
-              promise->setValue(folly::Unit{});
-            } catch (...) {
-              promise->setException(
-                  folly::exception_wrapper(std::current_exception()));
-            }
-          });
-    }
-    folly::collectAll(std::move(futures)).wait();
   } else {
+    // Sequential pread — safe from executor thread-pool deadlock.
+    // (Parallel pread via the same executor that called selectiveParquetRead
+    //  causes nested-submission deadlock when many stages run concurrently.)
     nvtx3::scoped_range_in<VD> directRange(nvtx3::event_attributes{
         "IO::directPread", nvtx3::rgb{255, 150, 50}});
     for (const auto& chunk : chunksToRead) {
