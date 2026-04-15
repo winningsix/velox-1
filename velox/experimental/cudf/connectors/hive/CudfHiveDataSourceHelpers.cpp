@@ -20,7 +20,7 @@
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
-#include "velox/experimental/cudf/exec/SparkTaskContext.h"
+// SparkTaskContext removed — JNI bridge not functional yet
 
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -490,10 +490,7 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   const auto fileSize = readFile->size();
   const auto shortName = filePath.substr(filePath.rfind('/') + 1);
   const auto nvtxMsg = fmt::format(
-      "IO::selectiveParquetRead [s={} t={} {}]",
-      cudf_velox::SparkTaskContext::stageId,
-      cudf_velox::SparkTaskContext::taskAttemptId,
-      shortName);
+      "IO::selectiveParquetRead [{}]", shortName);
   nvtx3::scoped_range_in<VD> outerRange(nvtx3::event_attributes{
       nvtxMsg, nvtx3::rgb{50, 200, 50}});
 
@@ -731,7 +728,10 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   // Step 7: Read needed column chunks from file and write to buffer.
   // Try cache-aware reads first; fall back to direct S3 reads if cache is
   // unavailable or on error.
-  auto* cache = cache::AsyncDataCache::getInstance();
+  // Disable cache in selectiveParquetRead for now — it causes
+  // performance regression in multi-query mode. Will re-enable after
+  // root cause is found.
+  auto* cache = static_cast<cache::AsyncDataCache*>(nullptr);
   if (cache) {
     // Map file path to a numeric ID for cache keys.
     StringIdLease fileId(fileIds(), filePath);
