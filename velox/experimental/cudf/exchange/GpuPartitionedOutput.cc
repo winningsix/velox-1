@@ -73,6 +73,7 @@ GpuPartitionedOutput::GpuPartitionedOutput(
       bufferManager_(exec::OutputBufferManager::getInstanceRef()),
       bufferReleaseFn_([task = operatorCtx_->task()]() {}) {
   VELOX_USER_CHECK_GT(numDestinations_, 0, "numDestinations must be positive");
+  initInProcessChannelsIfNeeded();
 }
 
 GpuPartitionedOutput::GpuPartitionedOutput(
@@ -102,6 +103,27 @@ GpuPartitionedOutput::GpuPartitionedOutput(
       // output buffers are being accessed externally.
       bufferReleaseFn_([task = operatorCtx_->task()]() {}) {
   VELOX_USER_CHECK_GT(numDestinations_, 0, "numDestinations must be positive");
+  initInProcessChannelsIfNeeded();
+}
+
+void GpuPartitionedOutput::initInProcessChannelsIfNeeded() {
+  const auto& taskId = operatorCtx_->task()->taskId();
+  if (!isInProcessTaskId(taskId)) {
+    return;
+  }
+  // Size the per-destination buffer the same as the in-process single-task
+  // run's OutputBuffer default (1 GB / numDestinations). With 16 destinations
+  // that's 64 MB/queue -- tight enough to trigger back-pressure, loose enough
+  // that one cuDF scan batch doesn't immediately stall.
+  constexpr int64_t kDefaultTotalBufferBytes = int64_t{1} << 30;
+  const int64_t perDestBytes = std::max<int64_t>(
+      int64_t{32} << 20, kDefaultTotalBufferBytes / numDestinations_);
+  auto& registry = InProcessChannelRegistry::get();
+  inprocChannels_.reserve(numDestinations_);
+  for (int d = 0; d < numDestinations_; ++d) {
+    inprocChannels_.push_back(
+        registry.registerChannel(taskId, d, perDestBytes));
+  }
 }
 
 void GpuPartitionedOutput::addInput(RowVectorPtr input) {
@@ -131,10 +153,34 @@ RowVectorPtr GpuPartitionedOutput::getOutput() {
   }
 
   if (noMoreInput_) {
+    if (!inprocChannels_.empty()) {
+      // In-process path: signal end-of-stream to every destination channel.
+      for (auto& ch : inprocChannels_) {
+        ch->noMoreData();
+      }
+    }
+    // Task lifecycle teardown: Task::start has registered an OutputBuffer for
+    // this task (via initializePartitionOutput()) and Task transitions to
+    // kFinished only after the OutputBuffer sees noMoreData AND every
+    // destination has been deleteResults'd. On the OutputBufferManager path
+    // the consumer does deleteResults implicitly when it hits end-of-stream;
+    // on the inproc path there is no such consumer, so we synthesize both
+    // calls here.
     auto bufferManager = bufferManager_.lock();
     VELOX_CHECK_NOT_NULL(
         bufferManager, "OutputBufferManager was already destructed");
-    bufferManager->noMoreData(operatorCtx_->task()->taskId());
+    const auto& taskId = operatorCtx_->task()->taskId();
+    if (!inprocChannels_.empty()) {
+      // On the inproc path the OutputBuffer is registered but unused. Skip
+      // OutputBufferManager entirely and flip partitionedOutputConsumed_
+      // directly via the Task's public API so the driver-close path can
+      // transition to kFinished. setAllOutputConsumed is safe to call from
+      // a running driver -- it only marks the flag; the actual state
+      // transition happens when the last driverClosed runs.
+      operatorCtx_->task()->setAllOutputConsumed();
+    } else {
+      bufferManager->noMoreData(taskId);
+    }
     finished_ = true;
   }
 
@@ -222,28 +268,41 @@ void GpuPartitionedOutput::partitionAndEnqueue(
 bool GpuPartitionedOutput::enqueuePartition(
     int destination,
     std::shared_ptr<CudfVector> partitionData) {
+  // Skip empty partition slices. Required on both the OutputBufferManager
+  // path (freedBytes>0 assertion, see plan/issue-outputbuffer-zero-bytes.md)
+  // and harmless on the InProcessChannel path.
+  if (partitionData == nullptr || partitionData->size() == 0) {
+    return false;
+  }
+
+  const int64_t bytes =
+      static_cast<int64_t>(partitionData->estimateFlatSize());
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addOutputVector(bytes, partitionData->size());
+  }
+
+  // In-process (single-machine single-GPU) path: push directly to
+  // InProcessChannel, bypassing OutputBufferManager's HTTP-style lifecycle.
+  if (!inprocChannels_.empty()) {
+    VELOX_CHECK_LT(destination, static_cast<int>(inprocChannels_.size()));
+    auto blockReason =
+        inprocChannels_[destination]->push(std::move(partitionData), &future_);
+    if (blockReason != exec::BlockingReason::kNotBlocked) {
+      blockingReason_ = blockReason;
+      return true;
+    }
+    return false;
+  }
+
   auto bufferManager = bufferManager_.lock();
   VELOX_CHECK_NOT_NULL(
       bufferManager, "OutputBufferManager was already destructed");
 
   auto page = std::make_unique<GpuSerializedPage>(std::move(partitionData));
-
-  // Skip zero-byte pages to avoid the OutputBuffer::updateAfterAcknowledgeLocked
-  // freedBytes>0 assertion. GpuSerializedPage::size() reports
-  // cudfVector->estimateFlatSize(); an empty partition slice (e.g. one of the
-  // 200 destinations of a hash-partitioned batch that happened to have no
-  // matching rows) has size()==0, and Velox's accounting VELOX_CHECK_GT
-  // (OutputBuffer.cpp:760) fires with freedBytes=0 when such a page is
-  // eventually freed. See plan/issue-outputbuffer-zero-bytes.md.
   if (page->size() == 0) {
     return false;
   }
-
-  {
-    auto lockedStats = stats_.wlock();
-    lockedStats->addOutputVector(page->size(), page->numRows().value_or(0));
-  }
-
   bool blocked = bufferManager->enqueue(
       operatorCtx_->task()->taskId(),
       destination,

@@ -19,6 +19,7 @@
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/experimental/cudf/exchange/GpuPartitionedOutputNode.h"
 #include "velox/experimental/cudf/exchange/GpuSerializedPage.h"
+#include "velox/experimental/cudf/exchange/InProcessChannel.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 namespace facebook::velox::cudf_velox {
@@ -72,6 +73,11 @@ class GpuPartitionedOutput : public exec::Operator {
   }
 
  private:
+  /// If the task id starts with "gpu-inproc://", populate inprocChannels_
+  /// (one InProcessChannel per destination) and skip OutputBufferManager
+  /// registration for this task. No-op otherwise.
+  void initInProcessChannelsIfNeeded();
+
   /// Partitions the input CudfVector on GPU and enqueues each partition slice
   /// as a GpuSerializedPage to OutputBufferManager.
   void partitionAndEnqueue(std::shared_ptr<CudfVector> cudfVec);
@@ -95,6 +101,12 @@ class GpuPartitionedOutput : public exec::Operator {
 
   const std::weak_ptr<exec::OutputBufferManager> bufferManager_;
   const std::function<void()> bufferReleaseFn_;
+
+  /// When non-empty, the task id uses the "gpu-inproc://" prefix and each
+  /// destination routes through an InProcessChannel instead of
+  /// OutputBufferManager. Indexed by destination. Populated in the
+  /// constructor when isInProcessTaskId(taskId) is true.
+  std::vector<std::shared_ptr<InProcessChannel>> inprocChannels_;
 
   exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture future_;

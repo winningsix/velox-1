@@ -15,7 +15,9 @@
 add_library(
   velox_cudf_exchange
   GpuExchange.cc
+  GpuInProcExchangeSource.cpp
   GpuPartitionedOutput.cc
+  InProcessChannel.cpp
   LocalGpuExchangeSource.cc)
 
 target_link_libraries(
