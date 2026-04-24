@@ -149,7 +149,22 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
+    const uint64_t incomingBytes = cudfInput->estimateFlatSize();
     inputs_.push_back(std::move(cudfInput));
+
+    // Aggregate size of all queued build inputs so we can see this operator's
+    // contribution to GPU memory as the build phase accumulates.
+    uint64_t totalBuildBytes = 0;
+    for (auto& v : inputs_) {
+      if (v) totalBuildBytes += v->estimateFlatSize();
+    }
+    std::cerr << "GPU_MEM_SNAPSHOT [hashJoinBuild-addInput] "
+              << cudf_velox::gpuMemorySnapshotString()
+              << " op=" << planNodeId()
+              << " inputs=" << inputs_.size()
+              << " incoming=" << (incomingBytes >> 20) << "MB"
+              << " totalBuild=" << (totalBuildBytes >> 20) << "MB"
+              << std::endl;
   }
 }
 

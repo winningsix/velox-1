@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -170,8 +171,14 @@ void CudfLocalPartition::enqueuePartition(
   }
 
   ContinueFuture future;
-  auto blockingReason =
-      queues_[partitionIndex]->enqueue(cudfVector, cudfVector->size(), &future);
+  // NOTE: second arg is size in BYTES (fed to LocalExchangeMemoryManager for
+  // backpressure). cudfVector->size() returns ROW count -- using it here is a
+  // unit-mismatch bug that effectively disables backpressure for GPU local
+  // exchanges: producers never block and the pipeline inventories unbounded
+  // GPU data, causing SF1000-scale OOM. Use estimateFlatSize() which
+  // genuinely reports the packed GPU byte footprint.
+  auto blockingReason = queues_[partitionIndex]->enqueue(
+      cudfVector, cudfVector->estimateFlatSize(), &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -186,6 +193,14 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
   auto stream = cudfVector->stream();
+
+  const uint64_t inBytes = cudfVector->estimateFlatSize();
+  std::cerr << "GPU_MEM_SNAPSHOT [localPartition-addInput] "
+            << gpuMemorySnapshotString()
+            << " op=" << planNodeId()
+            << " in=" << (inBytes >> 20) << "MB"
+            << " parts=" << numPartitions_
+            << std::endl;
 
   if (numPartitions_ > 1) {
     if (partitionFunctionType_ == PartitionFunctionType::kRoundRobin) {
@@ -262,14 +277,29 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     stream.synchronize();
     gpuTimer_.stop(stream);
 
+    uint64_t totalOutBytes = 0;
+    for (auto& [pid, vec] : partitionVectors) {
+      totalOutBytes += vec->estimateFlatSize();
+    }
+    std::cerr << "GPU_MEM_SNAPSHOT [localPartition-postHashPartition] "
+              << gpuMemorySnapshotString()
+              << " op=" << planNodeId()
+              << " nonEmptyParts=" << partitionVectors.size()
+              << " totalOut=" << (totalOutBytes >> 20) << "MB"
+              << std::endl;
+
     for (auto& [pid, vec] : partitionVectors) {
       enqueuePartition(pid, vec);
     }
   } else {
     // Single partition case.
+    // Same rationale as enqueuePartition above: RowVector::retainedSize() does
+    // not see the GPU-resident cuDF table stored in CudfVector::tableStorage_,
+    // so it severely underreports bytes here. Use estimateFlatSize() which
+    // returns the actual packed GPU byte count.
     ContinueFuture future;
     auto blockingReason =
-        queues_[0]->enqueue(input, input->retainedSize(), &future);
+        queues_[0]->enqueue(input, cudfVector->estimateFlatSize(), &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));
