@@ -73,6 +73,16 @@ class InProcessChannel {
       bool* atEnd,
       ContinueFuture* future);
 
+  /// Consumer pull, byte-budget variant. Drains queued vectors until the
+  /// accumulated estimateFlatSize() reaches 'maxBytes', or the queue is
+  /// empty. To avoid starvation when a single batch exceeds maxBytes, the
+  /// first batch is always returned regardless of size. atEnd / future
+  /// semantics are identical to pull().
+  std::vector<std::shared_ptr<CudfVector>> pullBytes(
+      int64_t maxBytes,
+      bool* atEnd,
+      ContinueFuture* future);
+
   bool noMoreProducers() const {
     return noMoreData_.load(std::memory_order_acquire);
   }

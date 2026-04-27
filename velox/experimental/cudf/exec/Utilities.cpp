@@ -39,6 +39,7 @@
 #include <rmm/mr/owning_wrapper.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <common/base/Exceptions.h>
 
@@ -120,34 +121,57 @@ void enablePrefetching() {
 
 } // namespace
 
+namespace {
+// Wrap-with-statistics-adaptor lets gpuMemorySnapshotString() report what the
+// RMM layer actually has alive (independent of cuda_async pool retention).
+// The adaptor is owned by createMemoryResource()'s shared_ptr return; we
+// keep a non-owning weak_ptr here so the snapshot can read counters without
+// extending lifetime.
+using StatsAdaptor =
+    rmm::mr::statistics_resource_adaptor<rmm::mr::device_memory_resource>;
+using StatsOwningWrapper = rmm::mr::owning_wrapper<
+    StatsAdaptor,
+    rmm::mr::device_memory_resource>;
+std::weak_ptr<StatsOwningWrapper> g_statsMr;
+
+template <typename Upstream>
+std::shared_ptr<rmm::mr::device_memory_resource> wrapWithStats(
+    std::shared_ptr<Upstream> base) {
+  auto wrapped = rmm::mr::make_owning_wrapper<rmm::mr::statistics_resource_adaptor>(
+      std::shared_ptr<rmm::mr::device_memory_resource>(std::move(base)));
+  g_statsMr = wrapped;
+  return wrapped;
+}
+} // namespace
+
 std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
     std::string_view mode,
     int percent) {
   if (mode == "cuda")
-    return makeCudaMr();
+    return wrapWithStats(makeCudaMr());
   if (mode == "pool")
-    return makePoolMr(percent);
+    return wrapWithStats(makePoolMr(percent));
   if (mode == "async")
-    return makeAsyncMr();
+    return wrapWithStats(makeAsyncMr());
   if (mode == "arena")
-    return makeArenaMr(percent);
+    return wrapWithStats(makeArenaMr(percent));
   if (mode == "managed")
-    return makeManagedMr();
+    return wrapWithStats(makeManagedMr());
   if (mode == "managed_pool")
-    return makeManagedPoolMr(percent);
+    return wrapWithStats(makeManagedPoolMr(percent));
   if (mode == "managed_async")
-    return makeManagedAsyncMr();
+    return wrapWithStats(makeManagedAsyncMr());
   if (mode == "prefetch_managed") {
     enablePrefetching();
-    return makePrefetchManagedMr();
+    return wrapWithStats(makePrefetchManagedMr());
   }
   if (mode == "prefetch_managed_pool") {
     enablePrefetching();
-    return makePrefetchManagedPoolMr(percent);
+    return wrapWithStats(makePrefetchManagedPoolMr(percent));
   }
   if (mode == "prefetch_managed_async") {
     enablePrefetching();
-    return makePrefetchManagedAsyncMr();
+    return wrapWithStats(makePrefetchManagedAsyncMr());
   }
   VELOX_FAIL(
       "Unknown memory resource mode: " + std::string(mode) +
@@ -209,6 +233,21 @@ std::string gpuMemorySnapshotString() {
   out << "gpuMem{free=" << succinctBytes(freeMem)
       << ", used=" << succinctBytes(usedMem)
       << ", total=" << succinctBytes(totalMem) << "}";
+
+  // RMM-tracked stats: shows what RMM actually has alive (rmm.live), the
+  // peak alive value (rmm.peak), and the cumulative byte total (rmm.total).
+  // The delta between cudaMemGetInfo's `used` and `rmm.live` is the
+  // pool-retained bytes (cuda_async / pool MR doesn't return memory to
+  // the device until the pool is destroyed).
+  if (auto stats = g_statsMr.lock()) {
+    auto bytes = stats->wrapped().get_bytes_counter();
+    auto allocs = stats->wrapped().get_allocations_counter();
+    out << " rmm{live=" << succinctBytes(static_cast<uint64_t>(bytes.value))
+        << ", peak=" << succinctBytes(static_cast<uint64_t>(bytes.peak))
+        << ", total=" << succinctBytes(static_cast<uint64_t>(bytes.total))
+        << ", liveAllocs=" << allocs.value
+        << ", peakAllocs=" << allocs.peak << "}";
+  }
   return out.str();
 }
 

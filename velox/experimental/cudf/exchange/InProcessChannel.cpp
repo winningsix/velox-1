@@ -137,6 +137,58 @@ std::vector<std::shared_ptr<CudfVector>> InProcessChannel::pull(
   return out;
 }
 
+std::vector<std::shared_ptr<CudfVector>> InProcessChannel::pullBytes(
+    int64_t maxBytes,
+    bool* atEnd,
+    ContinueFuture* future) {
+  std::vector<std::shared_ptr<CudfVector>> out;
+  std::vector<ContinuePromise> producersToWake;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    *atEnd = false;
+
+    if (closed_.load(std::memory_order_relaxed)) {
+      *atEnd = true;
+      return out;
+    }
+
+    int64_t accumulated = 0;
+    while (!queue_.empty()) {
+      auto& front = queue_.front();
+      const int64_t bytes = static_cast<int64_t>(front->estimateFlatSize());
+      // Always return the first batch even if it alone exceeds maxBytes
+      // (avoids starvation when one batch is bigger than the budget).
+      // Beyond that, stop once accumulated would exceed the budget.
+      if (!out.empty() && accumulated + bytes > maxBytes) {
+        break;
+      }
+      bufferedBytes_ -= bytes;
+      accumulated += bytes;
+      out.push_back(std::move(front));
+      queue_.pop_front();
+    }
+
+    if (!out.empty() && bufferedBytes_ < maxBufferBytes_) {
+      producersToWake = std::move(producerPromises_);
+    }
+
+    if (out.empty()) {
+      if (noMoreData_.load(std::memory_order_acquire)) {
+        *atEnd = true;
+      } else {
+        consumerPromises_.emplace_back("InProcessChannel::pullBytes");
+        *future = consumerPromises_.back().getSemiFuture();
+      }
+    } else if (queue_.empty() && noMoreData_.load(std::memory_order_acquire)) {
+      *atEnd = true;
+    }
+  }
+  for (auto& p : producersToWake) {
+    p.setValue();
+  }
+  return out;
+}
+
 // --- Registry ---
 
 InProcessChannelRegistry& InProcessChannelRegistry::get() {
