@@ -265,6 +265,13 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
+    VELOX_CHECK(
+        resultType->isRow() ||
+            step == core::AggregationNode::Step::kSingle ||
+            step == core::AggregationNode::Step::kFinal,
+        "Mean {} aggregation expects row(sum, count) intermediate type, got {}",
+        core::AggregationNode::toName(step),
+        resultType->toString());
     const auto& outputType = asRowType(resultType);
     switch (step) {
       case core::AggregationNode::Step::kSingle:
@@ -793,7 +800,11 @@ TypePtr companionAwareIntermediateType(
         1,
         "Companion aggregate must have exactly one input type: {}",
         kind);
-    return aggregate.rawInputTypes[0];
+    if (aggregate.rawInputTypes[0]->isRow()) {
+      return aggregate.rawInputTypes[0];
+    }
+    return exec::resolveIntermediateType(
+        getOriginalName(kind), aggregate.rawInputTypes);
   }
   return exec::resolveIntermediateType(
       getOriginalName(kind), aggregate.rawInputTypes);
@@ -802,7 +813,7 @@ TypePtr companionAwareIntermediateType(
 bool hasFinalAggs(
     std::vector<core::AggregationNode::Aggregate> const& aggregates) {
   return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
-    return agg.call->name().ends_with("_merge_extract");
+    return agg.call->name().find("_merge_extract") != std::string::npos;
   });
 }
 
@@ -824,6 +835,35 @@ bool hasNonPartialCompanionAggregates(
     const auto& name = agg.call->name();
     return isCompanionAggregateName(name) && !name.ends_with("_partial");
   });
+}
+
+bool canStreamCompanionAggregate(
+    std::string const& name,
+    core::AggregationNode::Step step) {
+  if (!isCompanionAggregateName(name)) {
+    return true;
+  }
+  switch (step) {
+    case core::AggregationNode::Step::kPartial:
+      return name.ends_with("_partial");
+    case core::AggregationNode::Step::kIntermediate:
+      return true;
+    case core::AggregationNode::Step::kFinal:
+      return name.ends_with("_merge") ||
+          name.find("_merge_extract") != std::string::npos;
+    case core::AggregationNode::Step::kSingle:
+      return name.find("_merge_extract") != std::string::npos;
+  }
+  return false;
+}
+
+bool canStreamCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates,
+    core::AggregationNode::Step step) {
+  return std::all_of(
+      aggregates.begin(), aggregates.end(), [step](auto const& agg) {
+        return canStreamCompanionAggregate(agg.call->name(), step);
+      });
 }
 
 struct AggregationInputChannels {
@@ -1004,8 +1044,11 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
       hasCompanions &&
       !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
-  streamingEnabled_ =
-      (!hasCompanions || canStreamPartialCompanions) && !isGlobal_;
+  const bool canStreamCompanions =
+      !hasCompanions ||
+      canStreamCompanionAggregates(
+          aggregationNode_->aggregates(), aggregationNode_->step());
+  streamingEnabled_ = canStreamCompanions && !isGlobal_;
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
