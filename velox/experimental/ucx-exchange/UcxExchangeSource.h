@@ -100,6 +100,8 @@ class UcxExchangeSource
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
+  static constexpr uint64_t kMaxDataRequestBytes =
+      static_cast<uint64_t>(256) << 20;
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
@@ -184,6 +186,11 @@ class UcxExchangeSource
 
   /// @brief Waits for metadata and installs the onMetadata callback.
   void getMetadata();
+
+  /// @brief Sends one consumer credit/request before receiving a remote chunk.
+  void sendDataRequest();
+
+  void onDataRequestSent(ucs_status_t status, std::shared_ptr<void> arg);
 
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status

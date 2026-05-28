@@ -97,8 +97,21 @@ class UcxExchangeQueue {
       ContinuePromise* stalePromise);
 
   int32_t size() const {
+    std::lock_guard<std::mutex> l(mutex_);
+    return sizeLocked();
+  }
+
+  int32_t sizeLocked() const {
     return queue_.size();
   }
+
+  /// Returns a byte credit for the next producer request based on current
+  /// consumer queue occupancy. The value is capped at maxBytesPerRequest so a
+  /// single UCX transfer remains bounded even when the queue is mostly empty.
+  uint64_t suggestedReceiveBytes(
+      int32_t highWaterMark,
+      uint64_t defaultBytes,
+      uint64_t maxBytesPerRequest);
 
   /// Returns the total bytes held by packed tables in 'this'.
   int64_t totalBytes() const {
@@ -159,7 +172,8 @@ class UcxExchangeQueue {
   }
 
   std::vector<ContinuePromise> clearAllPromisesLocked() {
-    std::vector<ContinuePromise> promises(promises_.size());
+    std::vector<ContinuePromise> promises;
+    promises.reserve(promises_.size());
     auto it = promises_.begin();
     while (it != promises_.end()) {
       promises.push_back(std::move(it->second));
@@ -182,7 +196,7 @@ class UcxExchangeQueue {
   bool noMoreSources_{false};
   bool atEnd_{false};
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::deque<PackedTableWithStreamPtr> queue_;
   // The map from consumer id to the waiting promise
   folly::F14FastMap<int, ContinuePromise> promises_;

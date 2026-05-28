@@ -132,12 +132,12 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     // push-based — there is no mechanism to "request" or "not request" more
     // data. The server pushes unconditionally. Real backpressure is
     // implemented in UcxExchangeSource::process() (ReadyToReceive state).
-    if (data != nullptr && queue_->size() > maxQueuedColumns_) {
+    if (data != nullptr && queue_->sizeLocked() > maxQueuedColumns_) {
       if (!inFlowControl_) {
         inFlowControl_ = true;
         VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
                 << " entering flow control"
-                << " queueSize=" << queue_->size()
+                << " queueSize=" << queue_->sizeLocked()
                 << " maxQueued=" << maxQueuedColumns_;
       }
       return data;
@@ -145,7 +145,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       inFlowControl_ = false;
       VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
               << " leaving flow control"
-              << " queueSize=" << queue_->size()
+              << " queueSize=" << queue_->sizeLocked()
               << " maxQueued=" << maxQueuedColumns_;
     }
 
@@ -155,7 +155,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       if (totalDequeued_ % 1000 == 0) {
         VLOG(1) << "[PROGRESS] @" << taskId_ << " consumer=" << consumerId
                 << " dequeued=" << totalDequeued_
-                << " queueSize=" << queue_->size()
+                << " queueSize=" << queue_->sizeLocked()
                 << " queueBytes=" << queue_->totalBytes();
       }
     }
@@ -166,7 +166,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     // The CAS inside resumeFromBackpressure() ensures each source is
     // woken exactly once per dormant period.
     if (data != nullptr &&
-        queue_->size() <= UcxExchangeSource::kBackpressureLowWaterMark) {
+        queue_->sizeLocked() <= UcxExchangeSource::kBackpressureLowWaterMark) {
       for (auto& source : sources_) {
         source->resumeFromBackpressure();
       }

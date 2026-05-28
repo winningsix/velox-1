@@ -36,6 +36,39 @@ void UcxExchangeQueue::close() {
   clearPromises(promises);
 }
 
+uint64_t UcxExchangeQueue::suggestedReceiveBytes(
+    int32_t highWaterMark,
+    uint64_t defaultBytes,
+    uint64_t maxBytesPerRequest) {
+  if (maxBytesPerRequest == 0) {
+    return defaultBytes == 0 ? 1 : defaultBytes;
+  }
+  std::lock_guard<std::mutex> l(mutex_);
+  const auto queuedTables = static_cast<int32_t>(queue_.size());
+  const auto availableSlots =
+      highWaterMark > queuedTables ? highWaterMark - queuedTables : 1;
+  auto bytesPerTable =
+      receivedTables_ > 0 ? receivedBytes_ / receivedTables_ : defaultBytes;
+  if (bytesPerTable <= 0) {
+    bytesPerTable = defaultBytes;
+  }
+
+  uint64_t requestedBytes;
+  if (static_cast<uint64_t>(bytesPerTable) >
+      maxBytesPerRequest / static_cast<uint64_t>(availableSlots)) {
+    requestedBytes = maxBytesPerRequest;
+  } else {
+    requestedBytes =
+        static_cast<uint64_t>(bytesPerTable) *
+        static_cast<uint64_t>(availableSlots);
+  }
+  if (requestedBytes == 0) {
+    return 1;
+  }
+  return requestedBytes > maxBytesPerRequest ? maxBytesPerRequest
+                                             : requestedBytes;
+}
+
 void UcxExchangeQueue::enqueueLocked(
     PackedTableWithStreamPtr&& data,
     std::vector<ContinuePromise>& promises) {
