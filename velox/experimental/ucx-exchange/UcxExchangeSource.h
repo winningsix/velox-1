@@ -35,6 +35,8 @@
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <functional>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
@@ -62,13 +64,24 @@ class UcxExchangeSource
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeSource> {
  public:
+  using SourceReadyCallback =
+      std::function<void(const std::shared_ptr<UcxExchangeSource>& source)>;
+  using SourceCreditFinishedCallback = std::function<void(
+      const std::shared_ptr<UcxExchangeSource>& source,
+      uint64_t reservedBytes,
+      uint64_t actualBytes,
+      const std::vector<int64_t>& remainingBytes,
+      bool atEnd)>;
+
   virtual ~UcxExchangeSource() = default;
 
   // factory method to create a UCX exchange source.
   static std::shared_ptr<UcxExchangeSource> create(
       const std::string& taskId,
       const std::string& url,
-      const std::shared_ptr<UcxExchangeQueue>& queue);
+      const std::shared_ptr<UcxExchangeQueue>& queue,
+      SourceReadyCallback readyCallback = nullptr,
+      SourceCreditFinishedCallback creditFinishedCallback = nullptr);
 
   bool supportsMetrics() const {
     return true;
@@ -96,6 +109,9 @@ class UcxExchangeSource
   /// thread to wake up this source after it went dormant due to backpressure.
   /// Uses CAS to ensure exactly one wake-up per dormant period.
   void resumeFromBackpressure();
+
+  /// Arms one remote receive credit. Returns false if the source is not ready.
+  bool armCredit(uint64_t maxBytes);
 
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
@@ -144,6 +160,7 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+    uint64_t creditBytes{0};
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -162,7 +179,9 @@ class UcxExchangeSource
       const std::string& host,
       uint16_t port,
       const PartitionKey& partitionKey,
-      const std::shared_ptr<UcxExchangeQueue> queue);
+      const std::shared_ptr<UcxExchangeQueue> queue,
+      SourceReadyCallback readyCallback,
+      SourceCreditFinishedCallback creditFinishedCallback);
 
   // Extracts taskId and destinationId from the path part of the task URL
   static PartitionKey extractTaskAndDestinationId(const std::string& path);
@@ -280,6 +299,7 @@ class UcxExchangeSource
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
+  uint64_t creditBytes_{0};
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};
@@ -307,6 +327,9 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
+
+  SourceReadyCallback readyCallback_{nullptr};
+  SourceCreditFinishedCallback creditFinishedCallback_{nullptr};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

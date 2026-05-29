@@ -66,6 +66,8 @@ class UcxExchangeServer
   enum class ServerState : uint32_t {
     Created,
     ReadyToTransfer,
+    WaitingForDataRequest,
+    DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
@@ -85,6 +87,11 @@ class UcxExchangeServer
 
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
+
+  /// @brief Posts and handles one consumer credit request.
+  void receiveDataRequest();
+
+  void onDataRequest(ucs_status_t status, std::shared_ptr<void> arg);
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
@@ -107,6 +114,8 @@ class UcxExchangeServer
     const std::string stateMap[] = {
         "Created",
         "ReadyToTransfer",
+        "WaitingForDataRequest",
+        "DataRequestReady",
         "WaitingForDataFromQueue",
         "DataReady",
         "WaitingForSendComplete",
@@ -130,6 +139,7 @@ class UcxExchangeServer
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
+  std::vector<int64_t> remainingBytes_;
   std::recursive_mutex dataMutex_; // mutex for above ptr.
   std::atomic<bool> closed_{false};
 
@@ -141,6 +151,7 @@ class UcxExchangeServer
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
+  uint64_t pendingRequestMaxBytes_{0};
 
   // The outstanding requests - there can only be one outstanding request
   // of each type at any point in time.
@@ -148,6 +159,7 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> dataRequestMsgRequest_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

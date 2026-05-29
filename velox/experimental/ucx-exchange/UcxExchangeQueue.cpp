@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 
+#include <algorithm>
+
 namespace facebook::velox::ucx_exchange {
 
 void UcxExchangeQueue::noMoreSources() {
@@ -67,6 +69,42 @@ uint64_t UcxExchangeQueue::suggestedReceiveBytes(
   }
   return requestedBytes > maxBytesPerRequest ? maxBytesPerRequest
                                              : requestedBytes;
+}
+
+uint64_t UcxExchangeQueue::reserveReceiveBytes(
+    int32_t highWaterMark,
+    uint64_t defaultBytes,
+    uint64_t maxBytesPerRequest) {
+  static_cast<void>(highWaterMark);
+  static_cast<void>(defaultBytes);
+  if (maxBytesPerRequest == 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> l(mutex_);
+  // Keep the first implementation conservative: one remote credit in flight per
+  // shared consumer queue. This prevents multiple sources from independently
+  // granting credits against the same downstream buffer.
+  const auto maxBufferedBytes = static_cast<int64_t>(maxBytesPerRequest);
+  const auto availableBytes = maxBufferedBytes - totalBytes_ - inFlightBytes_;
+  if (availableBytes <= 0) {
+    return 0;
+  }
+  const auto reserved = std::min<uint64_t>(
+      maxBytesPerRequest, static_cast<uint64_t>(availableBytes));
+  inFlightBytes_ += static_cast<int64_t>(reserved);
+  return reserved;
+}
+
+void UcxExchangeQueue::releaseReceiveBytes(uint64_t bytes) {
+  if (bytes == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> l(mutex_);
+  inFlightBytes_ -= static_cast<int64_t>(bytes);
+  if (inFlightBytes_ < 0) {
+    VLOG(1) << "[EX-QUEUE] inFlightBytes underflow, clamping to zero";
+    inFlightBytes_ = 0;
+  }
 }
 
 void UcxExchangeQueue::enqueueLocked(

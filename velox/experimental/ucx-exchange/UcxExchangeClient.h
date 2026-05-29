@@ -18,6 +18,9 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
+#include <deque>
+#include <unordered_set>
+
 namespace facebook::velox::ucx_exchange {
 
 // Handle for a set of producers. This may be shared by multiple UcxExchanges,
@@ -28,6 +31,7 @@ class UcxExchangeClient
   // used for some primitive type of flow control, limits the size of elements
   // in the UcxExchangeQueue
   static constexpr int32_t kDefaultMaxQueuedColumns = 32;
+  static constexpr uint64_t kDefaultMaxPendingBytes = 256ULL * 1024 * 1024;
   static constexpr std::chrono::milliseconds kRequestDataMaxWait{100};
 
   UcxExchangeClient(
@@ -88,6 +92,20 @@ class UcxExchangeClient
   }
 
  private:
+  void onSourceReadyForCredit(
+      const std::shared_ptr<UcxExchangeSource>& source);
+
+  void onSourceCreditFinished(
+      const std::shared_ptr<UcxExchangeSource>& source,
+      uint64_t reservedBytes,
+      uint64_t actualBytes,
+      const std::vector<int64_t>& remainingBytes,
+      bool atEnd);
+
+  uint64_t availableCreditBytesLocked() const;
+
+  void scheduleCreditsLocked();
+
   // Handy for ad-hoc logging.
   const std::string taskId_;
   const int destination_;
@@ -102,6 +120,10 @@ class UcxExchangeClient
 
   // Total number of packed_clumns in flight.
   int64_t totalPendingColumns_{0};
+  int64_t pendingBytes_{0};
+  std::deque<std::shared_ptr<UcxExchangeSource>> idleSources_;
+  std::unordered_set<UcxExchangeSource*> idleSourceSet_;
+  std::unordered_set<UcxExchangeSource*> producingSources_;
 
   // Diagnostic counters for progress and flow control.
   int64_t totalDequeued_{0};

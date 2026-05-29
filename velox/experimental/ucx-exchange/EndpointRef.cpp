@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -26,6 +28,18 @@ void EndpointRef::onClose(ucs_status_t status, std::shared_ptr<void> arg) {
   // Communicator loop via deferEndpointCleanup().
 
   std::shared_ptr<EndpointRef> ep = std::static_pointer_cast<EndpointRef>(arg);
+  size_t registeredCommElements = 0;
+  std::string peerAddress = "(unknown)";
+  if (ep) {
+    peerAddress = ep->getPeerAddress();
+    registeredCommElements =
+        ep->commElementCount_.load(std::memory_order_acquire);
+  }
+  LOG(WARNING) << "[UCX-ENDPOINT-CLOSE] status=" << ucs_status_string(status)
+               << " peer=" << peerAddress
+               << " endpointAlive="
+               << (ep && ep->endpoint_ && ep->endpoint_->isAlive())
+               << " registeredCommElements=" << registeredCommElements;
 
   // Defer ALL cleanup to the main progress loop.
   // The main loop will:
@@ -42,6 +56,7 @@ bool EndpointRef::addCommElem(std::shared_ptr<CommElement> commElem) {
   std::lock_guard<std::mutex> lock(commMutex_);
   cleanup();
   auto ret = communicators_.insert(commElem);
+  commElementCount_.store(communicators_.size(), std::memory_order_release);
   return ret.second;
 }
 
@@ -51,6 +66,7 @@ void EndpointRef::removeCommElem(std::shared_ptr<CommElement> commElem) {
   }
   std::lock_guard<std::mutex> lock(commMutex_);
   communicators_.erase(commElem);
+  commElementCount_.store(communicators_.size(), std::memory_order_release);
 }
 
 void EndpointRef::closeAndDrainCommunicators() {
@@ -67,15 +83,43 @@ void EndpointRef::closeAndDrainCommunicators() {
   {
     std::lock_guard<std::mutex> lock(commMutex_);
     localCopy.swap(communicators_);
+    commElementCount_.store(0, std::memory_order_release);
   }
+  LOG(WARNING) << "[UCX-ENDPOINT-DRAIN] peer=" << getPeerAddress()
+               << " closing comm elements count="
+               << localCopy.size();
 
-  // Now iterate the local copy -- no lock held, no contention.
+  // Close producers first so they can publish/cancel queue state before
+  // consumer sources observe endpoint teardown.
   for (auto& weakElem : localCopy) {
     if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
-      spt->close();
+      if (dynamic_cast<UcxExchangeServer*>(spt.get()) != nullptr) {
+        spt->close();
+      }
+    }
+  }
+  for (auto& weakElem : localCopy) {
+    if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
+      if (dynamic_cast<UcxExchangeServer*>(spt.get()) == nullptr) {
+        spt->close();
+      }
     }
   }
   // localCopy is destroyed here, releasing all weak_ptrs.
+}
+
+bool EndpointRef::tryAcquireDataSendSlot() {
+  std::lock_guard<std::mutex> lock(dataSendMutex_);
+  if (dataSendInProgress_) {
+    return false;
+  }
+  dataSendInProgress_ = true;
+  return true;
+}
+
+void EndpointRef::releaseDataSendSlot() {
+  std::lock_guard<std::mutex> lock(dataSendMutex_);
+  dataSendInProgress_ = false;
 }
 
 bool EndpointRef::operator<(EndpointRef const& other) {
