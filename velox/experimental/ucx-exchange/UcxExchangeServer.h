@@ -146,7 +146,11 @@ class UcxExchangeServer
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
-  uint64_t pendingRequestMaxBytes_{0};
+
+  /// Whether this server currently holds a data-send slot on its endpoint.
+  /// Send-slot concurrency control (via EndpointRef::tryAcquireDataSendSlot),
+  /// independent of flow control.
+  std::atomic<bool> dataSendSlotAcquired_{false};
 
   // The outstanding requests - there can only be one outstanding request
   // of each type at any point in time.
@@ -154,7 +158,6 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
-  std::shared_ptr<ucxx::Request> dataRequestMsgRequest_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

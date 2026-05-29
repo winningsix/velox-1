@@ -94,8 +94,7 @@ void UcxExchangeServer::process() {
       // Count-only / rendezvous push (Presto-style): no consumer credit request.
       // Go straight to dequeue + send; the data tagSend blocks at rendezvous
       // until the source posts its matching tagRecv (getMetadata/getData), which
-      // is the sole flow-control mechanism. pendingRequestMaxBytes_ stays 0 so
-      // getData() uses an unbounded cap.
+      // is the sole flow-control mechanism.
       setState(ServerState::DataRequestReady);
       communicator_->addToWorkQueue(getSelfPtr());
       break;
@@ -115,9 +114,9 @@ void UcxExchangeServer::process() {
         queueMgr_->getData(
             partitionKey_.taskId,
             partitionKey_.destination,
-            pendingRequestMaxBytes_ == 0
-                ? std::numeric_limits<uint64_t>::max()
-                : pendingRequestMaxBytes_,
+            // Unbounded per-fetch cap; rendezvous + queue-occupancy backpressure
+            // are the flow control (no byte-credit).
+            std::numeric_limits<uint64_t>::max(),
             static_cast<int64_t>(sequenceNumber_),
             [weakQueue](
                 std::shared_ptr<cudf::packed_columns> data,
@@ -226,9 +225,6 @@ void UcxExchangeServer::close() {
   if (dataRequest_ && !dataRequest_->isCompleted()) {
     dataRequest_->cancel();
   }
-  if (dataRequestMsgRequest_ && !dataRequestMsgRequest_->isCompleted()) {
-    dataRequestMsgRequest_->cancel();
-  }
   if (dataSendSlotAcquired_ && endpointRef_) {
     endpointRef_->releaseDataSendSlot();
     dataSendSlotAcquired_ = false;
@@ -243,9 +239,6 @@ void UcxExchangeServer::close() {
     }
     if (dataRequest_) {
       communicator_->deferRequestCleanup(std::move(dataRequest_));
-    }
-    if (dataRequestMsgRequest_) {
-      communicator_->deferRequestCleanup(std::move(dataRequestMsgRequest_));
     }
     for (auto& req : completedRequests_) {
       communicator_->deferRequestCleanup(std::move(req));
