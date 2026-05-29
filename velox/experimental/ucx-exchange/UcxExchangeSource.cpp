@@ -131,10 +131,20 @@ void UcxExchangeSource::process() {
         break;
       }
 
-      // Grant one credit before the producer may dequeue and publish/send the
-      // next item. Intra-node uses the same credit handshake, then waits on the
-      // registry; remote waits for UCX metadata/data tags.
-      sendDataRequest();
+      // Count-only backpressure (Presto-style): post the next receive directly.
+      // The server's tagSend blocks at rendezvous until we post the matching
+      // tagRecv, so no explicit byte-credit request is needed. Intra-node waits
+      // on the registry; remote waits for UCX metadata/data tags.
+      if (isIntraNodeTransfer_) {
+        setStateIf(
+            ReceiverState::ReadyToReceive,
+            ReceiverState::WaitingForIntraNodeData);
+        waitForIntraNodeData();
+      } else {
+        setStateIf(
+            ReceiverState::ReadyToReceive, ReceiverState::WaitingForMetadata);
+        getMetadata();
+      }
     } break;
     case ReceiverState::WaitingForMetadata:
       // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
@@ -203,7 +213,6 @@ void UcxExchangeSource::close() {
           expected, desired, std::memory_order_acq_rel)) {
     return; // already closed.
   }
-  releaseOutstandingRequestBytes();
 
   LOG(WARNING) << "[UCX-SOURCE-CLOSE] " << toString()
                << " state=" << getStateAsString()
@@ -306,14 +315,6 @@ void UcxExchangeSource::deliverEndMarker() {
   enqueue(nullptr);
 }
 
-void UcxExchangeSource::releaseOutstandingRequestBytes() {
-  const auto bytes = outstandingRequestBytes_.exchange(
-      0, std::memory_order_acq_rel);
-  if (bytes > 0) {
-    queue_->releaseReceiveBytes(bytes);
-  }
-}
-
 void UcxExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {
   endpointRef_ = std::move(endpointRef);
 }
@@ -404,87 +405,6 @@ void UcxExchangeSource::onHandshake(
   }
 }
 
-void UcxExchangeSource::sendDataRequest() {
-  auto request = std::make_shared<DataRequestMsg>();
-  request->sequence = sequenceNumber_;
-  request->maxBytes = queue_->reserveReceiveBytes(
-      kBackpressureHighWaterMark,
-      kMaxDataRequestBytes,
-      kMaxDataRequestBytes);
-  if (request->maxBytes == 0) {
-    if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
-      VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-              << "] pausing, no shared receive byte budget";
-    }
-    return;
-  }
-  outstandingRequestBytes_.store(request->maxBytes, std::memory_order_release);
-  const uint64_t requestTag =
-      getDataRequestTag(partitionKeyHash_, sequenceNumber_);
-  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-  if (request_) {
-    completedRequests_.push_back(std::move(request_));
-  }
-  const auto desiredState = isIntraNodeTransfer_
-      ? ReceiverState::WaitingForIntraNodeData
-      : ReceiverState::WaitingForMetadata;
-  if (!setStateIf(
-      ReceiverState::ReadyToReceive,
-      desiredState)) {
-    releaseOutstandingRequestBytes();
-    return;
-  }
-  request_ = endpointRef_->endpoint_->tagSend(
-      request.get(),
-      sizeof(*request),
-      ucxx::Tag{requestTag},
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (auto self = weak.lock()) {
-          self->onDataRequestSent(status, arg);
-        }
-      },
-      request);
-  // Post the matching receive immediately after granting credit. Waiting for
-  // the request send-completion callback opens a race where the server receives
-  // the credit and starts metadata/data sends before the receiver has posted
-  // the corresponding receives.
-  if (isIntraNodeTransfer_) {
-    waitForIntraNodeData();
-  } else {
-    getMetadata();
-  }
-}
-
-void UcxExchangeSource::onDataRequestSent(
-    ucs_status_t status,
-    std::shared_ptr<void> arg) {
-  if (closed_.load(std::memory_order_acquire)) {
-    releaseOutstandingRequestBytes();
-    deliverEndMarker();
-    return;
-  }
-  if (status != UCS_OK) {
-    releaseOutstandingRequestBytes();
-    std::string errorMsg = fmt::format(
-        "Failed to send data request to host {}:{}, task {}: {}",
-        host_,
-        port_,
-        partitionKey_.toString(),
-        ucs_status_string(status));
-    LOG(WARNING) << "[UCX-SOURCE-DATA-REQUEST-ERROR] " << toString()
-                 << " seq=" << sequenceNumber_ << " error=" << errorMsg;
-    queue_->setError(errorMsg);
-    deliverEndMarker();
-    setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
-    return;
-  }
-  const auto request = std::static_pointer_cast<DataRequestMsg>(arg);
-  VLOG(2) << "[UCX-SOURCE-DATA-REQUEST] " << toString()
-          << " seq=" << sequenceNumber_ << " maxBytes=" << request->maxBytes;
-}
-
 void UcxExchangeSource::getMetadata() {
   // Use kMaxMetaBufSize to support tables with many columns.
   // The sender allocates exact size needed; receiver pre-allocates max.
@@ -519,7 +439,6 @@ void UcxExchangeSource::onMetadata(
     std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    releaseOutstandingRequestBytes();
     LOG(WARNING) << "[UCX-SOURCE-METADATA-AFTER-CLOSE] " << toString()
                  << " seq=" << sequenceNumber_
                  << " status=" << ucs_status_string(status);
@@ -531,14 +450,12 @@ void UcxExchangeSource::onMetadata(
     VLOG(2) << toString() << " onMetadata called in state "
             << getStateAsString() << ", ignoring (possible UCXX replay)";
     if (status != UCS_OK) {
-      releaseOutstandingRequestBytes();
     }
     return;
   }
   VLOG(3) << toString() << " + onMetadata " << ucs_status_string(status);
 
   if (status != UCS_OK) {
-    releaseOutstandingRequestBytes();
     std::string errorMsg = fmt::format(
         "Failed to receive metadata from host {}:{}, task {}: {}",
         host_,
@@ -566,7 +483,6 @@ void UcxExchangeSource::onMetadata(
             << " Datasize bytes == " << ptr->metadata.dataSizeBytes;
 
     if (ptr->metadata.atEnd) {
-      releaseOutstandingRequestBytes();
       // It seems that all data has been transferred
       atEnd_ = true;
       // enqueue a nullpointer to mark the end for this source.
@@ -594,7 +510,6 @@ void UcxExchangeSource::onMetadata(
       ptr->dataBuf = std::make_unique<rmm::device_buffer>(
           ptr->metadata.dataSizeBytes, stream, &recvMemoryResource);
     } catch (const rmm::bad_alloc& e) {
-      releaseOutstandingRequestBytes();
       VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
       queue_->setError("Failed to alloc GPU memory"); // Let the operator know
                                                       // via the queue
@@ -617,7 +532,6 @@ void UcxExchangeSource::onMetadata(
 
     if (!setStateIf(
             ReceiverState::WaitingForMetadata, ReceiverState::WaitingForData)) {
-      releaseOutstandingRequestBytes();
       VLOG(1) << toString() << " onMetadata Invalid previous state ";
       return;
     }
@@ -646,7 +560,6 @@ void UcxExchangeSource::onMetadata(
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    releaseOutstandingRequestBytes();
     LOG(WARNING) << "[UCX-SOURCE-DATA-AFTER-CLOSE] " << toString()
                  << " seq=" << sequenceNumber_
                  << " status=" << ucs_status_string(status);
@@ -658,14 +571,12 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     VLOG(2) << toString() << " onData called in state " << getStateAsString()
             << ", ignoring (possible UCXX replay)";
     if (status != UCS_OK) {
-      releaseOutstandingRequestBytes();
     }
     return;
   }
   VLOG(3) << toString() << " + onData " << ucs_status_string(status);
 
   if (status != UCS_OK) {
-    releaseOutstandingRequestBytes();
     std::string errorMsg = fmt::format(
         "Failed to receive data from host {}:{}, task {}: {}",
         host_,
@@ -680,7 +591,6 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     deliverEndMarker();
     setState(ReceiverState::Done);
   } else {
-    releaseOutstandingRequestBytes();
     VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
             << " got chunk: " << sequenceNumber_;
 
@@ -830,7 +740,6 @@ void UcxExchangeSource::onIntraNodeData(
   }
 
   if (atEnd) {
-    releaseOutstandingRequestBytes();
     // End of stream
     atEnd_ = true;
     VLOG(3) << toString() << " Intra-node transfer: end of stream";
@@ -842,7 +751,6 @@ void UcxExchangeSource::onIntraNodeData(
   }
 
   if (!data) {
-    releaseOutstandingRequestBytes();
     // Error - should not happen if atEnd is false
     std::string errorMsg = fmt::format(
         "Intra-node transfer data is null for task {}, dest {}, seq {}",
@@ -888,7 +796,6 @@ void UcxExchangeSource::onIntraNodeData(
       std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
 
   enqueue(std::move(tableWithStream));
-  releaseOutstandingRequestBytes();
 
   this->sequenceNumber_++;
   setStateIf(

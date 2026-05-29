@@ -91,7 +91,13 @@ void UcxExchangeServer::process() {
       communicator_->addToWorkQueue(getSelfPtr());
       break;
     case ServerState::ReadyToTransfer:
-      receiveDataRequest();
+      // Count-only / rendezvous push (Presto-style): no consumer credit request.
+      // Go straight to dequeue + send; the data tagSend blocks at rendezvous
+      // until the source posts its matching tagRecv (getMetadata/getData), which
+      // is the sole flow-control mechanism. pendingRequestMaxBytes_ stays 0 so
+      // getData() uses an unbounded cap.
+      setState(ServerState::DataRequestReady);
+      communicator_->addToWorkQueue(getSelfPtr());
       break;
     case ServerState::WaitingForDataRequest:
       // Waiting for consumer credit is handled by the UCXX callback.

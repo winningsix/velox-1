@@ -40,7 +40,6 @@ namespace facebook::velox::ucx_exchange {
 constexpr uint64_t METADATA_TAG = 0x02000000;
 constexpr uint64_t DATA_TAG = 0x03000000;
 constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
-constexpr uint64_t DATA_REQUEST_TAG = 0x05000000;
 
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(const std::string& s);
@@ -61,14 +60,6 @@ inline uint64_t getDataTag(uint64_t taskHash, uint64_t sequenceNumber) {
 // Note: taskHash is implicitly converted to 64 bits.
 inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
   return (taskHash << 32) | HANDSHAKE_RESPONSE_TAG;
-}
-
-// Gets the tag used for consumer credit requests.
-// Note: taskHash and sequenceNumber are implicitly converted to 64 bits.
-inline uint64_t getDataRequestTag(
-    uint64_t taskHash,
-    uint64_t sequenceNumber) {
-  return (taskHash << 32) | DATA_REQUEST_TAG | sequenceNumber;
 }
 
 /// @brief Request that is sent from the client (UcxExchangeSource) to the
@@ -98,15 +89,7 @@ struct HandshakeResponse {
   uint8_t padding[7]{};
 };
 
-/// Credit sent by UcxExchangeSource before UcxExchangeServer may dequeue and
-/// send one data-bearing exchange item.
-struct DataRequestMsg {
-  int64_t sequence{0};
-  uint64_t maxBytes{0};
-};
-
 constexpr uint32_t kMagicNumber = 0x12345678;
-constexpr uint64_t kDataRequestMaxBytes = 256ULL * 1024 * 1024;
 /// Maximum metadata buffer size for receiving. This should be large enough
 /// to handle tables with many columns. 1MB allows for ~10,000+ columns.
 /// The sender allocates exact size needed; receiver pre-allocates this max.
