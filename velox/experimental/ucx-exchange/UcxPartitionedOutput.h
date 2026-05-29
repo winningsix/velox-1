@@ -113,8 +113,6 @@ class UcxPartitionedOutput : public exec::Operator,
   int64_t pendingRows_{0};
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
-  /// Maximum GPU payload bytes for one UCX transfer chunk.
-  const uint64_t targetBytesPerChunk_;
 };
 
 } // namespace facebook::velox::ucx_exchange
