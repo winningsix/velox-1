@@ -105,14 +105,6 @@ class UcxExchangeQueue {
     return queue_.size();
   }
 
-  /// Returns a byte credit for the next producer request based on current
-  /// consumer queue occupancy. The value is capped at maxBytesPerRequest so a
-  /// single UCX transfer remains bounded even when the queue is mostly empty.
-  uint64_t suggestedReceiveBytes(
-      int32_t highWaterMark,
-      uint64_t defaultBytes,
-      uint64_t maxBytesPerRequest);
-
   /// Returns the total bytes held by packed tables in 'this'.
   int64_t totalBytes() const {
     return totalBytes_;
