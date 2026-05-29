@@ -88,11 +88,6 @@ class UcxExchangeServer
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
-  /// @brief Posts and handles one consumer credit request.
-  void receiveDataRequest();
-
-  void onDataRequest(ucs_status_t status, std::shared_ptr<void> arg);
-
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
 

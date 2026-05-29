@@ -269,65 +269,6 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::getSelfPtr() {
   return shared_from_this();
 }
 
-void UcxExchangeServer::receiveDataRequest() {
-  auto request = std::make_shared<DataRequestMsg>();
-  const uint64_t requestTag =
-      getDataRequestTag(partitionKeyHash_, sequenceNumber_);
-  std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
-  if (dataRequestMsgRequest_) {
-    completedRequests_.push_back(std::move(dataRequestMsgRequest_));
-  }
-  setState(ServerState::WaitingForDataRequest);
-  dataRequestMsgRequest_ = endpointRef_->endpoint_->tagRecv(
-      request.get(),
-      sizeof(*request),
-      ucxx::Tag{requestTag},
-      ucxx::TagMaskFull,
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (auto self = weak.lock()) {
-          self->onDataRequest(status, arg);
-        }
-      },
-      request);
-}
-
-void UcxExchangeServer::onDataRequest(
-    ucs_status_t status,
-    std::shared_ptr<void> arg) {
-  if (closed_.load(std::memory_order_acquire)) {
-    return;
-  }
-  if (getState() != ServerState::WaitingForDataRequest) {
-    VLOG(2) << "[UCX-SERVER-DATA-REQUEST-IGNORED] key="
-            << partitionKey_.toString() << " state=" << getStateAsString()
-            << " status=" << ucs_status_string(status);
-    return;
-  }
-  if (status != UCS_OK) {
-    LOG(WARNING) << "[UCX-SERVER-DATA-REQUEST-ERROR] task="
-                 << partitionKey_.taskId << " key=" << partitionKey_.toString()
-                 << " seq=" << sequenceNumber_
-                 << " status=" << ucs_status_string(status);
-    setState(ServerState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
-    return;
-  }
-  auto request = std::static_pointer_cast<DataRequestMsg>(arg);
-  if (request->sequence != static_cast<int64_t>(sequenceNumber_)) {
-    LOG(WARNING) << "[UCX-SERVER-DATA-REQUEST-SEQUENCE-MISMATCH] task="
-                 << partitionKey_.taskId << " key=" << partitionKey_.toString()
-                 << " expected=" << sequenceNumber_
-                 << " got=" << request->sequence;
-  }
-  pendingRequestMaxBytes_ = request->maxBytes;
-  VLOG(2) << "[UCX-SERVER-DATA-REQUEST] task=" << partitionKey_.taskId
-          << " key=" << partitionKey_.toString() << " seq=" << sequenceNumber_
-          << " maxBytes=" << pendingRequestMaxBytes_;
-  setState(ServerState::DataRequestReady);
-  communicator_->addToWorkQueue(getSelfPtr());
-}
-
 void UcxExchangeServer::sendData() {
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
