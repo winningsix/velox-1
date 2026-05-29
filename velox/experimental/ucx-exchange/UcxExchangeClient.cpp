@@ -36,26 +36,7 @@ void UcxExchangeClient::addRemoteTaskId(const std::string& remoteTaskId) {
 
     std::weak_ptr<UcxExchangeClient> weakSelf = shared_from_this();
     std::shared_ptr<UcxExchangeSource> source;
-    source = UcxExchangeSource::create(
-        taskId_,
-        remoteTaskId,
-        queue_,
-        [weakSelf](const std::shared_ptr<UcxExchangeSource>& source) {
-          if (auto self = weakSelf.lock()) {
-            self->onSourceReadyForCredit(source);
-          }
-        },
-        [weakSelf](
-            const std::shared_ptr<UcxExchangeSource>& source,
-            uint64_t reservedBytes,
-            uint64_t actualBytes,
-            const std::vector<int64_t>& remainingBytes,
-            bool atEnd) {
-          if (auto self = weakSelf.lock()) {
-            self->onSourceCreditFinished(
-                source, reservedBytes, actualBytes, remainingBytes, atEnd);
-          }
-        });
+    source = UcxExchangeSource::create(taskId_, remoteTaskId, queue_);
 
     if (closed_) {
       toClose = std::move(source);
@@ -87,10 +68,6 @@ void UcxExchangeClient::close() {
       return;
     }
     closed_ = true;
-    pendingBytes_ = 0;
-    idleSources_.clear();
-    idleSourceSet_.clear();
-    producingSources_.clear();
     sources = std::move(sources_);
   }
 
@@ -150,7 +127,6 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       // queue is closed!
       return data;
     }
-    scheduleCreditsLocked();
 
     // TODO: Review this primitive form of flow control.
     // Maybe need to inspect the #bytes rather than the #tables?
@@ -197,7 +173,6 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       for (auto& source : sources_) {
         source->resumeFromBackpressure();
       }
-      scheduleCreditsLocked();
     }
   }
 
@@ -206,104 +181,6 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     stalePromise.setValue();
   }
   return data;
-}
-
-void UcxExchangeClient::onSourceReadyForCredit(
-    const std::shared_ptr<UcxExchangeSource>& source) {
-  std::lock_guard<std::mutex> l(queue_->mutex());
-  if (closed_ || source == nullptr) {
-    return;
-  }
-  if (producingSources_.count(source.get()) == 0 &&
-      idleSourceSet_.insert(source.get()).second) {
-    idleSources_.push_back(source);
-  }
-  scheduleCreditsLocked();
-}
-
-void UcxExchangeClient::onSourceCreditFinished(
-    const std::shared_ptr<UcxExchangeSource>& source,
-    uint64_t reservedBytes,
-    uint64_t actualBytes,
-    const std::vector<int64_t>& remainingBytes,
-    bool atEnd) {
-  std::lock_guard<std::mutex> l(queue_->mutex());
-  if (reservedBytes >= static_cast<uint64_t>(pendingBytes_)) {
-    pendingBytes_ = 0;
-  } else {
-    pendingBytes_ -= reservedBytes;
-  }
-
-  if (source != nullptr) {
-    producingSources_.erase(source.get());
-    if (!closed_ && !atEnd && idleSourceSet_.insert(source.get()).second) {
-      idleSources_.push_back(source);
-    }
-  }
-
-  VLOG(3) << "[UCX-CREDIT] @" << taskId_ << " sourceDone"
-          << " reservedBytes=" << reservedBytes
-          << " actualBytes=" << actualBytes
-          << " remainingItems=" << remainingBytes.size()
-          << " pendingBytes=" << pendingBytes_
-          << " queueBytes=" << queue_->totalBytes()
-          << " idleSources=" << idleSources_.size()
-          << " producingSources=" << producingSources_.size();
-
-  if (!closed_) {
-    scheduleCreditsLocked();
-  }
-}
-
-uint64_t UcxExchangeClient::availableCreditBytesLocked() const {
-  const int64_t queuedBytes = queue_->totalBytes();
-  const uint64_t usedBytes =
-      static_cast<uint64_t>(std::max<int64_t>(queuedBytes, 0)) +
-      static_cast<uint64_t>(std::max<int64_t>(pendingBytes_, 0));
-  if (usedBytes >= kDefaultMaxPendingBytes) {
-    return 0;
-  }
-  return kDefaultMaxPendingBytes - usedBytes;
-}
-
-void UcxExchangeClient::scheduleCreditsLocked() {
-  if (closed_) {
-    return;
-  }
-
-  size_t attempts = idleSources_.size();
-  while (attempts-- > 0 && !idleSources_.empty()) {
-    auto source = std::move(idleSources_.front());
-    idleSources_.pop_front();
-    if (source == nullptr) {
-      continue;
-    }
-    idleSourceSet_.erase(source.get());
-    if (producingSources_.count(source.get()) != 0) {
-      continue;
-    }
-
-    const uint64_t availableBytes = availableCreditBytesLocked();
-    if (availableBytes == 0) {
-      if (idleSourceSet_.insert(source.get()).second) {
-        idleSources_.push_front(std::move(source));
-      }
-      break;
-    }
-
-    const uint64_t creditBytes =
-        std::min<uint64_t>(availableBytes, kDataRequestMaxBytes);
-    if (source->armCredit(creditBytes)) {
-      pendingBytes_ += creditBytes;
-      producingSources_.insert(source.get());
-      VLOG(3) << "[UCX-CREDIT] @" << taskId_ << " armed"
-              << " creditBytes=" << creditBytes
-              << " pendingBytes=" << pendingBytes_
-              << " queueBytes=" << queue_->totalBytes()
-              << " idleSources=" << idleSources_.size()
-              << " producingSources=" << producingSources_.size();
-    }
-  }
 }
 
 UcxExchangeClient::~UcxExchangeClient() {
