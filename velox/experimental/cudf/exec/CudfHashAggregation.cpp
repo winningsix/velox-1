@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -30,6 +31,8 @@
 #include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
+
+#include <fmt/format.h>
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -1364,6 +1367,19 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
+      "CudfAggregation[node={},op={},pipeline={},driver={},phase=groupby,rows={},columns={},groupKeys={},aggs={},global={},distinct={},streaming={}]",
+      planNodeId(),
+      operatorId(),
+      operatorCtx_->driverCtx()->pipelineId,
+      operatorCtx_->driverCtx()->driverId,
+      tableView.num_rows(),
+      tableView.num_columns(),
+      groupByKeys.size(),
+      aggregators.size(),
+      isGlobal_,
+      isDistinct_,
+      streamingEnabled_));
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 

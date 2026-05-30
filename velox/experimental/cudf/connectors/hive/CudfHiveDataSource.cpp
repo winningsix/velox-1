@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -36,6 +37,8 @@
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/expression/FieldReference.h"
+
+#include <fmt/format.h>
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
@@ -215,6 +218,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       return nullptr;
     }
 
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
+        "CudfHiveDataSource[phase=read_chunk,split={}]",
+        split_->filePath));
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);

@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -24,6 +25,8 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
+
+#include <fmt/format.h>
 
 #include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
@@ -245,6 +248,16 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
+      "CudfFilterProject[node={},op={},pipeline={},driver={},phase=get_output,rows={},columns={},filter={},project={}]",
+      planNodeId(),
+      operatorId(),
+      operatorCtx_->driverCtx()->pipelineId,
+      operatorCtx_->driverCtx()->driverId,
+      cudfInput->getTableView().num_rows(),
+      cudfInput->getTableView().num_columns(),
+      hasFilter_,
+      projectEvaluators_.size()));
   auto inputTableColumns = cudfInput->release()->release();
 
   if (hasFilter_) {
