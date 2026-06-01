@@ -35,8 +35,6 @@
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
-#include <functional>
-
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
@@ -64,8 +62,6 @@ class UcxExchangeSource
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeSource> {
  public:
-  using SourceReadyCallback =
-      std::function<void(const std::shared_ptr<UcxExchangeSource>& source)>;
   virtual ~UcxExchangeSource() = default;
 
   // factory method to create a UCX exchange source.
@@ -146,7 +142,6 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
-    uint64_t creditBytes{0};
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -278,7 +273,6 @@ class UcxExchangeSource
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
-  uint64_t creditBytes_{0};
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};
@@ -306,8 +300,6 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
-
-  SourceReadyCallback readyCallback_{nullptr};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

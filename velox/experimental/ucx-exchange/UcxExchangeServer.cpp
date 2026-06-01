@@ -98,9 +98,6 @@ void UcxExchangeServer::process() {
       setState(ServerState::DataRequestReady);
       communicator_->addToWorkQueue(getSelfPtr());
       break;
-    case ServerState::WaitingForDataRequest:
-      // Waiting for consumer credit is handled by the UCXX callback.
-      break;
     case ServerState::DataRequestReady:
       setState(ServerState::WaitingForDataFromQueue);
       // Register the callback with the destination queue to get data.
@@ -203,13 +200,13 @@ void UcxExchangeServer::close() {
           expected, desired, std::memory_order_acq_rel)) {
     return; // already closed.
   }
-  LOG(WARNING) << "[UCX-SERVER-CLOSE] task=" << partitionKey_.taskId
-               << " key=" << partitionKey_.toString() << " peer="
-               << (endpointRef_ ? endpointRef_->getPeerAddress() : "(unknown)")
-               << " state=" << getStateAsString() << " seq=" << sequenceNumber_
-               << " hasMetaRequest=" << (metaRequest_ != nullptr)
-               << " hasDataRequest=" << (dataRequest_ != nullptr)
-               << " hasDataPtr=" << (dataPtr_ != nullptr);
+  VLOG(2) << "[UCX-SERVER-CLOSE] task=" << partitionKey_.taskId
+          << " key=" << partitionKey_.toString() << " peer="
+          << (endpointRef_ ? endpointRef_->getPeerAddress() : "(unknown)")
+          << " state=" << getStateAsString() << " seq=" << sequenceNumber_
+          << " hasMetaRequest=" << (metaRequest_ != nullptr)
+          << " hasDataRequest=" << (dataRequest_ != nullptr)
+          << " hasDataPtr=" << (dataPtr_ != nullptr);
 
   if (queueMgr_) {
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
@@ -394,11 +391,11 @@ void UcxExchangeServer::sendData() {
                     << " metadata successfully sent to " << tid
                     << " with tag: " << std::hex << metadataTag;
           } else {
-            LOG(WARNING) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
-                         << self->partitionKey_.taskId << " key=" << tid
-                         << " seq=" << self->sequenceNumber_
-                         << " tag=" << std::hex << metadataTag << std::dec
-                         << " status=" << ucs_status_string(status);
+            VLOG(0) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
+                    << self->partitionKey_.taskId << " key=" << tid
+                    << " seq=" << self->sequenceNumber_ << " tag=" << std::hex
+                    << metadataTag << std::dec
+                    << " status=" << ucs_status_string(status);
             if (self->dataSendSlotAcquired_ && self->endpointRef_) {
               self->endpointRef_->releaseDataSendSlot();
               self->dataSendSlotAcquired_ = false;
@@ -474,10 +471,10 @@ void UcxExchangeServer::sendComplete(
     std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    LOG(WARNING) << "[UCX-SERVER-SEND-COMPLETE-AFTER-CLOSE] task="
-                 << partitionKey_.taskId << " key=" << partitionKey_.toString()
-                 << " seq=" << sequenceNumber_
-                 << " status=" << ucs_status_string(status);
+    VLOG(2) << "[UCX-SERVER-SEND-COMPLETE-AFTER-CLOSE] task="
+            << partitionKey_.taskId << " key=" << partitionKey_.toString()
+            << " seq=" << sequenceNumber_
+            << " status=" << ucs_status_string(status);
     return;
   }
   if (status == UCS_OK) {
@@ -511,10 +508,9 @@ void UcxExchangeServer::sendComplete(
       endpointRef_->releaseDataSendSlot();
       dataSendSlotAcquired_ = false;
     }
-    LOG(WARNING) << "[UCX-SERVER-DATA-SEND-ERROR] task=" << partitionKey_.taskId
-                 << " key=" << partitionKey_.toString()
-                 << " seq=" << sequenceNumber_ << " bytes=" << bytes_
-                 << " status=" << ucs_status_string(status);
+    VLOG(0) << "[UCX-SERVER-DATA-SEND-ERROR] task=" << partitionKey_.taskId
+            << " key=" << partitionKey_.toString() << " seq=" << sequenceNumber_
+            << " bytes=" << bytes_ << " status=" << ucs_status_string(status);
     setState(ServerState::Done);
   }
   communicator_->addToWorkQueue(getSelfPtr());

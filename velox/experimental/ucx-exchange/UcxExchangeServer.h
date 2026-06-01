@@ -66,7 +66,6 @@ class UcxExchangeServer
   enum class ServerState : uint32_t {
     Created,
     ReadyToTransfer,
-    WaitingForDataRequest,
     DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
@@ -109,7 +108,6 @@ class UcxExchangeServer
     const std::string stateMap[] = {
         "Created",
         "ReadyToTransfer",
-        "WaitingForDataRequest",
         "DataRequestReady",
         "WaitingForDataFromQueue",
         "DataReady",
@@ -134,7 +132,6 @@ class UcxExchangeServer
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
-  std::vector<int64_t> remainingBytes_;
   std::recursive_mutex dataMutex_; // mutex for above ptr.
   std::atomic<bool> closed_{false};
 

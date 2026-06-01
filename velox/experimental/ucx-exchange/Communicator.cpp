@@ -315,11 +315,11 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 }
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
-  LOG(WARNING) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort="
-               << Communicator::getInstance()->port_
-               << " peer=" << (ep ? ep->getPeerAddress() : "(unknown)")
-               << " endpointAlive="
-               << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
+  VLOG(2) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort="
+          << Communicator::getInstance()->port_
+          << " peer=" << (ep ? ep->getPeerAddress() : "(unknown)")
+          << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
 
   // Close the endpoint if it's still alive.
   // NOTE: This calls closeBlocking() which progresses the worker internally.
@@ -343,9 +343,9 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
   // This method is safe to call from UCX callbacks because it doesn't
   // call any blocking/progress functions. The actual cleanup happens
   // in the main run() loop.
-  LOG(WARNING) << "[UCX-COMM-DEFER-ENDPOINT-CLEANUP] peer="
-               << (ep ? ep->getPeerAddress() : "(unknown)") << " endpointAlive="
-               << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
+  VLOG(2) << "[UCX-COMM-DEFER-ENDPOINT-CLEANUP] peer="
+          << (ep ? ep->getPeerAddress() : "(unknown)") << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
   deferredEndpointCleanup_.push(ep);
   signalWorker();
 }

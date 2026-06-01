@@ -79,11 +79,11 @@ UcxPartitionedOutput::UcxPartitionedOutput(
         planNode->kind(),
         static_cast<int>(numPartitions_),
         numDrivers);
-    LOG(WARNING) << "UcxPartitionedOutput initialized queue task="
-                 << ctx->task->taskId() << " destinations=" << numPartitions_
-                 << " drivers=" << numDrivers << " kind="
-                 << core::PartitionedOutputNode::toName(planNode->kind())
-                 << " targetRowsPerChunk=" << targetRowsPerChunk_;
+    VLOG(2) << "UcxPartitionedOutput initialized queue task="
+            << ctx->task->taskId() << " destinations=" << numPartitions_
+            << " drivers=" << numDrivers
+            << " kind=" << core::PartitionedOutputNode::toName(planNode->kind())
+            << " targetRowsPerChunk=" << targetRowsPerChunk_;
   }
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
@@ -392,10 +392,10 @@ void UcxPartitionedOutput::splitAndEnqueue(
     if (rowChunkingNeeded) {
       cudf::size_type rowsPerChunk = std::min<cudf::size_type>(
           partitionRows, static_cast<cudf::size_type>(targetRowsPerChunk_));
-      LOG(WARNING) << "UcxPartitionedOutput chunking task=" << taskId()
-                   << " destination=" << i << " rows=" << partitionRows
-                   << " rowsPerChunk=" << rowsPerChunk
-                   << " targetRowsPerChunk=" << targetRowsPerChunk_;
+      VLOG(2) << "UcxPartitionedOutput chunking task=" << taskId()
+              << " destination=" << i << " rows=" << partitionRows
+              << " rowsPerChunk=" << rowsPerChunk
+              << " targetRowsPerChunk=" << targetRowsPerChunk_;
       for (cudf::size_type start = 0; start < partitionRows;
            start += rowsPerChunk) {
         const auto end =

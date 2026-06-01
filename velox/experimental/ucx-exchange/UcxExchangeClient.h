@@ -18,7 +18,6 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
-#include <deque>
 #include <unordered_set>
 
 namespace facebook::velox::ucx_exchange {
@@ -31,7 +30,6 @@ class UcxExchangeClient
   // used for some primitive type of flow control, limits the size of elements
   // in the UcxExchangeQueue
   static constexpr int32_t kDefaultMaxQueuedColumns = 32;
-  static constexpr uint64_t kDefaultMaxPendingBytes = 256ULL * 1024 * 1024;
   static constexpr std::chrono::milliseconds kRequestDataMaxWait{100};
 
   UcxExchangeClient(

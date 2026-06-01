@@ -18,8 +18,6 @@
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 
-#include <algorithm>
-
 namespace facebook::velox::ucx_exchange {
 
 void UcxExchangeClient::addRemoteTaskId(const std::string& remoteTaskId) {
@@ -34,7 +32,6 @@ void UcxExchangeClient::addRemoteTaskId(const std::string& remoteTaskId) {
       return;
     }
 
-    std::weak_ptr<UcxExchangeClient> weakSelf = shared_from_this();
     std::shared_ptr<UcxExchangeSource> source;
     source = UcxExchangeSource::create(taskId_, remoteTaskId, queue_);
 

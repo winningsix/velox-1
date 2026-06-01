@@ -214,10 +214,9 @@ void UcxExchangeSource::close() {
     return; // already closed.
   }
 
-  LOG(WARNING) << "[UCX-SOURCE-CLOSE] " << toString()
-               << " state=" << getStateAsString() << " seq=" << sequenceNumber_
-               << " hasRequest=" << (request_ != nullptr)
-               << " atEnd=" << atEnd_;
+  VLOG(2) << "[UCX-SOURCE-CLOSE] " << toString()
+          << " state=" << getStateAsString() << " seq=" << sequenceNumber_
+          << " hasRequest=" << (request_ != nullptr) << " atEnd=" << atEnd_;
 
   // Guarantee the end marker is delivered before transitioning to Done.
   deliverEndMarker();
@@ -437,9 +436,9 @@ void UcxExchangeSource::onMetadata(
     std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    LOG(WARNING) << "[UCX-SOURCE-METADATA-AFTER-CLOSE] " << toString()
-                 << " seq=" << sequenceNumber_
-                 << " status=" << ucs_status_string(status);
+    VLOG(2) << "[UCX-SOURCE-METADATA-AFTER-CLOSE] " << toString()
+            << " seq=" << sequenceNumber_
+            << " status=" << ucs_status_string(status);
     deliverEndMarker();
     return;
   }
@@ -447,8 +446,6 @@ void UcxExchangeSource::onMetadata(
   if (getState() != ReceiverState::WaitingForMetadata) {
     VLOG(2) << toString() << " onMetadata called in state "
             << getStateAsString() << ", ignoring (possible UCXX replay)";
-    if (status != UCS_OK) {
-    }
     return;
   }
   VLOG(3) << toString() << " + onMetadata " << ucs_status_string(status);
@@ -568,9 +565,9 @@ void UcxExchangeSource::onMetadata(
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    LOG(WARNING) << "[UCX-SOURCE-DATA-AFTER-CLOSE] " << toString()
-                 << " seq=" << sequenceNumber_
-                 << " status=" << ucs_status_string(status);
+    VLOG(2) << "[UCX-SOURCE-DATA-AFTER-CLOSE] " << toString()
+            << " seq=" << sequenceNumber_
+            << " status=" << ucs_status_string(status);
     deliverEndMarker();
     return;
   }
@@ -578,8 +575,6 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   if (getState() != ReceiverState::WaitingForData) {
     VLOG(2) << toString() << " onData called in state " << getStateAsString()
             << ", ignoring (possible UCXX replay)";
-    if (status != UCS_OK) {
-    }
     return;
   }
   VLOG(3) << toString() << " + onData " << ucs_status_string(status);
@@ -591,9 +586,9 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    LOG(WARNING) << "[UCX-SOURCE-DATA-ERROR] " << toString()
-                 << " seq=" << sequenceNumber_
-                 << " state=" << getStateAsString() << " error=" << errorMsg;
+    VLOG(0) << "[UCX-SOURCE-DATA-ERROR] " << toString()
+            << " seq=" << sequenceNumber_ << " state=" << getStateAsString()
+            << " error=" << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
