@@ -501,12 +501,21 @@ void UcxExchangeSource::onMetadata(
     // Store the stream in the DataAndMetadata struct so it can be used later
     // in onData() when creating the PackedTableWithStream.
     ptr->stream = stream;
+    // Receive buffers MUST come from a dedicated, synchronous, fresh-memory
+    // resource — NOT the shared RMM pool. UCX RDMA-writes this buffer from the
+    // progress thread, out of band of any CUDA stream. The two pool-based
+    // alternatives both fail:
+    //   * pool alloc + stream.synchronize() -> deadlocks the UCX progress thread
+    //     (hang on heavy multi-fragment queries, e.g. Q18).
+    //   * pool alloc + no synchronize -> the pool may hand back a block still
+    //     in flight on another stream; UCX writing into it corrupts memory and
+    //     SIGSEGVs the process (observed crashing the driver at Q14).
+    // cuda_memory_resource (raw cudaMalloc) returns fresh, never-reused memory
+    // that is valid immediately, so no stream sync is needed and there is no
+    // reuse race. These buffers are short-lived (freed once consumed) and bound
+    // by the queue's count backpressure, so staying off the pool does not leak.
     static rmm::mr::cuda_memory_resource recvMemoryResource;
     try {
-      // UCX is not CUDA-stream ordered. Use a synchronous allocation for the
-      // receive buffer so the memory is valid before the tagRecv is posted,
-      // while still avoiding a blocking stream synchronize on the UCX progress
-      // thread.
       ptr->dataBuf = std::make_unique<rmm::device_buffer>(
           ptr->metadata.dataSizeBytes, stream, &recvMemoryResource);
     } catch (const rmm::bad_alloc& e) {
