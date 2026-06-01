@@ -36,8 +36,7 @@ void EndpointRef::onClose(ucs_status_t status, std::shared_ptr<void> arg) {
         ep->commElementCount_.load(std::memory_order_acquire);
   }
   LOG(WARNING) << "[UCX-ENDPOINT-CLOSE] status=" << ucs_status_string(status)
-               << " peer=" << peerAddress
-               << " endpointAlive="
+               << " peer=" << peerAddress << " endpointAlive="
                << (ep && ep->endpoint_ && ep->endpoint_->isAlive())
                << " registeredCommElements=" << registeredCommElements;
 
@@ -86,8 +85,7 @@ void EndpointRef::closeAndDrainCommunicators() {
     commElementCount_.store(0, std::memory_order_release);
   }
   LOG(WARNING) << "[UCX-ENDPOINT-DRAIN] peer=" << getPeerAddress()
-               << " closing comm elements count="
-               << localCopy.size();
+               << " closing comm elements count=" << localCopy.size();
 
   // Close producers first so they can publish/cancel queue state before
   // consumer sources observe endpoint teardown.

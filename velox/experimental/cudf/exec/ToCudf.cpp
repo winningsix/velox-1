@@ -40,12 +40,13 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include <dlfcn.h>
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include <dlfcn.h>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -210,10 +211,9 @@ class OutputMemoryResourceTracker final
     std::size_t totalMem = 0;
     const auto memErr = cudaMemGetInfo(&freeMem, &totalMem);
 
-    LOG(ERROR) << label_ << " OOM requestedBytes="
-               << requestedBytes << " requestedMiB="
-               << (requestedBytes / 1048576.0) << " error="
-               << (error == nullptr ? "unknown" : error)
+    LOG(ERROR) << label_ << " OOM requestedBytes=" << requestedBytes
+               << " requestedMiB=" << (requestedBytes / 1048576.0)
+               << " error=" << (error == nullptr ? "unknown" : error)
                << " currentContext=" << currentGpuOperatorContext()
                << " cudaMemGetInfoStatus="
                << (memErr == cudaSuccess ? "ok" : cudaGetErrorString(memErr))
@@ -273,8 +273,8 @@ void dumpRegisteredOutputMemoryTrackers(const std::string& prefix) {
     LOG(ERROR) << prefix << " cudfMemoryResources activeTrackerCount=0";
     return;
   }
-  LOG(ERROR) << prefix << " cudfMemoryResources activeTrackerCount="
-             << trackers.size();
+  LOG(ERROR) << prefix
+             << " cudfMemoryResources activeTrackerCount=" << trackers.size();
   for (auto& tracker : trackers) {
     tracker->dumpDiagnostics(prefix);
   }
@@ -285,8 +285,9 @@ std::shared_ptr<rmm::mr::device_memory_resource> maybeWrapSharedMemoryResource(
   if (!envFlagEnabled("GLUTEN_GPU_MEMORY_OOM_DUMP")) {
     return resource;
   }
-  LOG(INFO) << "CudfSharedPoolMemoryResource OOM dump wrapper enabled upstreamType="
-            << typeid(*resource).name();
+  LOG(INFO)
+      << "CudfSharedPoolMemoryResource OOM dump wrapper enabled upstreamType="
+      << typeid(*resource).name();
   auto tracker = std::make_shared<OutputMemoryResourceTracker>(
       std::move(resource), "CudfSharedPoolMemoryResource");
   registerOutputMemoryTracker(tracker);
@@ -318,7 +319,8 @@ extern "C" void glutenCudfDumpMemoryResources(const char* prefix) {
 // ScopedGpuMemoryOperatorContext (which dlsym-resolves these to stay usable in
 // a standalone Velox build) can tag each allocation with its operator. Without
 // these definitions the dump reports context=unavailable/unknown. Marked
-// default-visibility so dlsym(RTLD_DEFAULT, ...) finds them inside libgluten.so.
+// default-visibility so dlsym(RTLD_DEFAULT, ...) finds them inside
+// libgluten.so.
 extern "C" __attribute__((visibility("default"))) const char*
 glutenGpuMemoryTrackerCurrentOperatorContext() {
   return tlsGpuOperatorContext.empty() ? nullptr

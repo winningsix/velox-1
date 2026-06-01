@@ -199,9 +199,11 @@ bool isUcxExchangePlanNode(
     return false;
   }
   if (planNode->id() == planNodeId) {
-    const auto* exchangeNode = dynamic_cast<const core::ExchangeNode*>(planNode);
+    const auto* exchangeNode =
+        dynamic_cast<const core::ExchangeNode*>(planNode);
     return exchangeNode != nullptr &&
-        exchangeNode->transportType() == core::ExchangeNode::TransportType::kUcx;
+        exchangeNode->transportType() ==
+        core::ExchangeNode::TransportType::kUcx;
   }
   for (const auto& source : planNode->sources()) {
     if (isUcxExchangePlanNode(source.get(), planNodeId)) {

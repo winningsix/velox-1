@@ -24,11 +24,11 @@
 #include <limits>
 #include <memory>
 #include <vector>
-#include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "UcxTestHelpers.h"
 #include "folly/experimental/EventCount.h"
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
 using namespace facebook::velox::ucx_exchange;
@@ -124,8 +124,8 @@ class UcxOutputQueueManagerTest : public testing::Test {
         [&](std::shared_ptr<cudf::packed_columns> data,
             std::vector<int64_t> remainingBytes) {
           received = true;
-          response = FetchResponse{
-              std::move(data), -1, std::move(remainingBytes)};
+          response =
+              FetchResponse{std::move(data), -1, std::move(remainingBytes)};
         });
     EXPECT_TRUE(received) << "for destination " << destination;
     return response;
@@ -150,8 +150,8 @@ class UcxOutputQueueManagerTest : public testing::Test {
           response = FetchResponse{
               std::move(data), receivedSequence, std::move(remainingBytes)};
         });
-    EXPECT_TRUE(received) << "for destination " << destination
-                          << " sequence " << sequence;
+    EXPECT_TRUE(received) << "for destination " << destination << " sequence "
+                          << sequence;
     return response;
   }
 
@@ -422,13 +422,13 @@ TEST_F(UcxOutputQueueManagerTest, v2OversizeRequestReturnsOneChunk) {
   EXPECT_EQ(first.data->gpu_data->size(), firstBytes);
   EXPECT_EQ(first.remainingBytes.size(), 1);
 
-  auto second = fetchV2Data(
-      taskId, destination, std::numeric_limits<uint64_t>::max(), 1);
+  auto second =
+      fetchV2Data(taskId, destination, std::numeric_limits<uint64_t>::max(), 1);
   ASSERT_NE(second.data, nullptr);
   EXPECT_EQ(second.sequence, 1);
 
-  auto end = fetchV2Data(
-      taskId, destination, std::numeric_limits<uint64_t>::max(), 2);
+  auto end =
+      fetchV2Data(taskId, destination, std::numeric_limits<uint64_t>::max(), 2);
   EXPECT_EQ(end.data, nullptr);
   EXPECT_EQ(end.sequence, 2);
 
@@ -442,7 +442,8 @@ TEST_F(UcxOutputQueueManagerTest, v2RemovedTaskReturnsNullAtRequestedSequence) {
   const int destination = 0;
   const int64_t requestedSequence = 7;
 
-  auto task = initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
   task->requestAbort().wait();
   queueManager_->removeTask(taskId);
 

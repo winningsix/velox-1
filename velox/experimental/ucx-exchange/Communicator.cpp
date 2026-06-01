@@ -344,8 +344,7 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
   // call any blocking/progress functions. The actual cleanup happens
   // in the main run() loop.
   LOG(WARNING) << "[UCX-COMM-DEFER-ENDPOINT-CLEANUP] peer="
-               << (ep ? ep->getPeerAddress() : "(unknown)")
-               << " endpointAlive="
+               << (ep ? ep->getPeerAddress() : "(unknown)") << " endpointAlive="
                << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
   deferredEndpointCleanup_.push(ep);
   signalWorker();

@@ -18,8 +18,8 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -32,8 +32,6 @@
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
 
-#include <fmt/format.h>
-
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -43,6 +41,8 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <fmt/format.h>
 
 #include <vector>
 
@@ -269,8 +269,7 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
     VELOX_CHECK(
-        resultType->isRow() ||
-            step == core::AggregationNode::Step::kSingle ||
+        resultType->isRow() || step == core::AggregationNode::Step::kSingle ||
             step == core::AggregationNode::Step::kFinal,
         "Mean {} aggregation expects row(sum, count) intermediate type, got {}",
         core::AggregationNode::toName(step),
@@ -1047,8 +1046,7 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
       hasCompanions &&
       !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
-  const bool canStreamCompanions =
-      !hasCompanions ||
+  const bool canStreamCompanions = !hasCompanions ||
       canStreamCompanionAggregates(
           aggregationNode_->aggregates(), aggregationNode_->step());
   streamingEnabled_ = canStreamCompanions && !isGlobal_;
@@ -1198,8 +1196,8 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         // sticky), but kept at LOG(INFO) so the transition is visible in
         // production logs -- it's a one-shot state-change event, not noise.
         LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
-                  << "] partial bypass mode triggered: ratio="
-                  << ratio << " buf_rows=" << bufRows
+                  << "] partial bypass mode triggered: ratio=" << ratio
+                  << " buf_rows=" << bufRows
                   << " cum_input=" << partialCumulativeInputRows_;
         partialBypassMode_ = true;
       }
@@ -1367,19 +1365,20 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
-  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-      "CudfAggregation[node={},op={},pipeline={},driver={},phase=groupby,rows={},columns={},groupKeys={},aggs={},global={},distinct={},streaming={}]",
-      planNodeId(),
-      operatorId(),
-      operatorCtx_->driverCtx()->pipelineId,
-      operatorCtx_->driverCtx()->driverId,
-      tableView.num_rows(),
-      tableView.num_columns(),
-      groupByKeys.size(),
-      aggregators.size(),
-      isGlobal_,
-      isDistinct_,
-      streamingEnabled_));
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "CudfAggregation[node={},op={},pipeline={},driver={},phase=groupby,rows={},columns={},groupKeys={},aggs={},global={},distinct={},streaming={}]",
+          planNodeId(),
+          operatorId(),
+          operatorCtx_->driverCtx()->pipelineId,
+          operatorCtx_->driverCtx()->driverId,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          groupByKeys.size(),
+          aggregators.size(),
+          isGlobal_,
+          isDistinct_,
+          streamingEnabled_));
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 

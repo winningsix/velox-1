@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
+#include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
-#include <fmt/format.h>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -302,17 +302,18 @@ void UcxPartitionedOutput::hashPartition(
     rmm::cuda_stream_view stream) {
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " Hashing and partitioning into " << numPartitions_ << " chunks";
-  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-      "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=hash_partition,rows={},columns={},numPartitions={},keys={},spec={}]",
-      planNodeId(),
-      operatorId(),
-      pipelineId_,
-      driverId_,
-      tableView.num_rows(),
-      tableView.num_columns(),
-      numPartitions_,
-      partitionKeyIndices_.size(),
-      spec_));
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=hash_partition,rows={},columns={},numPartitions={},keys={},spec={}]",
+          planNodeId(),
+          operatorId(),
+          pipelineId_,
+          driverId_,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          numPartitions_,
+          partitionKeyIndices_.size(),
+          spec_));
 
   // Use cudf hash partitioning
   std::vector<cudf::size_type> partitionKeyIndices;
@@ -356,17 +357,18 @@ void UcxPartitionedOutput::splitAndEnqueue(
     cudf::table_view tableView,
     std::vector<cudf::size_type> offsets,
     rmm::cuda_stream_view stream) {
-  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-      "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=contiguous_split,rows={},columns={},numPartitions={},offsets={},spec={}]",
-      planNodeId(),
-      operatorId(),
-      pipelineId_,
-      driverId_,
-      tableView.num_rows(),
-      tableView.num_columns(),
-      numPartitions_,
-      offsets.size(),
-      spec_));
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=contiguous_split,rows={},columns={},numPartitions={},offsets={},spec={}]",
+          planNodeId(),
+          operatorId(),
+          pipelineId_,
+          driverId_,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          numPartitions_,
+          offsets.size(),
+          spec_));
   auto contiguousTables = cudf::contiguous_split(tableView, offsets, stream);
 
   // Synchronize the stream to ensure CUDA operations complete before enqueuing.
@@ -394,9 +396,10 @@ void UcxPartitionedOutput::splitAndEnqueue(
                    << " destination=" << i << " rows=" << partitionRows
                    << " rowsPerChunk=" << rowsPerChunk
                    << " targetRowsPerChunk=" << targetRowsPerChunk_;
-      for (cudf::size_type start = 0; start < partitionRows; start += rowsPerChunk) {
-        const auto end = std::min<cudf::size_type>(
-            partitionRows, start + rowsPerChunk);
+      for (cudf::size_type start = 0; start < partitionRows;
+           start += rowsPerChunk) {
+        const auto end =
+            std::min<cudf::size_type>(partitionRows, start + rowsPerChunk);
         auto slicedTables = cudf::slice(partitionTable.table, {start, end});
         VELOX_CHECK_EQ(slicedTables.size(), 1);
         auto packedCols = cudf::pack(slicedTables[0], stream);

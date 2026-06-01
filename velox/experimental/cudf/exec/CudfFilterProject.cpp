@@ -26,12 +26,12 @@
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
 
-#include <fmt/format.h>
-
 #include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
+
+#include <fmt/format.h>
 
 #include <iostream>
 #include <unordered_map>
@@ -248,16 +248,17 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-      "CudfFilterProject[node={},op={},pipeline={},driver={},phase=get_output,rows={},columns={},filter={},project={}]",
-      planNodeId(),
-      operatorId(),
-      operatorCtx_->driverCtx()->pipelineId,
-      operatorCtx_->driverCtx()->driverId,
-      cudfInput->getTableView().num_rows(),
-      cudfInput->getTableView().num_columns(),
-      hasFilter_,
-      projectEvaluators_.size()));
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "CudfFilterProject[node={},op={},pipeline={},driver={},phase=get_output,rows={},columns={},filter={},project={}]",
+          planNodeId(),
+          operatorId(),
+          operatorCtx_->driverCtx()->pipelineId,
+          operatorCtx_->driverCtx()->driverId,
+          cudfInput->getTableView().num_rows(),
+          cudfInput->getTableView().num_columns(),
+          hasFilter_,
+          projectEvaluators_.size()));
   auto inputTableColumns = cudfInput->release()->release();
 
   if (hasFilter_) {

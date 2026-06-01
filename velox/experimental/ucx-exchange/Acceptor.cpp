@@ -74,16 +74,15 @@ void Acceptor::cStyleAMCallback(
   // corrupt it for other servers).
   if (isIntraNodeTransfer) {
     auto queueMgr = UcxOutputQueueManager::getInstanceRef();
-    const bool canUseIntraNode =
-        queueMgr->canUseIntraNode(key.taskId);
+    const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
     LOG(WARNING) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
                  << " destination=" << key.destination
                  << " peer=" << peerAddress
                  << " sourceWorkerId=" << handshakePtr->workerId
                  << " localWorkerId=" << communicator->getWorkerId()
                  << " sameWorker=" << sameWorker
-                 << " canUseIntraNode=" << canUseIntraNode
-                 << " queue=" << queueMgr->describeQueueForIntraNode(key.taskId);
+                 << " canUseIntraNode=" << canUseIntraNode << " queue="
+                 << queueMgr->describeQueueForIntraNode(key.taskId);
     if (!canUseIntraNode) {
       VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
               << " (not initialized or broadcast)";
@@ -95,8 +94,7 @@ void Acceptor::cStyleAMCallback(
                  << " peer=" << peerAddress
                  << " sourceWorkerId=" << handshakePtr->workerId
                  << " localWorkerId=" << communicator->getWorkerId()
-                 << " sameWorker=" << sameWorker
-                 << " intraNodeEnabled="
+                 << " sameWorker=" << sameWorker << " intraNodeEnabled="
                  << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
   }
 

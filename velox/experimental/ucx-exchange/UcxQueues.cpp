@@ -88,7 +88,8 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
-  VELOX_CHECK_GE(sequence, sequence_, "Get received for an already acknowledged item");
+  VELOX_CHECK_GE(
+      sequence, sequence_, "Get received for an already acknowledged item");
   VELOX_CHECK(
       notify_ == nullptr && notifyV2_ == nullptr,
       "UcxDestinationQueue already has a pending data notification");
@@ -412,25 +413,28 @@ void UcxOutputQueue::getData(
     auto* queue = queues_[destination].get();
     if (queue) {
       std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
-      data = queue->getData(maxBytes, sequence, [notify, weakSelf](
-                                std::shared_ptr<cudf::packed_columns> data,
-                                int64_t sequence,
-                                std::vector<int64_t> remainingBytes) {
-        std::vector<ContinuePromise> promises;
-        int64_t bytes = data ? data->gpu_data->size() : -1L;
-        notify(std::move(data), sequence, std::move(remainingBytes));
-        if (bytes >= 0L) {
-          auto self = weakSelf.lock();
-          if (!self) {
-            return;
-          }
-          std::lock_guard<std::mutex> l(self->mutex_);
-          self->updateStatsWithFreedLocked(bytes, 1L, promises);
-        }
-        for (auto& promise : promises) {
-          promise.setValue();
-        }
-      });
+      data = queue->getData(
+          maxBytes,
+          sequence,
+          [notify, weakSelf](
+              std::shared_ptr<cudf::packed_columns> data,
+              int64_t sequence,
+              std::vector<int64_t> remainingBytes) {
+            std::vector<ContinuePromise> promises;
+            int64_t bytes = data ? data->gpu_data->size() : -1L;
+            notify(std::move(data), sequence, std::move(remainingBytes));
+            if (bytes >= 0L) {
+              auto self = weakSelf.lock();
+              if (!self) {
+                return;
+              }
+              std::lock_guard<std::mutex> l(self->mutex_);
+              self->updateStatsWithFreedLocked(bytes, 1L, promises);
+            }
+            for (auto& promise : promises) {
+              promise.setValue();
+            }
+          });
       if (data.data) {
         updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
       }

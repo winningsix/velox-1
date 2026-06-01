@@ -185,7 +185,8 @@ bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
   }
   // Placeholder partitioned queues are safe for intra-node: the server will
   // wait until initializeTask() upgrades the queue and data arrives. Broadcast
-  // is the unsafe case because one packed_columns may be shared by destinations.
+  // is the unsafe case because one packed_columns may be shared by
+  // destinations.
   return !queue->isInitialized() ||
       queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
 }
@@ -207,8 +208,8 @@ void UcxOutputQueueManager::removeTask(const std::string& taskId) {
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
         auto it = queues.find(taskId);
         if (it == queues.end()) {
-      // Already removed. Keep the tombstone so late getData() calls from
-      // stale UCX servers cannot recreate zombie placeholder queues.
+          // Already removed. Keep the tombstone so late getData() calls from
+          // stale UCX servers cannot recreate zombie placeholder queues.
           return nullptr;
         }
         auto taskQueue = it->second;

@@ -215,8 +215,7 @@ void UcxExchangeSource::close() {
   }
 
   LOG(WARNING) << "[UCX-SOURCE-CLOSE] " << toString()
-               << " state=" << getStateAsString()
-               << " seq=" << sequenceNumber_
+               << " state=" << getStateAsString() << " seq=" << sequenceNumber_
                << " hasRequest=" << (request_ != nullptr)
                << " atEnd=" << atEnd_;
 
@@ -333,9 +332,8 @@ void UcxExchangeSource::sendHandshake() {
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-SEND] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
-          << " destination=" << partitionKey_.destination
-          << " peer=" << host_ << ":" << port_
-          << " workerId=" << handshakeReq->workerId;
+          << " destination=" << partitionKey_.destination << " peer=" << host_
+          << ":" << port_ << " workerId=" << handshakeReq->workerId;
 
   // Create the handshake which will register client's existence with the server
   ucxx::AmReceiverCallbackInfo info(
@@ -505,7 +503,8 @@ void UcxExchangeSource::onMetadata(
     // resource — NOT the shared RMM pool. UCX RDMA-writes this buffer from the
     // progress thread, out of band of any CUDA stream. The two pool-based
     // alternatives both fail:
-    //   * pool alloc + stream.synchronize() -> deadlocks the UCX progress thread
+    //   * pool alloc + stream.synchronize() -> deadlocks the UCX progress
+    //   thread
     //     (hang on heavy multi-fragment queries, e.g. Q18).
     //   * pool alloc + no synchronize -> the pool may hand back a block still
     //     in flight on another stream; UCX writing into it corrupts memory and
@@ -594,8 +593,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         ucs_status_string(status));
     LOG(WARNING) << "[UCX-SOURCE-DATA-ERROR] " << toString()
                  << " seq=" << sequenceNumber_
-                 << " state=" << getStateAsString()
-                 << " error=" << errorMsg;
+                 << " state=" << getStateAsString() << " error=" << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
@@ -696,9 +694,8 @@ void UcxExchangeSource::onHandshakeResponse(
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-RESPONSE] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
-          << " destination=" << partitionKey_.destination
-          << " peer=" << host_ << ":" << port_
-          << " isIntraNodeTransfer=" << isIntraNodeTransfer_;
+          << " destination=" << partitionKey_.destination << " peer=" << host_
+          << ":" << port_ << " isIntraNodeTransfer=" << isIntraNodeTransfer_;
 
   setStateIf(
       ReceiverState::WaitingForHandshakeResponse,

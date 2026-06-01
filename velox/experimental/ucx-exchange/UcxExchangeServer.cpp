@@ -91,10 +91,10 @@ void UcxExchangeServer::process() {
       communicator_->addToWorkQueue(getSelfPtr());
       break;
     case ServerState::ReadyToTransfer:
-      // Count-only / rendezvous push (Presto-style): no consumer credit request.
-      // Go straight to dequeue + send; the data tagSend blocks at rendezvous
-      // until the source posts its matching tagRecv (getMetadata/getData), which
-      // is the sole flow-control mechanism.
+      // Count-only / rendezvous push (Presto-style): no consumer credit
+      // request. Go straight to dequeue + send; the data tagSend blocks at
+      // rendezvous until the source posts its matching tagRecv
+      // (getMetadata/getData), which is the sole flow-control mechanism.
       setState(ServerState::DataRequestReady);
       communicator_->addToWorkQueue(getSelfPtr());
       break;
@@ -114,8 +114,8 @@ void UcxExchangeServer::process() {
         queueMgr_->getData(
             partitionKey_.taskId,
             partitionKey_.destination,
-            // Unbounded per-fetch cap; rendezvous + queue-occupancy backpressure
-            // are the flow control (no byte-credit).
+            // Unbounded per-fetch cap; rendezvous + queue-occupancy
+            // backpressure are the flow control (no byte-credit).
             std::numeric_limits<uint64_t>::max(),
             static_cast<int64_t>(sequenceNumber_),
             [weakQueue](
@@ -126,8 +126,8 @@ void UcxExchangeServer::process() {
               if (!self) {
                 return; // Object was destroyed, safe to ignore
               }
-              // Check if close() was called - avoid processing if we're shutting
-              // down
+              // Check if close() was called - avoid processing if we're
+              // shutting down
               if (self->closed_.load(std::memory_order_acquire)) {
                 VLOG(3) << "@" << self->partitionKey_.taskId
                         << " getData callback called after close, ignoring";
@@ -204,11 +204,9 @@ void UcxExchangeServer::close() {
     return; // already closed.
   }
   LOG(WARNING) << "[UCX-SERVER-CLOSE] task=" << partitionKey_.taskId
-               << " key=" << partitionKey_.toString()
-               << " peer="
+               << " key=" << partitionKey_.toString() << " peer="
                << (endpointRef_ ? endpointRef_->getPeerAddress() : "(unknown)")
-               << " state=" << getStateAsString()
-               << " seq=" << sequenceNumber_
+               << " state=" << getStateAsString() << " seq=" << sequenceNumber_
                << " hasMetaRequest=" << (metaRequest_ != nullptr)
                << " hasDataRequest=" << (dataRequest_ != nullptr)
                << " hasDataPtr=" << (dataPtr_ != nullptr);
@@ -515,8 +513,7 @@ void UcxExchangeServer::sendComplete(
     }
     LOG(WARNING) << "[UCX-SERVER-DATA-SEND-ERROR] task=" << partitionKey_.taskId
                  << " key=" << partitionKey_.toString()
-                 << " seq=" << sequenceNumber_
-                 << " bytes=" << bytes_
+                 << " seq=" << sequenceNumber_ << " bytes=" << bytes_
                  << " status=" << ucs_status_string(status);
     setState(ServerState::Done);
   }

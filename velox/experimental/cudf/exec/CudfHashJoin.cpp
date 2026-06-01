@@ -276,14 +276,15 @@ void CudfHashJoinBuild::noMoreInput() {
     buildRows += input->getTableView().num_rows();
     buildColumns = input->getTableView().num_columns();
   }
-  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-      "CudfHashJoinBuild[node={},op={},pipeline={},driver={},phase=build_hash_table,rows={},columns={}]",
-      planNodeId(),
-      operatorId(),
-      operatorCtx_->driverCtx()->pipelineId,
-      operatorCtx_->driverCtx()->driverId,
-      buildRows,
-      buildColumns));
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "CudfHashJoinBuild[node={},op={},pipeline={},driver={},phase=build_hash_table,rows={},columns={}]",
+          planNodeId(),
+          operatorId(),
+          operatorCtx_->driverCtx()->pipelineId,
+          operatorCtx_->driverCtx()->driverId,
+          buildRows,
+          buildColumns));
 
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using output_mr here to allow spilling queued up large tables

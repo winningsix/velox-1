@@ -104,15 +104,16 @@ void CudfOrderBy::noMoreInput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using the output memory resource to allow spilling to CPU memory.
   auto tbl = [&]() {
-    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-        "CudfOrderBy[node={},op={},pipeline={},driver={},phase=concat,rows={},columns={},batches={}]",
-        planNodeId(),
-        operatorId(),
-        operatorCtx_->driverCtx()->pipelineId,
-        operatorCtx_->driverCtx()->driverId,
-        inputRows,
-        inputColumns,
-        inputs_.size()));
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+        fmt::format(
+            "CudfOrderBy[node={},op={},pipeline={},driver={},phase=concat,rows={},columns={},batches={}]",
+            planNodeId(),
+            operatorId(),
+            operatorCtx_->driverCtx()->pipelineId,
+            operatorCtx_->driverCtx()->driverId,
+            inputRows,
+            inputColumns,
+            inputs_.size()));
     return getConcatenatedTable(
         std::move(inputs_), outputType_, stream, get_output_mr());
   }();
@@ -126,15 +127,16 @@ void CudfOrderBy::noMoreInput() {
   auto keys = tbl->view().select(sortKeys_);
   auto values = tbl->view();
   auto result = [&]() {
-    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(fmt::format(
-        "CudfOrderBy[node={},op={},pipeline={},driver={},phase=sort_by_key,rows={},columns={},sortKeys={}]",
-        planNodeId(),
-        operatorId(),
-        operatorCtx_->driverCtx()->pipelineId,
-        operatorCtx_->driverCtx()->driverId,
-        values.num_rows(),
-        values.num_columns(),
-        sortKeys_.size()));
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+        fmt::format(
+            "CudfOrderBy[node={},op={},pipeline={},driver={},phase=sort_by_key,rows={},columns={},sortKeys={}]",
+            planNodeId(),
+            operatorId(),
+            operatorCtx_->driverCtx()->pipelineId,
+            operatorCtx_->driverCtx()->driverId,
+            values.num_rows(),
+            values.num_columns(),
+            sortKeys_.size()));
     return cudf::sort_by_key(
         values, keys, columnOrder_, nullOrder_, stream, get_output_mr());
   }();

@@ -38,7 +38,6 @@ void UcxExchangeQueue::close() {
   clearPromises(promises);
 }
 
-
 void UcxExchangeQueue::enqueueLocked(
     PackedTableWithStreamPtr&& data,
     std::vector<ContinuePromise>& promises) {
