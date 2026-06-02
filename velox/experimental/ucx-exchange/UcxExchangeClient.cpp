@@ -125,6 +125,23 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       return data;
     }
 
+    // Revive backpressured sources on the empty/blocking path. When the queue
+    // has drained and next() is about to hand back a kWaitForProducer future,
+    // any source this client parked under backpressure must be woken now: no
+    // other thread revives a dormant source, and the consumer will not call
+    // next() again with data to trigger the data-path resume below. A consumer
+    // draining multiple exchanges (e.g. TPC-H Q17's correlated-aggregate join)
+    // otherwise hangs forever on a source that stopped reposting receives
+    // (observed as blockedWaitForProducer / WaitingForMetadata). The CAS in
+    // resumeFromBackpressure() no-ops a non-dormant source, and an empty queue
+    // can never warrant backpressure, so this is always safe.
+    if (data == nullptr &&
+        queue_->sizeLocked() <= UcxExchangeSource::kBackpressureLowWaterMark) {
+      for (auto& source : sources_) {
+        source->resumeFromBackpressure();
+      }
+    }
+
     // TODO: Review this primitive form of flow control.
     // Maybe need to inspect the #bytes rather than the #tables?
     // Don't request more data when queue size exceeds the configured limit.
