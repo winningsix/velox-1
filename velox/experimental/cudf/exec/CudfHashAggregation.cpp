@@ -1168,6 +1168,17 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
 
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads groupbyOnInput (produced on inputTableStream) on
+    // partialOutputStream; without making inputTableStream wait for the concat,
+    // its stream-ordered async free can let cudaMallocAsync recycle the block
+    // while the concat is still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
+
     // Now we have to groupby again but this time with intermediate aggregators.
     // Keep concatenatedTable alive while we use its view.
     auto compactedOutput = doGroupByAggregation(
@@ -1233,6 +1244,17 @@ void CudfHashAggregation::computePartialDistinctStreaming(CudfVectorPtr tbl) {
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
 
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads tbl (produced on inputTableStream) on partialOutputStream;
+    // without making inputTableStream wait for the concat, its stream-ordered
+    // async free can let cudaMallocAsync recycle the block while the concat is
+    // still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
+
     // Do a distinct on the concatenated results.
     // Keep concatenatedTable alive while we use its view.
     auto distinctOutput = getDistinctKeys(
@@ -1278,6 +1300,18 @@ void CudfHashAggregation::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
 
   auto concatenatedTable =
       cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
+
+  // Order the input batch's deallocation after the concatenate read. The concat
+  // reads tbl (produced on inputTableStream) on finalStream; without making
+  // inputTableStream wait for the concat, its stream-ordered async free can let
+  // cudaMallocAsync recycle the block while the concat is still reading it
+  // (cudaErrorIllegalAddress).
+  CudaEvent concatEvent(cudaEventDisableTiming);
+  streamsWaitForStream(
+      concatEvent,
+      std::vector<rmm::cuda_stream_view>{inputTableStream},
+      finalStream);
+
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
@@ -1311,6 +1345,17 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
 
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_temp_mr());
+
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads groupbyOnInput (produced on inputTableStream) on
+    // partialOutputStream; without making inputTableStream wait for the concat,
+    // its stream-ordered async free can let cudaMallocAsync recycle the block
+    // while the concat is still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
 
     auto compactedOutput = doGroupByAggregation(
         concatenatedTable->view(),

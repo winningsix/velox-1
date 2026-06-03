@@ -772,15 +772,22 @@ void UcxExchangeSource::onIntraNodeData(
 
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(data->gpu_data->size());
-  static_cast<void>(producerStream);
-
-  // Use the same stream for any local clone and for downstream cuDF work.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   // Broadcast output can share the same packed_columns across multiple
   // destinations. Keep the zero-copy path for uniquely owned partitioned
   // pages, but clone shared pages before moving out of them.
   const bool sharedPage = data.use_count() > 1;
+  // The received device buffer was allocated on `producerStream`, and with the
+  // stream-ordered async MR its cudaFreeAsync stays bound to that stream. For
+  // the uniquely-owned (partitioned) page we MOVE the buffer out, so tag the
+  // rebuilt vector with `producerStream` itself: the downstream read and the
+  // eventual async free then share one stream, so the free can never recycle
+  // the block under a still-pending consumer read on a different pool stream
+  // (previously seen as flaky garbage on Q17, both high and low). Shared pages
+  // are cloned onto a fresh pool stream (the source buffer stays live in the
+  // shared owner and the producer host-synchronizes before publishing).
+  auto stream = sharedPage
+      ? facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream()
+      : producerStream;
   cudf::packed_columns packedCols(
       sharedPage ? std::make_unique<std::vector<uint8_t>>(*data->metadata)
                  : std::move(data->metadata),
