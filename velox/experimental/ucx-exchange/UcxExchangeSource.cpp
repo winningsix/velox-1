@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -27,6 +29,27 @@
 
 using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
+
+int64_t UcxExchangeSource::maxInFlightRecvBytes() {
+  // Read once. See header for rationale: recv buffers are off the operator
+  // pool, so an unbounded byte footprint scales O(#peers) and exhausts the GPU
+  // at 4 peers. This cap makes the producer's tagSend block at rendezvous,
+  // leaving the async operator pool headroom. Deadlock-safe: the count-based
+  // resume path (UcxExchangeClient::next) drains both count and bytes.
+  static const int64_t kBytes = [] {
+    if (const char* env = std::getenv("GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES")) {
+      try {
+        const int64_t v = std::stoll(env);
+        if (v > 0) {
+          return v;
+        }
+      } catch (...) {
+      }
+    }
+    return static_cast<int64_t>(8) * 1024 * 1024 * 1024; // 8 GiB default
+  }();
+  return kBytes;
+}
 
 void UcxExchangeSource::setState(ReceiverState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
@@ -120,11 +143,19 @@ void UcxExchangeSource::process() {
       // will block at rendezvous until we post a matching tagRecv. For
       // intra-node: the server's publish future won't resolve until we poll.
       int32_t queueSize = queue_->size();
-      if (queueSize > kBackpressureHighWaterMark) {
+      int64_t queueBytes = queue_->totalBytes();
+      // Backpressure on BOTH item count and aggregate bytes. The byte cap is
+      // what bounds the off-pool receive-buffer footprint that otherwise scales
+      // O(#peers) and OOMs/deadlocks the GPU at 4 peers (the count cap alone
+      // let a few large chunks fill the device before pausing).
+      if (queueSize > kBackpressureHighWaterMark ||
+          queueBytes > maxInFlightRecvBytes()) {
         if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
                   << "] pausing, queueSize=" << queueSize
-                  << " > highWater=" << kBackpressureHighWaterMark;
+                  << " (high=" << kBackpressureHighWaterMark
+                  << "), queueBytes=" << queueBytes
+                  << " (cap=" << maxInFlightRecvBytes() << ")";
         }
         // Go dormant — do NOT re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
