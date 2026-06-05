@@ -22,6 +22,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/concatenate.hpp>
@@ -161,6 +162,24 @@ void UcxPartitionedOutput::flushPending() {
 
       mergedTable = cudf::concatenate(
           views, stream, cudf::get_current_device_resource_ref());
+
+      // Order each input's stream-ordered async free AFTER this concat read on `stream`.
+      // The producer-side host-sync loop above only guarantees the read sees ready data;
+      // it does NOT order the inputs' cudaFreeAsync (issued on their own heterogeneous
+      // streams when pendingInputs_ is cleared) after the concat. Because device_buffer
+      // allocations default to the recycling pool, an unbridged free lets the pool reclaim
+      // an input block while the concat is still reading it -> silent cross-stream value
+      // corruption (row count intact) on multi-GPU MPP. Mirror the reverse bridge that
+      // getConcatenatedTable (Utilities.cpp) applies.
+      {
+        std::vector<rmm::cuda_stream_view> inputStreams;
+        inputStreams.reserve(pendingInputs_.size());
+        for (auto& v : pendingInputs_) {
+          inputStreams.push_back(v->stream());
+        }
+        CudaEvent freeAfterConcat(cudaEventDisableTiming);
+        streamsWaitForStream(freeAfterConcat, inputStreams, stream);
+      }
 
       // Free input GPU memory before partitioning (peak = 2x -> 1x).
       pendingInputs_.clear();
