@@ -130,9 +130,11 @@ class UcxExchangeSource
   enum class ReceiverState : uint32_t {
     Created,
     WaitingForHandshakeComplete,
+    WaitingForHandshakeResponse, // Waiting for server's HandshakeResponse
     ReadyToReceive,
     WaitingForMetadata,
     WaitingForData,
+    WaitingForIntraNodeData, // Intra-node transfer: waiting on registry
     Done
   };
 
@@ -193,6 +195,26 @@ class UcxExchangeSource
   /// @param arg
   void onData(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// @brief Initiates receiving the HandshakeResponse from server.
+  void receiveHandshakeResponse();
+
+  /// @brief Called when HandshakeResponse is received from server.
+  /// @param status indication by transport layer of transfer status
+  /// @param arg The HandshakeResponse data
+  void onHandshakeResponse(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// @brief For intra-node transfer: initiates waiting for data from registry.
+  void waitForIntraNodeData();
+
+  /// @brief For intra-node transfer: handles data retrieved from registry.
+  /// @param data The packed_columns from registry (nullptr if atEnd or error)
+  /// @param producerStream The CUDA stream on which the data was produced
+  /// @param atEnd True if this is end-of-stream
+  void onIntraNodeData(
+      std::shared_ptr<cudf::packed_columns> data,
+      rmm::cuda_stream_view producerStream,
+      bool atEnd);
+
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
   /// @param newState the new state of the UcxExchangeSource.
@@ -207,9 +229,11 @@ class UcxExchangeSource
     const std::string stateMap[] = {
         "Created",
         "WaitingForHandshakeComplete",
+        "WaitingForHandshakeResponse",
         "ReadyToReceive",
         "WaitingForMetadata",
         "WaitingForData",
+        "WaitingForIntraNodeData",
         "Done"};
     return stateMap[static_cast<uint32_t>(s)];
   }
@@ -248,6 +272,7 @@ class UcxExchangeSource
   std::atomic<ReceiverState> state_;
 
   uint32_t sequenceNumber_{0};
+  uint32_t intraNodePollCount_{0};
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};
@@ -263,6 +288,13 @@ class UcxExchangeSource
   /// that were never registered with the queue (e.g., created after client
   /// close).
   bool registered_{false};
+
+  /// True if the server detected that this source is on the same node.
+  /// Set from the isIntraNodeTransfer flag in HandshakeResponse, which the
+  /// server determines by comparing this source's listener address (sent in
+  /// HandshakeMsg) with its own Communicator's listener address.
+  /// When true, intra-node transfer optimizations bypass UCXX transfers.
+  bool isIntraNodeTransfer_{false};
 
   // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()

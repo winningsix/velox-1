@@ -39,6 +39,7 @@ namespace facebook::velox::ucx_exchange {
 // Definition of the operations.
 constexpr uint64_t METADATA_TAG = 0x02000000;
 constexpr uint64_t DATA_TAG = 0x03000000;
+constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(const std::string& s);
@@ -55,13 +56,37 @@ inline uint64_t getDataTag(uint64_t taskHash, uint64_t sequenceNumber) {
   return (taskHash << 32) | DATA_TAG | sequenceNumber;
 }
 
-/// @brief Request sent from the client (UcxExchangeSource) to the server
-/// (UcxExchangeServer) after connection.
+// Gets the tag used for handshake response communication.
+// Note: taskHash is implicitly converted to 64 bits.
+inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
+  return (taskHash << 32) | HANDSHAKE_RESPONSE_TAG;
+}
+
+/// @brief Request that is sent from the client (UcxExchangeSource) to the
+/// server (UcxExchangeServer) after connection.
 ///
-/// Establishes the partition key for data exchange.
+/// The handshake establishes the partition key for data exchange.
+/// The workerId identifies the source's Communicator instance (process).
+/// If the server's workerId matches, both are in the same process, enabling
+/// intra-node transfer via IntraNodeTransferRegistry instead of UCXX.
 struct HandshakeMsg {
   char taskId[256];
   uint32_t destination;
+  /// Unique identifier for the source's Communicator instance.
+  /// Generated randomly at Communicator startup. The server compares this
+  /// against its own workerId to detect same-process (intra-node) transfers.
+  uint64_t workerId{0};
+};
+
+/// @brief Response sent from server to source after handshake.
+/// Informs the source whether intra-node transfer optimization is available,
+/// allowing the source to bypass UCXX for all subsequent data transfers.
+struct HandshakeResponse {
+  /// True if server and source are on the same node (same Communicator).
+  /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
+  bool isIntraNodeTransfer{false};
+  /// Padding for alignment
+  uint8_t padding[7]{};
 };
 
 constexpr uint32_t kMagicNumber = 0x12345678;

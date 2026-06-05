@@ -825,8 +825,261 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
 }
 
+// Test that verifies intra-node exchange does not livelock when a producing
+// task is removed while the consumer is polling IntraNodeTransferRegistry.
+// Before the fix: test times out (livelock). After the fix: test passes.
+TEST_P(UcxExchangeTest, intraNodeTaskRemovalLivelock) {
+  // This test doesn't use parameters — run only for the first param set.
+  {
+    ExchangeTestParams p = GetParam();
+    if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+        p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+        p.tableType != TableType::NARROW) {
+      GTEST_SKIP() << "intraNodeTaskRemovalLivelock: runs only once";
+    }
+  }
 
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "srcProducerNeverSends";
+  const std::string sinkTaskId = taskPrefix + "sinkConsumer";
+  const int numPartitions = 1;
+  const int partitionId = 0;
 
+  // 1. Create and initialize source task but never enqueue any data.
+  //    This simulates a producer that gets cancelled before producing.
+  auto srcTask = createSourceTask(srcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      numPartitions,
+      /*numDrivers=*/1);
+
+  // 2. Create sink task with exchange plan node.
+  core::PlanNodeId exchangeNodeId;
+  auto sinkTask = createExchangeTask(
+      sinkTaskId, UcxTestData::kTestRowType, partitionId, exchangeNodeId);
+  auto sinkDriver =
+      std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+
+  // Add split pointing to source task. Since we use a single Communicator,
+  // the handshake will resolve to intra-node (same listener IP:port).
+  std::vector<exec::Split> splits;
+  splits.emplace_back(remoteSplit(srcTaskId, partitionId));
+  sinkDriver->addSplits(splits);
+
+  // 3. Start sink driver on background threads — it will begin polling
+  //    IntraNodeTransferRegistry for data that never arrives.
+  sinkDriver->run();
+
+  // 4. Wait for the UcxExchangeSource to complete handshake and start polling.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // 5. Premature task cancellation — abort the source task then remove it.
+  //    This mirrors the production flow where the task is aborted before
+  //    removal. After the fix, the consumer should detect this and stop
+  //    polling.
+  srcTask->requestAbort();
+  queueManager_->removeTask(srcTaskId);
+
+  // 6. Wait for sink to complete with a timeout.
+  auto future =
+      std::async(std::launch::async, [&]() { sinkDriver->joinThreads(); });
+  auto status = future.wait_for(std::chrono::seconds(10));
+
+  // 7. Verify that the sink completed (no livelock).
+  if (status != std::future_status::ready) {
+    // Abort the sink task to prevent the test from hanging indefinitely.
+    sinkTask->requestAbort();
+    future.wait();
+    FAIL() << "Sink driver did not complete within 10s after removeTask()"
+           << " — intra-node livelock: source stuck polling "
+           << "IntraNodeTransferRegistry for cancelled task";
+  }
+  // If we get here, the source correctly detected the cancelled task.
+}
+
+// Regression test for broadcast + intra-node SIGSEGV.
+// Before the fix in Acceptor.cpp, broadcast tasks using intra-node transfer
+// would crash because the intra-node source destructively moves gpu_data from
+// a shared packed_columns object, corrupting it for other servers.
+// The fix disables intra-node at handshake time for broadcast tasks, falling
+// back to UCXX. This test verifies that broadcast with intra-node enabled
+// completes without crash and delivers correct data.
+TEST_P(UcxExchangeTest, broadcastIntraNodeFallback) {
+  // This test doesn't use parameters — run only for the first param set.
+  {
+    ExchangeTestParams p = GetParam();
+    if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+        p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+        p.tableType != TableType::NARROW) {
+      GTEST_SKIP() << "broadcastIntraNodeFallback: runs only once";
+    }
+  }
+
+  // Enable intra-node exchange so the Acceptor's broadcast guard is exercised.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "broadcastSrc";
+  const int numDestinations = 3;
+  const int numDrivers = 1;
+  const int numChunks = 5;
+  const int numRowsPerChunk = 1000;
+
+  // Create source task with broadcast mode.
+  auto srcTask = createSourceTask(srcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      numDestinations,
+      numDrivers);
+  // Finalize destinations for broadcast.
+  queueManager_->updateOutputBuffers(srcTaskId, numDestinations, true);
+
+  // Create one sink per destination. Each connects to its own destination
+  // index.
+  std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+  for (int destId = 0; destId < numDestinations; ++destId) {
+    const std::string sinkTaskId =
+        taskPrefix + "broadcastSink" + std::to_string(destId);
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        sinkTaskId, UcxTestData::kTestRowType, destId, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+
+    std::vector<exec::Split> splits;
+    splits.emplace_back(remoteSplit(srcTaskId, destId));
+    sinkDriver->addSplits(splits);
+
+    sinkDrivers.push_back(sinkDriver);
+  }
+
+  // Producer sends to 1 partition (destination 0); broadcast replicates to all.
+  auto sourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      srcTaskId, numDrivers, /*numPartitions=*/1, numChunks, numRowsPerChunk);
+
+  // Start source and sinks.
+  sourceMock->run();
+  for (auto& sink : sinkDrivers) {
+    sink->run();
+  }
+
+  // Wait for completion.
+  sourceMock->joinThreads();
+  for (auto& sink : sinkDrivers) {
+    sink->joinThreads();
+  }
+
+  // Each sink should receive all chunks: 5 * 1000 = 5000 rows.
+  const size_t expectedRowsPerSink =
+      static_cast<size_t>(numChunks) * numRowsPerChunk;
+  for (int i = 0; i < numDestinations; ++i) {
+    EXPECT_EQ(sinkDrivers[i]->numRows(), expectedRowsPerSink)
+        << "Sink " << i << " row count mismatch";
+  }
+
+  // Cleanup.
+  queueManager_->removeTask(srcTaskId);
+  config.intraNodeExchange = origIntraNode;
+}
+
+// Regression test for broadcast + intra-node placeholder race condition.
+// When sinks connect BEFORE initializeTask() is called, the Acceptor creates
+// a placeholder UcxOutputQueue. If initializeTask() later upgrades that
+// placeholder to broadcast mode, the intra-node flag may be incorrectly set
+// because the broadcast guard in Acceptor only runs at handshake time — but
+// the placeholder was already created with intra-node enabled.
+// Without a fix, this causes a SIGSEGV when the intra-node source
+// destructively moves gpu_data from the shared packed_columns object.
+TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
+  // This test doesn't use parameters — run only for the first param set.
+  {
+    ExchangeTestParams p = GetParam();
+    if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+        p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+        p.tableType != TableType::NARROW) {
+      GTEST_SKIP() << "broadcastIntraNodePlaceholderRace: runs only once";
+    }
+  }
+
+  // Enable intra-node exchange so the race condition can manifest.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "broadcastPlaceholderSrc";
+  const int numDestinations = 3;
+  const int numDrivers = 1;
+  const int numChunks = 5;
+  const int numRowsPerChunk = 1000;
+
+  // Step 1: Create sink tasks and start them BEFORE initializeTask().
+  // This triggers handshakes that create a placeholder queue in
+  // UcxOutputQueueManager with intra-node potentially enabled.
+  std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+  for (int destId = 0; destId < numDestinations; ++destId) {
+    const std::string sinkTaskId =
+        taskPrefix + "broadcastPlaceholderSink" + std::to_string(destId);
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        sinkTaskId, UcxTestData::kTestRowType, destId, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+
+    std::vector<exec::Split> splits;
+    splits.emplace_back(remoteSplit(srcTaskId, destId));
+    sinkDriver->addSplits(splits);
+
+    sinkDrivers.push_back(sinkDriver);
+  }
+
+  // Start sinks — they will handshake and create placeholder queues.
+  for (auto& sink : sinkDrivers) {
+    sink->run();
+  }
+
+  // Step 2: Wait for handshakes to be processed.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // Step 3: NOW initialize the task with broadcast mode.
+  // This upgrades the placeholder queue to broadcast.
+  auto srcTask = createSourceTask(srcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      numDestinations,
+      numDrivers);
+
+  // Step 4: Finalize destinations for broadcast.
+  queueManager_->updateOutputBuffers(srcTaskId, numDestinations, true);
+
+  // Step 5: Create and run the producer.
+  auto sourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      srcTaskId, numDrivers, /*numPartitions=*/1, numChunks, numRowsPerChunk);
+  sourceMock->run();
+
+  // Step 6: Wait for completion — without a fix this crashes (SIGSEGV).
+  sourceMock->joinThreads();
+  for (auto& sink : sinkDrivers) {
+    sink->joinThreads();
+  }
+
+  // Step 7: Verify all sinks received correct row counts.
+  const size_t expectedRowsPerSink =
+      static_cast<size_t>(numChunks) * numRowsPerChunk;
+  for (int i = 0; i < numDestinations; ++i) {
+    EXPECT_EQ(sinkDrivers[i]->numRows(), expectedRowsPerSink)
+        << "Sink " << i << " row count mismatch";
+  }
+
+  // Cleanup.
+  queueManager_->removeTask(srcTaskId);
+  config.intraNodeExchange = origIntraNode;
+}
 
 // Test that UcxPartitionedOutput's batch accumulation correctly merges many
 // small input chunks into fewer, larger output chunks while preserving all rows
@@ -1144,6 +1397,11 @@ TEST_P(UcxExchangeTest, deferredRequestCleanupOnTaskAbort) {
     }
   }
 
+  // Ensure intra-node is disabled so we exercise the UCXX path (tagRecv).
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = false;
+
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "srcActiveTransfer";
   const std::string sinkTaskId = taskPrefix + "sinkAborted";
@@ -1213,6 +1471,8 @@ TEST_P(UcxExchangeTest, deferredRequestCleanupOnTaskAbort) {
 
   // If we reach here without crashing, the deferred cleanup is working.
   VLOG(0) << "deferredRequestCleanupOnTaskAbort: completed without crash";
+
+  config.intraNodeExchange = origIntraNode;
 }
 
 std::shared_ptr<UcxOutputQueueManager> UcxExchangeTest::queueManager_;

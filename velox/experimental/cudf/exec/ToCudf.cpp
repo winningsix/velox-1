@@ -719,6 +719,9 @@ void CudfConfig::initialize(
   if (config.find(kUcxExchange) != config.end()) {
     exchange = folly::to<bool>(config[kUcxExchange]);
   }
+  if (config.find(kUcxIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
+  }
   if (config.find(kUcxxErrorHandling) != config.end()) {
     ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
   }

@@ -26,6 +26,7 @@ set(
   Acceptor.cpp
   EndpointRef.cpp
   NetUtil.cpp
+  IntraNodeTransferRegistry.cpp
 )
 
 # Generate a header containing the module basenames (without .cpp extension)

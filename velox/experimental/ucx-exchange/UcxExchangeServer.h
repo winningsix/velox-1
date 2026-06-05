@@ -39,10 +39,13 @@ class UcxExchangeServer
   /// @param communicator The Communicator instance.
   /// @param endpointRef The endpoint reference for UCXX communication.
   /// @param key The partition key identifying the data to serve.
+  /// @param isIntraNodeTransfer True if the source is on the same node,
+  ///        determined by checking if the peer's IP is in the local IP set.
   static std::shared_ptr<UcxExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key);
+      const PartitionKey& key,
+      bool isIntraNodeTransfer);
 
   void process() override;
 
@@ -54,6 +57,11 @@ class UcxExchangeServer
     return partitionKey_;
   }
 
+  /// @brief Returns true if this server detected same-node with the source.
+  bool isIntraNodeTransfer() const {
+    return isIntraNodeTransfer_;
+  }
+
  private:
   enum class ServerState : uint32_t {
     Created,
@@ -62,13 +70,16 @@ class UcxExchangeServer
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
+    WaitingForIntraNodeRetrieve, // Intra-node transfer: waiting for source to
+                                 // retrieve
     Done
   };
 
   explicit UcxExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key);
+      const PartitionKey& key,
+      bool isIntraNodeTransfer);
 
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
@@ -78,6 +89,10 @@ class UcxExchangeServer
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// @brief Completion handler for intra-node transfer after source retrieves
+  /// data.
+  void onIntraNodeRetrieveComplete();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -97,6 +112,7 @@ class UcxExchangeServer
         "WaitingForDataFromQueue",
         "DataReady",
         "WaitingForSendComplete",
+        "WaitingForIntraNodeRetrieve",
         "Done"};
     return stateMap[static_cast<uint32_t>(s)];
   }
@@ -109,12 +125,24 @@ class UcxExchangeServer
   const uint32_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
+  /// True if server and source are on the same node (determined by checking
+  /// if peer's actual IP is in the local IP set). When true, data is passed
+  /// via IntraNodeTransferRegistry instead of UCXX transfer.
+  bool isIntraNodeTransfer_{false};
+
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
   std::recursive_mutex dataMutex_; // mutex for above ptr.
   std::atomic<bool> closed_{false};
 
+  /// Future for intra-node transfer - signaled when source retrieves data.
+  std::future<void> intraNodeRetrieveFuture_;
+
+  /// For intra-node transfer: true if the last published entry was atEnd.
+  bool intraNodeAtEndPublished_{false};
+
   uint32_t sequenceNumber_{0};
+  uint32_t intraNodePollCount_{0};
 
   /// Whether this server currently holds a data-send slot on its endpoint.
   /// Send-slot concurrency control (via EndpointRef::tryAcquireDataSendSlot),
