@@ -220,10 +220,6 @@ void UcxExchangeServer::close() {
   if (dataRequest_ && !dataRequest_->isCompleted()) {
     dataRequest_->cancel();
   }
-  if (dataSendSlotAcquired_ && endpointRef_) {
-    endpointRef_->releaseDataSendSlot();
-    dataSendSlotAcquired_ = false;
-  }
 
   // Move all requests to the Communicator's deferred list so the GPU
   // buffers they reference (via their arg shared_ptr) stay alive until
@@ -318,17 +314,6 @@ void UcxExchangeServer::sendData() {
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
     if (dataPtr_) {
-      if (!dataSendSlotAcquired_) {
-        if (!endpointRef_->tryAcquireDataSendSlot()) {
-          VLOG(2) << "[UCX-SERVER-SEND-GATED] task=" << partitionKey_.taskId
-                  << " key=" << partitionKey_.toString()
-                  << " seq=" << sequenceNumber_
-                  << " bytes=" << dataPtr_->gpu_data->size();
-          communicator_->addToWorkQueue(getSelfPtr());
-          return;
-        }
-        dataSendSlotAcquired_ = true;
-      }
       // Copy metadata (not move) because in broadcast mode, the same
       // packed_columns may be shared across multiple destination queues.
       // Metadata is small (CPU-side), so copying is negligible.
@@ -396,10 +381,6 @@ void UcxExchangeServer::sendData() {
                     << " seq=" << self->sequenceNumber_ << " tag=" << std::hex
                     << metadataTag << std::dec
                     << " status=" << ucs_status_string(status);
-            if (self->dataSendSlotAcquired_ && self->endpointRef_) {
-              self->endpointRef_->releaseDataSendSlot();
-              self->dataSendSlotAcquired_ = false;
-            }
             self->setState(ServerState::Done);
             self->communicator_->addToWorkQueue(self);
           }
@@ -480,10 +461,6 @@ void UcxExchangeServer::sendComplete(
   if (status == UCS_OK) {
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
     VELOX_CHECK(dataPtr_ != nullptr, "dataPtr_ is null");
-    if (dataSendSlotAcquired_ && endpointRef_) {
-      endpointRef_->releaseDataSendSlot();
-      dataSendSlotAcquired_ = false;
-    }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = end - sendStart_;
@@ -504,10 +481,6 @@ void UcxExchangeServer::sendComplete(
             << " Releasing dataPtr_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);
   } else {
-    if (dataSendSlotAcquired_ && endpointRef_) {
-      endpointRef_->releaseDataSendSlot();
-      dataSendSlotAcquired_ = false;
-    }
     VLOG(0) << "[UCX-SERVER-DATA-SEND-ERROR] task=" << partitionKey_.taskId
             << " key=" << partitionKey_.toString() << " seq=" << sequenceNumber_
             << " bytes=" << bytes_ << " status=" << ucs_status_string(status);

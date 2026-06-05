@@ -106,19 +106,6 @@ void EndpointRef::closeAndDrainCommunicators() {
   // localCopy is destroyed here, releasing all weak_ptrs.
 }
 
-bool EndpointRef::tryAcquireDataSendSlot() {
-  std::lock_guard<std::mutex> lock(dataSendMutex_);
-  if (dataSendInProgress_) {
-    return false;
-  }
-  dataSendInProgress_ = true;
-  return true;
-}
-
-void EndpointRef::releaseDataSendSlot() {
-  std::lock_guard<std::mutex> lock(dataSendMutex_);
-  dataSendInProgress_ = false;
-}
 
 bool EndpointRef::operator<(EndpointRef const& other) {
   if (endpoint_ == other.endpoint_) {

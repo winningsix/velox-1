@@ -144,11 +144,6 @@ class UcxExchangeServer
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
 
-  /// Whether this server currently holds a data-send slot on its endpoint.
-  /// Send-slot concurrency control (via EndpointRef::tryAcquireDataSendSlot),
-  /// independent of flow control.
-  std::atomic<bool> dataSendSlotAcquired_{false};
-
   // The outstanding requests - there can only be one outstanding request
   // of each type at any point in time.
   // NOTE: The request owns/holds references to the upcall function

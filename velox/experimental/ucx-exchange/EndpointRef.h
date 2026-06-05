@@ -69,12 +69,6 @@ class EndpointRef : std::enable_shared_from_this<EndpointRef> {
   /// Must be called from the Communicator main loop thread ONLY.
   void closeAndDrainCommunicators();
 
-  /// Limits large UCX data tagSend requests to one in-flight send per endpoint.
-  /// Metadata and handshakes are small and are not gated.
-  bool tryAcquireDataSendSlot();
-
-  void releaseDataSendSlot();
-
   /// implement < operator such that this endpoint can be used in a
   /// std::map
   bool operator<(EndpointRef const& other);
@@ -114,7 +108,5 @@ class EndpointRef : std::enable_shared_from_this<EndpointRef> {
       communicators_;
   std::mutex commMutex_; // Protects communicators_
   std::atomic<size_t> commElementCount_{0};
-  std::mutex dataSendMutex_;
-  bool dataSendInProgress_{false};
 };
 } // namespace facebook::velox::ucx_exchange
