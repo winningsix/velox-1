@@ -22,7 +22,6 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 #include <limits>
-#include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -60,9 +59,6 @@ void UcxOutputQueueManager::initializeTask(
   // Clear any stale "removed" state so that getData() calls after this
   // initializeTask() create proper placeholder queues if needed.
   removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
-  // Clear any stale "cancelled" state in the intra-node registry so
-  // that the cancelledTasks_ set doesn't grow unboundedly across queries.
-  IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
 }
 
 void UcxOutputQueueManager::updateOutputBuffers(
@@ -178,31 +174,6 @@ void UcxOutputQueueManager::getData(
   outputQueue->getData(destination, maxBytes, sequence, notify);
 }
 
-bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
-  auto queue = getQueueIfExists(taskId);
-  if (!queue) {
-    return true;
-  }
-  // Placeholder partitioned queues are safe for intra-node: the server will
-  // wait until initializeTask() upgrades the queue and data arrives. Broadcast
-  // is the unsafe case because one packed_columns may be shared by
-  // destinations.
-  return !queue->isInitialized() ||
-      queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
-}
-
-std::string UcxOutputQueueManager::describeQueueForIntraNode(
-    const std::string& taskId) {
-  auto queue = getQueueIfExists(taskId);
-  if (!queue) {
-    return "missing";
-  }
-  return fmt::format(
-      "initialized={} kind={}",
-      queue->isInitialized(),
-      core::PartitionedOutputNode::toName(queue->kind()));
-}
-
 void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
@@ -225,9 +196,6 @@ void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   if (queue != nullptr) {
     queue->terminate();
   }
-  // Notify the intra-node registry so that any sources polling for this
-  // task get an atEnd result instead of spinning forever.
-  IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);
 }
 
 std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueueIfExists(

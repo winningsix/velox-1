@@ -55,8 +55,6 @@ struct CudfConfig {
 
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
-  static constexpr const char* kUcxIntraNodeExchange{
-      "cudf.intra_node_exchange"};
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
   static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
 
@@ -142,10 +140,6 @@ struct CudfConfig {
 
   /// Whether to enable error handling in UCXX endpoints.
   bool ucxxErrorHandling{true};
-
-  /// Whether intra-node exchange optimization is enabled.
-  /// When disabled, all transfers use UCXX even within the same node.
-  bool intraNodeExchange{false};
 
   /// Whether to use blocking polling in UCXX.
   bool ucxxBlockingPolling{true};

@@ -128,23 +128,13 @@ class Communicator {
   [[nodiscard]] const std::string& getCoordinatorUrl();
 
   /// @brief Get the listener's bound IP address.
-  /// Used for same-node detection in intra-node transfer optimization.
   /// @returns The IP address string from the UCXX listener, or empty if not
   /// initialized.
   [[nodiscard]] std::string getListenerIp() const;
 
   /// @brief Get the listener's bound port.
-  /// Used for same-node detection in intra-node transfer optimization.
   /// @returns The port number from the UCXX listener.
   [[nodiscard]] uint16_t getListenerPort() const;
-
-  /// @brief Get the unique worker ID for this Communicator instance.
-  /// Used for intra-process detection: if two endpoints share the same
-  /// workerId, they are in the same process and can use
-  /// IntraNodeTransferRegistry instead of UCXX.
-  uint64_t getWorkerId() const {
-    return workerId_;
-  }
 
  private:
   Communicator() =
@@ -202,11 +192,6 @@ class Communicator {
   /// progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
   /// or if not in blocking progress mode.
   void signalWorker();
-
-  /// A random unique identifier for this Communicator instance (process).
-  /// Generated once at initialization. Used by the Acceptor to determine
-  /// if a connecting source is in the same process (intra-node transfer).
-  uint64_t workerId_{0};
 
   // Queue of endpoints that need cleanup, populated by callbacks.
   // UCX callbacks cannot call progress functions (like closeBlocking),
