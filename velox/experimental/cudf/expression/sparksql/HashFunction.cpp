@@ -18,7 +18,9 @@
 #include "velox/expression/ConstantExpr.h"
 #include "velox/vector/BaseVector.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/hashing.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 
 namespace facebook::velox::cudf_velox::sparksql {
@@ -50,7 +52,22 @@ ColumnOrView HashFunction::eval(
     std::vector<ColumnOrView>& inputColumns,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const {
-  VELOX_CHECK(!inputColumns.empty());
+  return eval(
+      inputColumns,
+      inputColumns.empty() ? cudf::size_type{0} : asView(inputColumns[0]).size(),
+      stream,
+      mr);
+}
+
+ColumnOrView HashFunction::eval(
+    std::vector<ColumnOrView>& inputColumns,
+    cudf::size_type inputRowCount,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  if (inputColumns.empty()) {
+    cudf::numeric_scalar<int32_t> seedScalar(seedValue_, true, stream, mr);
+    return cudf::make_column_from_scalar(seedScalar, inputRowCount, stream, mr);
+  }
   auto inputTableView = convertToTableView(inputColumns);
   return cudf::hashing::murmurhash3_x86_32(
       inputTableView, seedValue_, stream, mr);

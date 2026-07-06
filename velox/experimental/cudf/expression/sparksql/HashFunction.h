@@ -30,6 +30,12 @@ class HashFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override;
 
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override;
+
  private:
   // Constant non-negative seed extracted from the first argument.
   uint32_t seedValue_;

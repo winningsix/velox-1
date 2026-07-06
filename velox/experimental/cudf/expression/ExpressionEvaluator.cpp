@@ -4069,7 +4069,23 @@ class HashFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    VELOX_CHECK(!inputColumns.empty());
+    return eval(
+        inputColumns,
+        inputColumns.empty() ? cudf::size_type{0}
+                             : asView(inputColumns[0]).size(),
+        stream,
+        mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    if (inputColumns.empty()) {
+      cudf::numeric_scalar<int32_t> seedScalar(seedValue_, true, stream, mr);
+      return cudf::make_column_from_scalar(seedScalar, inputRowCount, stream, mr);
+    }
     std::vector<cudf::column_view> columns;
     columns.reserve(inputColumns.size());
     for (auto& col : inputColumns) {
@@ -4099,7 +4115,24 @@ class XxHash64Function : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    VELOX_CHECK(!inputColumns.empty());
+    return eval(
+        inputColumns,
+        inputColumns.empty() ? cudf::size_type{0}
+                             : asView(inputColumns[0]).size(),
+        stream,
+        mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    if (inputColumns.empty()) {
+      cudf::numeric_scalar<int64_t> seedScalar(
+          static_cast<int64_t>(seedValue_), true, stream, mr);
+      return cudf::make_column_from_scalar(seedScalar, inputRowCount, stream, mr);
+    }
     std::vector<cudf::column_view> columns;
     columns.reserve(inputColumns.size());
     for (auto& col : inputColumns) {

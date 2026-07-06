@@ -79,32 +79,48 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
           .build());
   // AVG final: row(DOUBLE,BIGINT)->DOUBLE already registered.
 
-  auto collectSetRawSignature = FunctionSignatureBuilder()
-                                    .typeVariable("T")
-                                    .returnType("array(T)")
-                                    .argumentType("T")
-                                    .build();
-  auto collectSetMergeSignature = FunctionSignatureBuilder()
-                                      .typeVariable("T")
-                                      .returnType("array(T)")
-                                      .argumentType("array(T)")
-                                      .build();
+  auto collectRawSignature = FunctionSignatureBuilder()
+                                 .typeVariable("T")
+                                 .returnType("array(T)")
+                                 .argumentType("T")
+                                 .build();
+  auto collectMergeSignature = FunctionSignatureBuilder()
+                                   .typeVariable("T")
+                                   .returnType("array(T)")
+                                   .argumentType("array(T)")
+                                   .build();
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kSingle,
+      collectRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kPartial,
+      collectRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kIntermediate,
+      collectMergeSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kFinal,
+      collectMergeSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kSingle,
-      collectSetRawSignature);
+      collectRawSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kPartial,
-      collectSetRawSignature);
+      collectRawSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kIntermediate,
-      collectSetMergeSignature);
+      collectMergeSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kFinal,
-      collectSetMergeSignature);
+      collectMergeSignature);
 }
 
 } // namespace facebook::velox::cudf_velox
