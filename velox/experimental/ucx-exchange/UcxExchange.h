@@ -52,6 +52,14 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
   void close() override;
 
  private:
+  friend class UcxExchangeTestPeer;
+
+  static bool shouldRecordExchangeClientStats(
+      bool atEnd,
+      bool noMoreSplits) noexcept {
+    return atEnd && noMoreSplits;
+  }
+
   // Invoked to create exchange client for remote tasks. The function shuffles
   // the source task ids first to randomize the source tasks we fetch data from.
   // This helps to avoid different tasks fetching from the same source task in a

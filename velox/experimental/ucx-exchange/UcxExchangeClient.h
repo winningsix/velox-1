@@ -19,7 +19,10 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <functional>
+#include <mutex>
 #include <string_view>
 #include <unordered_set>
 
@@ -34,8 +37,7 @@ class UcxExchangeClient
   // in the UcxExchangeQueue
   static constexpr int32_t kDefaultMaxQueuedColumns = 32;
   static constexpr std::chrono::milliseconds kRequestDataMaxWait{100};
-  static constexpr char kMetricQueueSize[] =
-      "ucxExchangeQueue.currentSize";
+  static constexpr char kMetricQueueSize[] = "ucxExchangeQueue.currentSize";
   static constexpr char kMetricCurrentQueuedBytes[] =
       "ucxExchangeQueue.currentQueuedBytes";
   static constexpr char kMetricCurrentPendingReceiveBytes[] =
@@ -71,8 +73,10 @@ class UcxExchangeClient
         destination_(destination),
         maxQueuedColumns_(kDefaultMaxQueuedColumns),
         kRequestDataSizesMaxWaitSec_(requestDataSizesMaxWaitSec),
-        queue_(std::make_shared<UcxExchangeQueue>(
-            numberOfConsumers, maxInflightReceiveBytesPerClient)) {
+        queue_(
+            std::make_shared<UcxExchangeQueue>(
+                numberOfConsumers,
+                maxInflightReceiveBytesPerClient)) {
     VELOX_CHECK_GE(
         destination, 0, "Exchange client destination must not be negative");
     VLOG(1) << "[UCX_RECEIVE_BUDGET] task=" << taskId_
@@ -135,8 +139,17 @@ class UcxExchangeClient
  private:
   friend class UcxExchangeClientTestPeer;
 
+  enum class CloseState : uint8_t {
+    kOpen,
+    kClosing,
+    kClosed,
+  };
+
   void mergeClosedSourceMetricsLocked(
       const UcxExchangeSource::BackpressureMetrics& metrics);
+
+  void finishLateClosedSource(
+      const UcxExchangeSource::BackpressureMetrics* metrics) noexcept;
 
   // Handy for ad-hoc logging.
   const std::string taskId_;
@@ -151,7 +164,10 @@ class UcxExchangeClient
   // Cumulative source metrics survive source retirement and client close.
   // Guarded by queue_->mutex().
   UcxExchangeSource::BackpressureMetrics closedSourceMetrics_;
-  bool closed_{false};
+  CloseState closeState_{CloseState::kOpen};
+  std::condition_variable closeCv_;
+  size_t pendingClosedSourceMerges_{0};
+  std::exception_ptr closeFailure_;
 
   // Total number of packed_clumns in flight.
   int64_t totalPendingColumns_{0};

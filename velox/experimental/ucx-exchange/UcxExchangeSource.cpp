@@ -351,8 +351,8 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   return map;
 }
 
-UcxExchangeSource::BackpressureMetrics
-UcxExchangeSource::backpressureMetrics() const {
+UcxExchangeSource::BackpressureMetrics UcxExchangeSource::backpressureMetrics()
+    const {
   std::lock_guard<std::mutex> lock(backpressureMetricsMutex_);
   auto pausedNanos = totalPausedNanos_;
   if (backpressureActive_) {
@@ -373,7 +373,11 @@ UcxExchangeSource::backpressureMetrics() const {
 
 bool UcxExchangeSource::enterBackpressure(bool waitingForReceiveCredit) {
   std::lock_guard<std::mutex> lock(backpressureMetricsMutex_);
-  if (backpressureActive_) {
+  // close() publishes closed_ before taking this mutex to settle an active
+  // pause. Rejecting a stale progress-thread transition here creates a strict
+  // linearization: either enter wins first and close accounts it, or close wins
+  // first and no post-close metric mutation is possible.
+  if (closed_.load(std::memory_order_acquire) || backpressureActive_) {
     return false;
   }
   backpressureActive_ = true;
@@ -909,8 +913,7 @@ void UcxExchangeSource::onHandshakeResponse(
     communicator_->addToWorkQueue(getSelfPtr());
     return;
   }
-  if (!isValidAcceptedHandshakeResponse(
-          *response, partitionKey_.destination)) {
+  if (!isValidAcceptedHandshakeResponse(*response, partitionKey_.destination)) {
     const auto errorMsg = response->taskEpoch == 0
         ? fmt::format(
               "UCX handshake accepted task {} with invalid epoch zero",

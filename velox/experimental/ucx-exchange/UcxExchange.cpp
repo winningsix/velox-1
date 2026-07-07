@@ -124,7 +124,6 @@ void UcxExchange::getSplits(ContinueFuture* future) {
     if (atEnd_) {
       operatorCtx_->task()->multipleSplitsFinished(
           false, stats_.rlock()->numSplits, 0);
-      recordExchangeClientStats();
     }
     return;
   }
@@ -145,11 +144,11 @@ BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
   currentData_ = exchangeClient_->next(driverId_, &atEnd_, &dataFuture);
   if (currentData_ || atEnd_) {
     // got some data or reached the end.
-    if (atEnd_ && noMoreSplits_) {
+    if (shouldRecordExchangeClientStats(atEnd_, noMoreSplits_)) {
       const auto numSplits = stats_.rlock()->numSplits;
       operatorCtx_->task()->multipleSplitsFinished(false, numSplits, 0);
+      recordExchangeClientStats();
     }
-    recordExchangeClientStats();
     return BlockingReason::kNotBlocked;
   }
 
@@ -216,8 +215,12 @@ void UcxExchange::close() {
   SourceOperator::close();
   currentData_.reset();
   if (exchangeClient_) {
-    recordExchangeClientStats();
     exchangeClient_->close();
+    // close() is a barrier across all operators sharing this client. Record
+    // once sources have settled their active-pause counters and the queue has
+    // discarded unconsumed data. Posted receives may still hold asynchronous
+    // credit until the communicator executes source cleanup.
+    recordExchangeClientStats();
   }
   exchangeClient_ = nullptr;
 }

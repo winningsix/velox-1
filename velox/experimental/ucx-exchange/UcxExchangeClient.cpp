@@ -57,8 +57,9 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
     std::shared_ptr<UcxExchangeSource> source;
     source = UcxExchangeSource::create(taskId_, remoteTaskId, queue_);
 
-    if (closed_) {
+    if (closeState_ != CloseState::kOpen) {
       toClose = std::move(source);
+      ++pendingClosedSourceMerges_;
     } else {
       sources_.push_back(source);
       queue_->addSourceLocked();
@@ -70,10 +71,14 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
 
   // Outside of lock.
   if (toClose) {
-    toClose->close();
-    const auto metrics = toClose->backpressureMetrics();
-    std::lock_guard<std::mutex> l(queue_->mutex());
-    mergeClosedSourceMetricsLocked(metrics);
+    try {
+      toClose->close();
+      const auto metrics = toClose->backpressureMetrics();
+      finishLateClosedSource(&metrics);
+    } catch (...) {
+      finishLateClosedSource(nullptr);
+      throw;
+    }
   }
 }
 
@@ -104,7 +109,7 @@ bool UcxExchangeClient::waitForSourcesPrepared(
         }
         return false;
       }
-      if (closed_) {
+      if (closeState_ != CloseState::kOpen) {
         if (detail != nullptr) {
           *detail = "exchange client closed during PREPARE";
         }
@@ -142,11 +147,25 @@ bool UcxExchangeClient::waitForSourcesPrepared(
 void UcxExchangeClient::close() {
   std::vector<std::shared_ptr<UcxExchangeSource>> sources;
   {
-    std::lock_guard<std::mutex> l(queue_->mutex());
-    if (closed_) {
+    std::unique_lock<std::mutex> l(queue_->mutex());
+    if (closeState_ == CloseState::kClosed) {
+      const auto failure = closeFailure_;
+      l.unlock();
+      if (failure != nullptr) {
+        std::rethrow_exception(failure);
+      }
       return;
     }
-    closed_ = true;
+    if (closeState_ == CloseState::kClosing) {
+      closeCv_.wait(l, [this]() { return closeState_ == CloseState::kClosed; });
+      const auto failure = closeFailure_;
+      l.unlock();
+      if (failure != nullptr) {
+        std::rethrow_exception(failure);
+      }
+      return;
+    }
+    closeState_ = CloseState::kClosing;
     // Keep sources_ visible to concurrent stats() calls until close() settles
     // every active pause and atomically replaces the live sources with their
     // cumulative metrics.
@@ -155,16 +174,28 @@ void UcxExchangeClient::close() {
 
   // Outside of mutex.
   UcxExchangeSource::BackpressureMetrics closedMetrics;
-  for (auto& source : sources) {
-    source->close();
-    mergeBackpressureMetrics(closedMetrics, source->backpressureMetrics());
+  std::exception_ptr failure;
+  try {
+    for (auto& source : sources) {
+      source->close();
+      mergeBackpressureMetrics(closedMetrics, source->backpressureMetrics());
+    }
+    queue_->close();
+  } catch (...) {
+    failure = std::current_exception();
   }
   {
-    std::lock_guard<std::mutex> l(queue_->mutex());
+    std::unique_lock<std::mutex> l(queue_->mutex());
+    closeCv_.wait(l, [this]() { return pendingClosedSourceMerges_ == 0; });
     mergeClosedSourceMetricsLocked(closedMetrics);
     sources_.clear();
+    closeFailure_ = failure;
+    closeState_ = CloseState::kClosed;
   }
-  queue_->close();
+  closeCv_.notify_all();
+  if (failure != nullptr) {
+    std::rethrow_exception(failure);
+  }
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
@@ -185,38 +216,31 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
   stats.insert_or_assign(kMetricQueueSize, RuntimeMetric(queueStats.queueSize));
   stats.insert_or_assign(
       kMetricCurrentQueuedBytes,
-      RuntimeMetric(
-          queueStats.queuedBytes, RuntimeCounter::Unit::kBytes));
+      RuntimeMetric(queueStats.queuedBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricCurrentPendingReceiveBytes,
       RuntimeMetric(
           queueStats.pendingReceiveBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricCurrentInflightReceiveBytes,
-      RuntimeMetric(
-          queueStats.inFlightBytes, RuntimeCounter::Unit::kBytes));
+      RuntimeMetric(queueStats.inFlightBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricPeakQueuedBytes,
-      RuntimeMetric(
-          queueStats.peakQueuedBytes, RuntimeCounter::Unit::kBytes));
+      RuntimeMetric(queueStats.peakQueuedBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricPeakInflightReceiveBytes,
       RuntimeMetric(
-          queueStats.peakInflightReceiveBytes,
-          RuntimeCounter::Unit::kBytes));
+          queueStats.peakInflightReceiveBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricMaxInflightReceiveBytes,
       RuntimeMetric(
-          queueStats.maxInflightReceiveBytes,
-          RuntimeCounter::Unit::kBytes));
+          queueStats.maxInflightReceiveBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
-      kMetricReceivedTables,
-      RuntimeMetric(queueStats.receivedTables));
+      kMetricReceivedTables, RuntimeMetric(queueStats.receivedTables));
   stats.insert_or_assign(
       kMetricAverageReceivedTableBytes,
       RuntimeMetric(
-          queueStats.averageReceivedTableBytes,
-          RuntimeCounter::Unit::kBytes));
+          queueStats.averageReceivedTableBytes, RuntimeCounter::Unit::kBytes));
   stats.insert_or_assign(
       kMetricBackpressurePauseCount,
       RuntimeMetric(saturateCast(sourceMetrics.pauseCount)));
@@ -239,6 +263,22 @@ void UcxExchangeClient::mergeClosedSourceMetricsLocked(
   mergeBackpressureMetrics(closedSourceMetrics_, metrics);
 }
 
+void UcxExchangeClient::finishLateClosedSource(
+    const UcxExchangeSource::BackpressureMetrics* metrics) noexcept {
+  {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    if (metrics != nullptr) {
+      mergeClosedSourceMetricsLocked(*metrics);
+    }
+    if (pendingClosedSourceMerges_ == 0) {
+      LOG(ERROR) << "UcxExchangeClient late-source merge underflow";
+    } else {
+      --pendingClosedSourceMerges_;
+    }
+  }
+  closeCv_.notify_all();
+}
+
 PackedTableWithStreamPtr
 UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
   VLOG(3) << "@" << taskId_ << " UcxExchangeClient::next called for consumerId "
@@ -248,7 +288,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
   std::vector<std::shared_ptr<UcxExchangeSource>> sourcesToResume;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
-    if (closed_) {
+    if (closeState_ != CloseState::kOpen) {
       *atEnd = true;
       return data;
     }
@@ -350,11 +390,11 @@ std::string UcxExchangeClient::toString() const {
 folly::dynamic UcxExchangeClient::toJson() const {
   folly::dynamic obj = folly::dynamic::object;
   obj["taskId"] = taskId_;
-  obj["closed"] = closed_;
   folly::dynamic clientsObj = folly::dynamic::object;
   int index = 0;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
+    obj["closed"] = closeState_ != CloseState::kOpen;
     for (auto& source : sources_) {
       clientsObj[std::to_string(index++)] = source->toJson();
     }

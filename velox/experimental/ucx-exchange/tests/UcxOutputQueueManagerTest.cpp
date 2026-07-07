@@ -22,11 +22,15 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/UcxExchange.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
@@ -45,6 +49,57 @@ class UcxExchangeClientTestPeer {
       const UcxExchangeSource::BackpressureMetrics& metrics) {
     std::lock_guard<std::mutex> lock(client.queue_->mutex());
     client.mergeClosedSourceMetricsLocked(metrics);
+  }
+
+  static void beginLateClosedSource(UcxExchangeClient& client) {
+    std::lock_guard<std::mutex> lock(client.queue_->mutex());
+    ++client.pendingClosedSourceMerges_;
+  }
+
+  static void finishLateClosedSource(
+      UcxExchangeClient& client,
+      const UcxExchangeSource::BackpressureMetrics& metrics) {
+    client.finishLateClosedSource(&metrics);
+  }
+
+  static bool isClosing(UcxExchangeClient& client) {
+    std::lock_guard<std::mutex> lock(client.queue_->mutex());
+    return client.closeState_ == UcxExchangeClient::CloseState::kClosing;
+  }
+
+  static bool isClosed(UcxExchangeClient& client) {
+    std::lock_guard<std::mutex> lock(client.queue_->mutex());
+    return client.closeState_ == UcxExchangeClient::CloseState::kClosed;
+  }
+};
+
+class UcxExchangeSourceTestPeer {
+ public:
+  static std::shared_ptr<UcxExchangeSource> createForBackpressureMetrics(
+      const std::shared_ptr<UcxExchangeQueue>& queue) {
+    return std::shared_ptr<UcxExchangeSource>(new UcxExchangeSource(
+        /*communicator=*/{},
+        "metrics-client",
+        "localhost",
+        0,
+        PartitionKey{"metrics-source", 0},
+        queue));
+  }
+
+  static bool enter(UcxExchangeSource& source, bool waitingForReceiveCredit) {
+    return source.enterBackpressure(waitingForReceiveCredit);
+  }
+
+  static void markClosedAndSettle(UcxExchangeSource& source) {
+    source.closed_.store(true, std::memory_order_release);
+    source.leaveBackpressure(/*resumedByConsumer=*/false);
+  }
+};
+
+class UcxExchangeTestPeer {
+ public:
+  static bool shouldRecordStats(bool atEnd, bool noMoreSplits) {
+    return UcxExchange::shouldRecordExchangeClientStats(atEnd, noMoreSplits);
   }
 };
 
@@ -491,8 +546,7 @@ TEST_F(UcxOutputQueueManagerTest, v2TaskRemovalWakesAtRequestedSequence) {
 }
 
 TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
-  UcxExchangeQueue queue(
-      1, UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
+  UcxExchangeQueue queue(1, UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
   bool atEnd = false;
   ContinueFuture future;
   ContinuePromise stalePromise = ContinuePromise::makeEmpty();
@@ -527,22 +581,24 @@ TEST_F(UcxOutputQueueManagerTest, receiveBudgetIsPerClientAndValidated) {
       initialStats.at(UcxExchangeClient::kMetricMaxInflightReceiveBytes).sum,
       kSmallCap);
   EXPECT_EQ(
-      initialStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      initialStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes)
+          .sum,
       0);
   EXPECT_EQ(
       initialStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
       0);
   EXPECT_EQ(
-      initialStats.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
-      0);
+      initialStats.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum, 0);
 
   EXPECT_TRUE(smallClient.queue()->tryReserveReceive(1024));
   const auto reservedStats = smallClient.stats();
   EXPECT_EQ(
-      reservedStats.at(UcxExchangeClient::kMetricCurrentPendingReceiveBytes).sum,
+      reservedStats.at(UcxExchangeClient::kMetricCurrentPendingReceiveBytes)
+          .sum,
       1024);
   EXPECT_EQ(
-      reservedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      reservedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes)
+          .sum,
       1024);
   EXPECT_EQ(
       reservedStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
@@ -550,7 +606,8 @@ TEST_F(UcxOutputQueueManagerTest, receiveBudgetIsPerClientAndValidated) {
   smallClient.queue()->releaseReservedReceive(1024);
   const auto releasedStats = smallClient.stats();
   EXPECT_EQ(
-      releasedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      releasedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes)
+          .sum,
       0);
   EXPECT_EQ(
       releasedStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
@@ -565,22 +622,18 @@ TEST_F(UcxOutputQueueManagerTest, closedSourceStatsRemainMonotonic) {
   UcxExchangeClient client("closed-stats-query", 0, 1, 1024);
   UcxExchangeClientTestPeer::addClosedSourceMetrics(
       client,
-      UcxExchangeSource::BackpressureMetrics{
-          /*pauseCount=*/3,
-          /*resumeCount=*/2,
-          /*receiveCreditWaitCount=*/1,
-          /*pausedNanos=*/100});
+      UcxExchangeSource::BackpressureMetrics{/*pauseCount=*/3,
+                                             /*resumeCount=*/2,
+                                             /*receiveCreditWaitCount=*/1,
+                                             /*pausedNanos=*/100});
 
   const auto beforeClose = client.stats();
   EXPECT_EQ(
-      beforeClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
-      3);
+      beforeClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum, 3);
   EXPECT_EQ(
-      beforeClose.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum,
-      2);
+      beforeClose.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum, 2);
   EXPECT_EQ(
-      beforeClose.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum,
-      1);
+      beforeClose.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum, 1);
   EXPECT_EQ(
       beforeClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
       100);
@@ -612,8 +665,8 @@ TEST_F(UcxOutputQueueManagerTest, closedSourceStatsRemainMonotonic) {
           .sum,
       afterClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum);
 
-  // A source added concurrently with close may retire after close() returns.
-  // Its cumulative metrics must merge without wrapping.
+  // A late-retired source can merge after the initial close snapshot. Its
+  // cumulative metrics must remain monotonic and must not wrap.
   UcxExchangeClientTestPeer::addClosedSourceMetrics(
       client,
       UcxExchangeSource::BackpressureMetrics{
@@ -622,8 +675,7 @@ TEST_F(UcxOutputQueueManagerTest, closedSourceStatsRemainMonotonic) {
           /*receiveCreditWaitCount=*/std::numeric_limits<uint64_t>::max(),
           /*pausedNanos=*/std::numeric_limits<uint64_t>::max()});
   UcxExchangeClientTestPeer::addClosedSourceMetrics(
-      client,
-      UcxExchangeSource::BackpressureMetrics{1, 1, 1, 1});
+      client, UcxExchangeSource::BackpressureMetrics{1, 1, 1, 1});
   const auto saturated = client.stats();
   EXPECT_EQ(
       saturated.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
@@ -637,6 +689,156 @@ TEST_F(UcxOutputQueueManagerTest, closedSourceStatsRemainMonotonic) {
   EXPECT_EQ(
       saturated.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
       std::numeric_limits<int64_t>::max());
+}
+
+TEST_F(UcxOutputQueueManagerTest, statisticsCollectionIsTerminalOnly) {
+  // Model a long stream of data-bearing calls. Data arrival alone must never
+  // trigger the O(peers) source snapshot and 13-key runtimeStats allocation.
+  for (int32_t chunk = 0; chunk < 10'000; ++chunk) {
+    EXPECT_FALSE(
+        UcxExchangeTestPeer::shouldRecordStats(
+            /*atEnd=*/false, /*noMoreSplits=*/true));
+  }
+  EXPECT_FALSE(
+      UcxExchangeTestPeer::shouldRecordStats(
+          /*atEnd=*/true, /*noMoreSplits=*/false));
+  EXPECT_TRUE(
+      UcxExchangeTestPeer::shouldRecordStats(
+          /*atEnd=*/true, /*noMoreSplits=*/true));
+}
+
+TEST_F(UcxOutputQueueManagerTest, concurrentCloseWaitsForFinalMetricsMerge) {
+  using namespace std::chrono_literals;
+
+  UcxExchangeClient client("close-barrier-query", 0, 1, 1024);
+  std::atomic<bool> secondReturned{false};
+  std::exception_ptr firstFailure;
+  std::exception_ptr secondFailure;
+
+  // Model an addRemoteTaskId() that observed Closing and is retiring its
+  // source outside the queue lock. The first close must not publish Closed
+  // until this source's metrics have merged.
+  UcxExchangeClientTestPeer::beginLateClosedSource(client);
+
+  std::thread first([&]() {
+    try {
+      client.close();
+    } catch (...) {
+      firstFailure = std::current_exception();
+    }
+  });
+  const auto closingDeadline = std::chrono::steady_clock::now() + 2s;
+  while (!UcxExchangeClientTestPeer::isClosing(client) &&
+         std::chrono::steady_clock::now() < closingDeadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  if (!UcxExchangeClientTestPeer::isClosing(client)) {
+    UcxExchangeClientTestPeer::finishLateClosedSource(
+        client, UcxExchangeSource::BackpressureMetrics{});
+    first.join();
+    FAIL() << "first close did not enter Closing";
+  }
+
+  std::thread second([&]() {
+    try {
+      client.close();
+      secondReturned.store(true, std::memory_order_release);
+    } catch (...) {
+      secondFailure = std::current_exception();
+    }
+  });
+  std::this_thread::sleep_for(50ms);
+  EXPECT_FALSE(secondReturned.load(std::memory_order_acquire));
+
+  UcxExchangeClientTestPeer::finishLateClosedSource(
+      client,
+      UcxExchangeSource::BackpressureMetrics{/*pauseCount=*/3,
+                                             /*resumeCount=*/2,
+                                             /*receiveCreditWaitCount=*/1,
+                                             /*pausedNanos=*/100});
+  first.join();
+  second.join();
+  EXPECT_EQ(firstFailure, nullptr);
+  EXPECT_EQ(secondFailure, nullptr);
+  EXPECT_TRUE(secondReturned.load(std::memory_order_acquire));
+  EXPECT_TRUE(UcxExchangeClientTestPeer::isClosed(client));
+  const auto finalStats = client.stats();
+  EXPECT_EQ(
+      finalStats.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum, 3);
+  EXPECT_EQ(
+      finalStats.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum, 2);
+  EXPECT_EQ(
+      finalStats.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum, 1);
+  EXPECT_EQ(
+      finalStats.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
+      100);
+
+  // A repeated close observes the completed barrier and remains idempotent.
+  client.close();
+  EXPECT_TRUE(UcxExchangeClientTestPeer::isClosed(client));
+}
+
+TEST_F(UcxOutputQueueManagerTest, backpressureCannotRestartAfterClose) {
+  auto queue = std::make_shared<UcxExchangeQueue>(1, 1024);
+  auto source = UcxExchangeSourceTestPeer::createForBackpressureMetrics(queue);
+
+  EXPECT_TRUE(
+      UcxExchangeSourceTestPeer::enter(
+          *source, /*waitingForReceiveCredit=*/true));
+  const auto active = source->backpressureMetrics();
+  EXPECT_EQ(active.pauseCount, 1);
+  EXPECT_EQ(active.receiveCreditWaitCount, 1);
+
+  UcxExchangeSourceTestPeer::markClosedAndSettle(*source);
+  const auto settled = source->backpressureMetrics();
+  EXPECT_EQ(settled.pauseCount, 1);
+  EXPECT_EQ(settled.resumeCount, 0);
+  EXPECT_EQ(settled.receiveCreditWaitCount, 1);
+
+  // A progress iteration that passed its first closed_ check before close()
+  // cannot create a new dormant interval after the close linearization.
+  EXPECT_FALSE(
+      UcxExchangeSourceTestPeer::enter(
+          *source, /*waitingForReceiveCredit=*/false));
+  const auto afterStaleEnter = source->backpressureMetrics();
+  EXPECT_EQ(afterStaleEnter.pauseCount, settled.pauseCount);
+  EXPECT_EQ(afterStaleEnter.pausedNanos, settled.pausedNanos);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    postedReceiveCreditRemainsCurrentUntilAsyncSourceCleanup) {
+  constexpr int64_t kPostedBytes = 128;
+  UcxExchangeClient client("posted-close-query", 0, 1, 1024);
+  ASSERT_TRUE(client.queue()->tryReserveReceive(kPostedBytes));
+
+  client.close();
+  const auto atClose = client.stats();
+  EXPECT_EQ(atClose.at(UcxExchangeClient::kMetricCurrentQueuedBytes).sum, 0);
+  EXPECT_EQ(
+      atClose.at(UcxExchangeClient::kMetricCurrentPendingReceiveBytes).sum,
+      kPostedBytes);
+  EXPECT_EQ(
+      atClose.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      kPostedBytes);
+  EXPECT_EQ(
+      atClose.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
+      kPostedBytes);
+
+  // Source cleanup runs on the communicator thread after close. Model its
+  // reservation release and prove that current drops while peak is retained.
+  client.queue()->releaseReservedReceive(kPostedBytes);
+  const auto afterCleanup = client.stats();
+  EXPECT_EQ(
+      afterCleanup.at(UcxExchangeClient::kMetricCurrentPendingReceiveBytes).sum,
+      0);
+  EXPECT_EQ(
+      afterCleanup.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes)
+          .sum,
+      0);
+  EXPECT_EQ(
+      afterCleanup.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
+      kPostedBytes);
 }
 
 TEST_F(UcxOutputQueueManagerTest, receiveBudgetAggregatesAndResumesSafely) {

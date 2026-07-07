@@ -181,6 +181,8 @@ class UcxExchangeSource
   }
 
  private:
+  friend class UcxExchangeSourceTestPeer;
+
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
