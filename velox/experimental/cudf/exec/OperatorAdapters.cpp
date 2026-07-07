@@ -1281,7 +1281,8 @@ class ExchangeAdapter : public OperatorAdapter {
           return std::make_shared<ucx_exchange::UcxExchangeClient>(
               op->taskId(),
               veloxExchangeClient->getDestination(),
-              veloxExchangeClient->getNumberOfConsumers());
+              veloxExchangeClient->getNumberOfConsumers(),
+              ctx->queryConfig().ucxMaxInflightReceiveBytesPerClient());
         });
     auto client = std::move(lookup.client);
     if (!lookup.created) {

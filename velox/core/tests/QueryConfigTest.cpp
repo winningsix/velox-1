@@ -56,6 +56,42 @@ TEST_F(QueryConfigTest, invalidConfig) {
       "session 'session_timezone' set with invalid value 'invalid'");
 }
 
+TEST_F(QueryConfigTest, ucxReceiveBudgetIsFrozenPerQuery) {
+  auto legacyQuery = QueryCtx::create(nullptr, QueryConfig{{}});
+  EXPECT_EQ(
+      legacyQuery->queryConfig().ucxMaxInflightReceiveBytesPerClient(),
+      8LL << 30);
+
+  auto smallQuery = QueryCtx::create(
+      nullptr,
+      QueryConfig{{
+          {QueryConfig::kUcxMaxInflightReceiveBytesPerClient, "50331648"}}});
+  auto largeQuery = QueryCtx::create(
+      nullptr,
+      QueryConfig{{
+          {QueryConfig::kUcxMaxInflightReceiveBytesPerClient, "100663296"}}});
+  EXPECT_EQ(
+      smallQuery->queryConfig().ucxMaxInflightReceiveBytesPerClient(),
+      48LL << 20);
+  EXPECT_EQ(
+      largeQuery->queryConfig().ucxMaxInflightReceiveBytesPerClient(),
+      96LL << 20);
+}
+
+TEST_F(QueryConfigTest, ucxReceiveBudgetRejectsInvalidRange) {
+  for (const auto* invalid : {"0", "-1"}) {
+    VELOX_ASSERT_USER_THROW(
+        (QueryConfig{{
+            {QueryConfig::kUcxMaxInflightReceiveBytesPerClient, invalid}}}),
+        "must be positive");
+  }
+  VELOX_ASSERT_USER_THROW(
+      (QueryConfig{{
+          {QueryConfig::kUcxMaxInflightReceiveBytesPerClient,
+           "8589934593"}}}),
+      "exceeds the legacy 8 GiB ceiling");
+}
+
 TEST_F(QueryConfigTest, taskWriterCountConfig) {
   struct {
     std::optional<int> numWriterCounter;

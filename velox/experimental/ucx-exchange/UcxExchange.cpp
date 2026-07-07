@@ -58,8 +58,8 @@ UcxExchange::UcxExchange(
     exchangeClient_ = std::make_shared<UcxExchangeClient>(
         task->taskId(),
         task->destination(),
-        1 // number of consumers, is always 1.
-    );
+        1, // number of consumers, is always 1.
+        driverCtx->queryConfig().ucxMaxInflightReceiveBytesPerClient());
   }
 }
 

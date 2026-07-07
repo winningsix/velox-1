@@ -94,7 +94,11 @@ TEST(UcxExchangeProtocolTest, AcceptedResponseRequiresExactTaskEpoch) {
 }
 
 TEST(UcxExchangeProtocolTest, HandshakeFailureIsAnErrorNotEndOfStream) {
-  auto client = std::make_shared<UcxExchangeClient>("consumer", 0, 1);
+  auto client = std::make_shared<UcxExchangeClient>(
+      "consumer",
+      0,
+      1,
+      UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
   client->queue()->setError("UCX handshake rejected: ADMISSION_CAPACITY");
 
   bool atEnd = false;
@@ -113,7 +117,11 @@ TEST(UcxExchangeProtocolTest, IntraNodeCancellationIsAnErrorNotEndOfStream) {
       token, 0, 0, IntraNodeTransferStatus::kCancelled);
   ASSERT_TRUE(error.has_value());
 
-  auto client = std::make_shared<UcxExchangeClient>("consumer", 0, 1);
+  auto client = std::make_shared<UcxExchangeClient>(
+      "consumer",
+      0,
+      1,
+      UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
   client->queue()->setError(*error);
   bool atEnd = false;
   ContinueFuture future;

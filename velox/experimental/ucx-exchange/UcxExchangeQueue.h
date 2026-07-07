@@ -47,6 +47,8 @@ using PackedTableWithStreamPtr = std::unique_ptr<PackedTableWithStream>;
 
 class UcxExchangeQueue {
  public:
+  static constexpr int64_t kMaxInflightReceiveBytesCeiling = 8LL << 30;
+
   struct BackpressureStats {
     int32_t queueSize{0};
     int64_t queuedBytes{0};
@@ -54,9 +56,20 @@ class UcxExchangeQueue {
     int64_t inFlightBytes{0};
   };
 
-  explicit UcxExchangeQueue(int32_t numberOfConsumers)
-      : numberOfConsumers_{numberOfConsumers} {
+  explicit UcxExchangeQueue(
+      int32_t numberOfConsumers,
+      int64_t maxInflightReceiveBytes)
+      : numberOfConsumers_{numberOfConsumers},
+        maxInflightReceiveBytes_{maxInflightReceiveBytes} {
     VELOX_CHECK_GE(numberOfConsumers, 1);
+    VELOX_CHECK_GT(
+        maxInflightReceiveBytes,
+        0,
+        "UCX per-client receive cap must be positive");
+    VELOX_CHECK_LE(
+        maxInflightReceiveBytes,
+        kMaxInflightReceiveBytesCeiling,
+        "UCX per-client receive cap exceeds the 8 GiB ceiling");
   }
 
   ~UcxExchangeQueue() {
@@ -131,14 +144,16 @@ class UcxExchangeQueue {
         totalBytes_ + pendingReceiveBytes_};
   }
 
+  int64_t maxInflightReceiveBytes() const {
+    return maxInflightReceiveBytes_;
+  }
+
   bool shouldPauseReceive(
       int32_t highWaterMark,
-      int64_t maxInFlightBytes,
       BackpressureStats* stats = nullptr) const;
 
   bool tryReserveReceive(
       int64_t bytes,
-      int64_t maxInFlightBytes,
       BackpressureStats* stats = nullptr);
 
   void releaseReservedReceive(int64_t bytes);
@@ -216,6 +231,10 @@ class UcxExchangeQueue {
   }
 
   const int32_t numberOfConsumers_;
+  // Frozen with QueryCtx and shared by every producer-peer source attached to
+  // this client's queue. This is a soft backpressure cap, not a query-global
+  // hard memory reservation.
+  const int64_t maxInflightReceiveBytes_;
 
   int numCompleted_{0};
   int numSources_{0};

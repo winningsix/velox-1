@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -62,27 +61,6 @@ VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     UcxExchangeSource,
     ReceiverState,
     receiverStateNames)
-
-int64_t UcxExchangeSource::maxInFlightRecvBytes() {
-  // Read once. See header for rationale: recv buffers are off the operator
-  // pool, so an unbounded byte footprint scales O(#peers) and exhausts the GPU
-  // at 4 peers. This cap makes the producer's tagSend block at rendezvous,
-  // leaving the async operator pool headroom. Deadlock-safe: the count-based
-  // resume path (UcxExchangeClient::next) drains both count and bytes.
-  static const int64_t kBytes = [] {
-    if (const char* env = std::getenv("GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES")) {
-      try {
-        const int64_t v = std::stoll(env);
-        if (v > 0) {
-          return v;
-        }
-      } catch (...) {
-      }
-    }
-    return static_cast<int64_t>(8) * 1024 * 1024 * 1024; // 8 GiB default
-  }();
-  return kBytes;
-}
 
 void UcxExchangeSource::setState(ReceiverState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
@@ -203,15 +181,14 @@ void UcxExchangeSource::process() {
       // what bounds the off-pool receive-buffer footprint that otherwise scales
       // O(#peers) and OOMs/deadlocks the GPU at 4 peers (the count cap alone
       // let a few large chunks fill the device before pausing).
-      if (queue_->shouldPauseReceive(
-              kBackpressureHighWaterMark, maxInFlightRecvBytes(), &stats)) {
+      if (queue_->shouldPauseReceive(kBackpressureHighWaterMark, &stats)) {
         if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
                   << "] pausing, queueSize=" << stats.queueSize
                   << " (high=" << kBackpressureHighWaterMark
                   << "), queueBytes=" << stats.queuedBytes
                   << ", pendingReceiveBytes=" << stats.pendingReceiveBytes
-                  << " (cap=" << maxInFlightRecvBytes() << ")";
+                  << " (cap=" << queue_->maxInflightReceiveBytes() << ")";
         }
         // Go dormant — do NOT re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
@@ -638,15 +615,14 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
 
   UcxExchangeQueue::BackpressureStats stats;
-  if (!queue_->tryReserveReceive(
-          ptr->metadata.dataSizeBytes, maxInFlightRecvBytes(), &stats)) {
+  if (!queue_->tryReserveReceive(ptr->metadata.dataSizeBytes, &stats)) {
     if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
       VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
               << "] waiting for receive credit, requestedBytes="
               << ptr->metadata.dataSizeBytes
               << ", queueBytes=" << stats.queuedBytes
               << ", pendingReceiveBytes=" << stats.pendingReceiveBytes
-              << " (cap=" << maxInFlightRecvBytes() << ")";
+              << " (cap=" << queue_->maxInflightReceiveBytes() << ")";
     }
     if (getState() == expectedState) {
       setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);

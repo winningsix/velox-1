@@ -41,7 +41,12 @@ SinkDriverMock::SinkDriverMock(
       referenceData_(referenceData) {
   // Create a UcxExchangeClient shared across all exchange operators.
   exchangeClient_ = std::make_shared<UcxExchangeClient>(
-      task_->taskId(), task_->destination(), numDrivers_);
+      task_->taskId(),
+      task_->destination(),
+      numDrivers_,
+      task_->queryCtx()
+          ->queryConfig()
+          .ucxMaxInflightReceiveBytesPerClient());
   uint32_t operatorId = 0;
   auto planNode = task_->planFragment().planNode;
   // create the set of exchange operators.

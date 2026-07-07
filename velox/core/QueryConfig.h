@@ -352,6 +352,18 @@ class QueryConfig {
       10'000,
       "Minimum rows to accumulate in CudfPartitionedOutput before flushing.")
 
+  /// Soft cap for queued plus posted receive bytes in one UcxExchangeClient.
+  /// All producer-peer sources owned by that client share the same queue and
+  /// therefore the same cap. MPP freezes this value per QueryCtx; 8 GiB keeps
+  /// the legacy behavior for non-MPP callers that do not provide the key.
+  VELOX_QUERY_CONFIG(
+      kUcxMaxInflightReceiveBytesPerClient,
+      ucxMaxInflightReceiveBytesPerClient,
+      "gluten.mpp.ucx.max_inflight_receive_bytes_per_client",
+      int64_t,
+      8LL << 30,
+      "Soft in-flight receive-byte cap per UCX exchange client queue.")
+
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
       maxPartialAggregationMemoryUsage,

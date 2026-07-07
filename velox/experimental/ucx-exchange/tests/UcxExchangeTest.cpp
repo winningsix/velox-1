@@ -242,7 +242,10 @@ TEST_P(UcxExchangeTest, duplicateHandshakeFloodIsBoundedBeforeServerCreation) {
       producerTaskId);
   for (size_t i = 0; i < kClients; ++i) {
     auto client = std::make_shared<UcxExchangeClient>(
-        prefix + "floodConsumer" + std::to_string(i), 0, 1);
+        prefix + "floodConsumer" + std::to_string(i),
+        0,
+        1,
+        UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
     client->addRemoteTaskId(remoteUrl);
     clients.push_back(std::move(client));
   }

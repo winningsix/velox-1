@@ -106,30 +106,38 @@ void UcxExchangeQueue::enqueueLocked(
 
 bool UcxExchangeQueue::shouldPauseReceive(
     int32_t highWaterMark,
-    int64_t maxInFlightBytes,
     BackpressureStats* stats) const {
   std::lock_guard<std::mutex> l(mutex_);
   auto current = backpressureStatsLocked();
+  VELOX_CHECK_GE(current.queuedBytes, 0);
+  VELOX_CHECK_GE(current.pendingReceiveBytes, 0);
+  VELOX_CHECK_GE(current.inFlightBytes, 0);
   if (stats != nullptr) {
     *stats = current;
   }
   return current.queueSize > highWaterMark ||
-      current.inFlightBytes > maxInFlightBytes;
+      current.inFlightBytes > maxInflightReceiveBytes_;
 }
 
 bool UcxExchangeQueue::tryReserveReceive(
     int64_t bytes,
-    int64_t maxInFlightBytes,
     BackpressureStats* stats) {
   VELOX_CHECK_GE(bytes, 0);
   std::lock_guard<std::mutex> l(mutex_);
   auto current = backpressureStatsLocked();
+  VELOX_CHECK_GE(current.queuedBytes, 0);
+  VELOX_CHECK_GE(current.pendingReceiveBytes, 0);
+  VELOX_CHECK_GE(current.inFlightBytes, 0);
   if (stats != nullptr) {
     *stats = current;
   }
-  if (maxInFlightBytes > 0 && current.inFlightBytes > 0 &&
-      current.inFlightBytes + bytes > maxInFlightBytes) {
-    return false;
+  if (current.inFlightBytes > 0) {
+    // Preserve progress for one oversize chunk when the client queue is empty,
+    // but never evaluate a signed addition that can overflow for later chunks.
+    if (current.inFlightBytes >= maxInflightReceiveBytes_ ||
+        bytes > maxInflightReceiveBytes_ - current.inFlightBytes) {
+      return false;
+    }
   }
   pendingReceiveBytes_ += bytes;
   if (stats != nullptr) {

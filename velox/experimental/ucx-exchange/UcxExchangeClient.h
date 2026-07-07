@@ -38,14 +38,20 @@ class UcxExchangeClient
       std::string taskId,
       int destination,
       int32_t numberOfConsumers,
+      int64_t maxInflightReceiveBytesPerClient,
       int32_t requestDataSizesMaxWaitSec = 10)
       : taskId_{std::move(taskId)},
         destination_(destination),
         maxQueuedColumns_(kDefaultMaxQueuedColumns),
         kRequestDataSizesMaxWaitSec_(requestDataSizesMaxWaitSec),
-        queue_(std::make_shared<UcxExchangeQueue>(numberOfConsumers)) {
+        queue_(std::make_shared<UcxExchangeQueue>(
+            numberOfConsumers, maxInflightReceiveBytesPerClient)) {
     VELOX_CHECK_GE(
         destination, 0, "Exchange client destination must not be negative");
+    VLOG(1) << "[UCX_RECEIVE_BUDGET] task=" << taskId_
+            << " destination=" << destination_
+            << " maxInflightReceiveBytesPerClient="
+            << queue_->maxInflightReceiveBytes();
   }
 
   ~UcxExchangeClient();

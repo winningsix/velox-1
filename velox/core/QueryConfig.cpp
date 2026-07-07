@@ -93,6 +93,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kMaxPartitionedOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kMaxOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchRows);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxMaxInflightReceiveBytesPerClient);
 
     // Output batch.
     VELOX_REGISTER_QUERY_CONFIG(kPreferredOutputBatchBytes);
@@ -288,6 +289,21 @@ void QueryConfig::validateConfig() {
         "session '{}' set with invalid value '{}'",
         QueryConfig::kSessionTimezone,
         *tz);
+  }
+  if (auto cap = config_->get<int64_t>(
+          QueryConfig::kUcxMaxInflightReceiveBytesPerClient)) {
+    VELOX_USER_CHECK_GT(
+        *cap,
+        0,
+        "session '{}' must be positive, got '{}'",
+        QueryConfig::kUcxMaxInflightReceiveBytesPerClient,
+        *cap);
+    VELOX_USER_CHECK_LE(
+        *cap,
+        8LL << 30,
+        "session '{}' exceeds the legacy 8 GiB ceiling, got '{}'",
+        QueryConfig::kUcxMaxInflightReceiveBytesPerClient,
+        *cap);
   }
 }
 

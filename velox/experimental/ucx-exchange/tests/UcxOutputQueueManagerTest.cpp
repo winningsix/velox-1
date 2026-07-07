@@ -27,6 +27,7 @@
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
@@ -476,7 +477,8 @@ TEST_F(UcxOutputQueueManagerTest, v2TaskRemovalWakesAtRequestedSequence) {
 }
 
 TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
-  UcxExchangeQueue queue(1);
+  UcxExchangeQueue queue(
+      1, UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
   bool atEnd = false;
   ContinueFuture future;
   ContinuePromise stalePromise = ContinuePromise::makeEmpty();
@@ -492,6 +494,60 @@ TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
   queue.close();
   future.wait();
   EXPECT_TRUE(future.isReady());
+}
+
+TEST_F(UcxOutputQueueManagerTest, receiveBudgetIsPerClientAndValidated) {
+  constexpr int64_t kSmallCap = 48LL << 20;
+  constexpr int64_t kLargeCap = 96LL << 20;
+  EXPECT_EQ(
+      QueryConfig({}).ucxMaxInflightReceiveBytesPerClient(),
+      UcxExchangeQueue::kMaxInflightReceiveBytesCeiling);
+  UcxExchangeClient smallClient("small-query", 0, 1, kSmallCap);
+  UcxExchangeClient largeClient("large-query", 0, 1, kLargeCap);
+
+  EXPECT_EQ(smallClient.queue()->maxInflightReceiveBytes(), kSmallCap);
+  EXPECT_EQ(largeClient.queue()->maxInflightReceiveBytes(), kLargeCap);
+  EXPECT_ANY_THROW(UcxExchangeQueue(1, 0));
+  EXPECT_ANY_THROW(UcxExchangeQueue(1, -1));
+  EXPECT_ANY_THROW(UcxExchangeQueue(
+      1, UcxExchangeQueue::kMaxInflightReceiveBytesCeiling + 1));
+}
+
+TEST_F(UcxOutputQueueManagerTest, receiveBudgetAggregatesAndResumesSafely) {
+  constexpr int64_t kCap = 64;
+  UcxExchangeQueue queue(1, kCap);
+  UcxExchangeQueue::BackpressureStats stats;
+
+  EXPECT_TRUE(queue.tryReserveReceive(40, &stats));
+  EXPECT_EQ(stats.inFlightBytes, 40);
+  EXPECT_FALSE(queue.tryReserveReceive(25, &stats));
+  EXPECT_EQ(stats.inFlightBytes, 40);
+  EXPECT_TRUE(queue.tryReserveReceive(24, &stats));
+  EXPECT_EQ(stats.inFlightBytes, kCap);
+
+  queue.releaseReservedReceive(kCap);
+  EXPECT_FALSE(queue.shouldPauseReceive(32, &stats));
+  EXPECT_EQ(stats.inFlightBytes, 0);
+  EXPECT_TRUE(queue.tryReserveReceive(kCap + 1, &stats));
+  EXPECT_TRUE(queue.shouldPauseReceive(32, &stats));
+  EXPECT_FALSE(queue.tryReserveReceive(1, &stats));
+  queue.releaseReservedReceive(kCap + 1);
+  EXPECT_FALSE(queue.shouldPauseReceive(32, &stats));
+}
+
+TEST_F(UcxOutputQueueManagerTest, oversizeFirstReceiveAvoidsSignedOverflow) {
+  UcxExchangeQueue queue(1, 64);
+  UcxExchangeQueue::BackpressureStats stats;
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+
+  EXPECT_TRUE(queue.tryReserveReceive(kMax, &stats));
+  EXPECT_EQ(stats.inFlightBytes, kMax);
+  EXPECT_TRUE(queue.shouldPauseReceive(32, &stats));
+  EXPECT_FALSE(queue.tryReserveReceive(kMax, &stats));
+  EXPECT_EQ(stats.inFlightBytes, kMax);
+  queue.releaseReservedReceive(kMax);
+  EXPECT_FALSE(queue.shouldPauseReceive(32, &stats));
+  EXPECT_EQ(stats.inFlightBytes, 0);
 }
 
 TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
