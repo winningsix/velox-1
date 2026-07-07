@@ -16,6 +16,8 @@
 
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
+#include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 
 #include <array>
 #include <cstring>
@@ -76,6 +78,21 @@ TEST(UcxExchangeProtocolTest, EveryAdmissionFailureHasExplicitWireStatus) {
   }
 }
 
+TEST(UcxExchangeProtocolTest, AcceptedResponseRequiresExactTaskEpoch) {
+  HandshakeResponse response;
+  response.protocolVersion = kUcxExchangeProtocolVersion;
+  response.status = HandshakeStatus::kAccepted;
+  response.destinationCount = 1;
+
+  EXPECT_FALSE(isValidAcceptedHandshakeResponse(response, 0));
+  response.taskEpoch = 17;
+  EXPECT_TRUE(isValidAcceptedHandshakeResponse(response, 0));
+  EXPECT_FALSE(isValidAcceptedHandshakeResponse(response, 1));
+
+  response.protocolVersion = kUcxExchangeProtocolVersion - 1;
+  EXPECT_FALSE(isValidAcceptedHandshakeResponse(response, 0));
+}
+
 TEST(UcxExchangeProtocolTest, HandshakeFailureIsAnErrorNotEndOfStream) {
   auto client = std::make_shared<UcxExchangeClient>("consumer", 0, 1);
   client->queue()->setError("UCX handshake rejected: ADMISSION_CAPACITY");
@@ -84,6 +101,23 @@ TEST(UcxExchangeProtocolTest, HandshakeFailureIsAnErrorNotEndOfStream) {
   ContinueFuture future;
   EXPECT_THROW(client->next(0, &atEnd, &future), VeloxRuntimeError);
   EXPECT_TRUE(atEnd);
+}
+
+TEST(UcxExchangeProtocolTest, IntraNodeCancellationIsAnErrorNotEndOfStream) {
+  const TaskToken token{"producer", 9};
+  EXPECT_FALSE(
+      UcxExchangeSource::intraNodeTransferError(
+          token, 0, 0, IntraNodeTransferStatus::kEnd)
+          .has_value());
+  const auto error = UcxExchangeSource::intraNodeTransferError(
+      token, 0, 0, IntraNodeTransferStatus::kCancelled);
+  ASSERT_TRUE(error.has_value());
+
+  auto client = std::make_shared<UcxExchangeClient>("consumer", 0, 1);
+  client->queue()->setError(*error);
+  bool atEnd = false;
+  ContinueFuture future;
+  EXPECT_THROW(client->next(0, &atEnd, &future), VeloxRuntimeError);
 }
 
 } // namespace

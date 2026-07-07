@@ -24,6 +24,7 @@
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
+#include "velox/experimental/ucx-exchange/UcxTaskToken.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -36,7 +37,11 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <optional>
+
 namespace facebook::velox::ucx_exchange {
+
+enum class IntraNodeTransferStatus : uint8_t;
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
@@ -85,6 +90,15 @@ class UcxExchangeSource
       std::string_view taskId,
       std::string_view url,
       const std::shared_ptr<UcxExchangeQueue>& queue);
+
+  /// Returns an error for every non-data/non-EOS intra-node terminal state.
+  /// Kept pure so the source and protocol regression tests share the exact
+  /// cancelled/stale/duplicate classification.
+  static std::optional<std::string> intraNodeTransferError(
+      const TaskToken& taskToken,
+      uint32_t destination,
+      uint32_t sequenceNumber,
+      IntraNodeTransferStatus status);
 
   bool supportsMetrics() const {
     return true;
@@ -309,6 +323,7 @@ class UcxExchangeSource
   /// HandshakeMsg) with its own Communicator's listener address.
   /// When true, intra-node transfer optimizations bypass UCXX transfers.
   bool isIntraNodeTransfer_{false};
+  TaskToken taskToken_;
 
   // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()

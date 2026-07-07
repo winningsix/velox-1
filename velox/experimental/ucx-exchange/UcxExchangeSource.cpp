@@ -137,6 +137,25 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
   return source;
 }
 
+std::optional<std::string> UcxExchangeSource::intraNodeTransferError(
+    const TaskToken& taskToken,
+    uint32_t destination,
+    uint32_t sequenceNumber,
+    IntraNodeTransferStatus status) {
+  if (status == IntraNodeTransferStatus::kData ||
+      status == IntraNodeTransferStatus::kEnd) {
+    return std::nullopt;
+  }
+  return fmt::format(
+      "Intra-node UCX transfer failed for task {}, epoch {}, destination {}, "
+      "sequence {}: {}",
+      taskToken.taskId,
+      taskToken.epoch,
+      destination,
+      sequenceNumber,
+      intraNodeTransferStatusName(status));
+}
+
 void UcxExchangeSource::process() {
   if (closed_) {
     // Driver thread called closed
@@ -849,12 +868,18 @@ void UcxExchangeSource::onHandshakeResponse(
     communicator_->addToWorkQueue(getSelfPtr());
     return;
   }
-  if (partitionKey_.destination >= response->destinationCount) {
-    const auto errorMsg = fmt::format(
-        "UCX handshake accepted an invalid destination {} for task {} with bound {}",
-        partitionKey_.destination,
-        partitionKey_.taskId,
-        response->destinationCount);
+  if (!isValidAcceptedHandshakeResponse(
+          *response, partitionKey_.destination)) {
+    const auto errorMsg = response->taskEpoch == 0
+        ? fmt::format(
+              "UCX handshake accepted task {} with invalid epoch zero",
+              partitionKey_.taskId)
+        : fmt::format(
+              "UCX handshake accepted an invalid destination {} for task {} "
+              "with bound {}",
+              partitionKey_.destination,
+              partitionKey_.taskId,
+              response->destinationCount);
     queue_->setError(errorMsg);
     setState(ReceiverState::Done);
     communicator_->addToWorkQueue(getSelfPtr());
@@ -862,6 +887,7 @@ void UcxExchangeSource::onHandshakeResponse(
   }
 
   isIntraNodeTransfer_ = response->isIntraNodeTransfer;
+  taskToken_ = TaskToken{partitionKey_.taskId, response->taskEpoch};
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-RESPONSE] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
@@ -884,7 +910,7 @@ void UcxExchangeSource::waitForIntraNodeData() {
   }
 
   IntraNodeTransferKey key{
-      partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+      taskToken_, partitionKey_.destination, sequenceNumber_};
 
   auto result = IntraNodeTransferRegistry::getInstance()->poll(key);
 
@@ -915,7 +941,20 @@ void UcxExchangeSource::waitForIntraNodeData() {
   }
 
   intraNodePollCount_ = 0;
-  onIntraNodeData(std::move(result->data), result->stream, result->atEnd);
+  if (auto error = intraNodeTransferError(
+          taskToken_,
+          partitionKey_.destination,
+          sequenceNumber_,
+          result->status)) {
+    queue_->setError(*error);
+    setState(ReceiverState::Done);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+  onIntraNodeData(
+      std::move(result->data),
+      result->stream,
+      result->status == IntraNodeTransferStatus::kEnd);
 }
 
 void UcxExchangeSource::onIntraNodeData(

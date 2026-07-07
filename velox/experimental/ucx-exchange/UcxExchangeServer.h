@@ -121,6 +121,7 @@ class UcxExchangeServer
   }
 
   const PartitionKey partitionKey_;
+  const TaskToken taskToken_;
   const uint32_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
@@ -139,7 +140,7 @@ class UcxExchangeServer
   std::atomic<bool> closed_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
-  std::future<void> intraNodeRetrieveFuture_;
+  std::shared_future<void> intraNodeRetrieveFuture_;
 
   /// For intra-node transfer: true if the last published entry was atEnd.
   bool intraNodeAtEndPublished_{false};

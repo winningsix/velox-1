@@ -136,19 +136,24 @@ UcxOutputQueueManager::UcxOutputQueueManager(
 
 UcxOutputQueueManager::~UcxOutputQueueManager() {
   taskLifecycle_.shutdown();
+  // Do not call the process-wide intra-node singleton here: function-local
+  // singleton destruction order across translation units is unspecified. Live
+  // tasks are cancelled by removeTask(); process teardown only drops local
+  // bookkeeping.
   std::lock_guard<std::mutex> lock(handshakeMutex_);
   activeHandshakes_.clear();
   activeHandshakesPerTask_.clear();
+  intraNodeTaskTokens_.clear();
 }
 
 UcxOutputQueueManager::HandshakeReservation::HandshakeReservation(
     std::weak_ptr<UcxOutputQueueManager> owner,
-    std::string taskId,
+    TaskToken taskToken,
     uint32_t destination,
     uintptr_t endpointIdentity,
     uint64_t reservationId)
     : owner_(std::move(owner)),
-      taskId_(std::move(taskId)),
+      taskToken_(std::move(taskToken)),
       destination_(destination),
       endpointIdentity_(endpointIdentity),
       reservationId_(reservationId) {}
@@ -156,7 +161,7 @@ UcxOutputQueueManager::HandshakeReservation::HandshakeReservation(
 UcxOutputQueueManager::HandshakeReservation::~HandshakeReservation() {
   if (auto owner = owner_.lock()) {
     owner->releaseHandshake(
-        taskId_, destination_, endpointIdentity_, reservationId_);
+        taskToken_.taskId, destination_, endpointIdentity_, reservationId_);
   }
 }
 
@@ -178,18 +183,36 @@ void UcxOutputQueueManager::expectTask(
       isValidHandshakeTaskId(taskId),
       "UCX task ID is invalid for the handshake protocol: {} bytes",
       taskId.size());
-  const auto inserted = taskLifecycle_.expectTask(
-      taskId,
-      UcxTaskLifecycleRegistry::TaskContract{
-          destinationCount, lifecycleOutputKind(kind)});
+  std::lock_guard<std::mutex> incarnationLock(taskIncarnationMutex_);
   auto intraNodeRegistry = IntraNodeTransferRegistry::getInstance();
+  const auto registration = intraNodeRegistry->expectTask(taskId);
   try {
-    intraNodeRegistry->expectTask(taskId);
+    {
+      std::lock_guard<std::mutex> lock(handshakeMutex_);
+      const auto [token, inserted] = intraNodeTaskTokens_.emplace(
+          std::string{taskId}, registration.token);
+      VELOX_CHECK(
+          inserted || token->second == registration.token,
+          "UCX task {} has conflicting active epochs",
+          taskId);
+    }
+    taskLifecycle_.expectTask(
+        taskId,
+        UcxTaskLifecycleRegistry::TaskContract{
+            destinationCount, lifecycleOutputKind(kind)});
   } catch (...) {
-    if (inserted) {
+    if (registration.inserted) {
       taskLifecycle_.retireTask(taskId);
-      releaseTaskHandshakes(taskId);
-      intraNodeRegistry->cancelTask(taskId);
+      {
+        std::lock_guard<std::mutex> lock(handshakeMutex_);
+        releaseTaskHandshakesLocked(taskId);
+        auto token = intraNodeTaskTokens_.find(std::string{taskId});
+        if (token != intraNodeTaskTokens_.end() &&
+            token->second == registration.token) {
+          intraNodeTaskTokens_.erase(token);
+        }
+      }
+      intraNodeRegistry->cancelTask(registration.token);
     }
     throw;
   }
@@ -221,6 +244,7 @@ UcxOutputQueueManager::reserveHandshake(
   HandshakeReservationKey key{taskIdString, destination, endpointIdentity};
   uint64_t reservationId;
   UcxTaskLifecycleRegistry::TaskContract contract;
+  TaskToken taskToken;
   {
     std::lock_guard<std::mutex> lock(handshakeMutex_);
     // Serialize this final contract check with removeTask()'s reservation
@@ -231,6 +255,11 @@ UcxOutputQueueManager::reserveHandshake(
       return {nullptr, HandshakeRejectReason::kRetired, {}};
     }
     contract = *currentContract;
+    const auto tokenIt = intraNodeTaskTokens_.find(taskIdString);
+    if (tokenIt == intraNodeTaskTokens_.end()) {
+      return {nullptr, HandshakeRejectReason::kRetired, contract};
+    }
+    taskToken = tokenIt->second;
     if (destination >= contract.destinationCount) {
       return {nullptr, HandshakeRejectReason::kInvalidDestination, contract};
     }
@@ -239,7 +268,7 @@ UcxOutputQueueManager::reserveHandshake(
       ++totalHandshakeReservationRejected_;
       return {nullptr, HandshakeRejectReason::kDuplicate, contract};
     }
-    const auto taskIt = activeHandshakesPerTask_.find(taskIdString);
+    auto taskIt = activeHandshakesPerTask_.find(taskIdString);
     const size_t taskCount =
         taskIt == activeHandshakesPerTask_.end() ? 0 : taskIt->second;
     const size_t taskCapacity = std::min<size_t>(
@@ -256,24 +285,67 @@ UcxOutputQueueManager::reserveHandshake(
         std::numeric_limits<uint64_t>::max(),
         "UCX handshake reservation incarnation space is exhausted");
     reservationId = nextHandshakeReservationId_++;
-    activeHandshakes_.emplace(key, reservationId);
-    activeHandshakesPerTask_[taskIdString] = taskCount + 1;
+    bool insertedTaskCounter = false;
+    try {
+      if (taskIt == activeHandshakesPerTask_.end()) {
+        auto inserted = activeHandshakesPerTask_.emplace(taskIdString, 0);
+        taskIt = inserted.first;
+        insertedTaskCounter = inserted.second;
+      }
+      const auto insertedReservation =
+          activeHandshakes_.emplace(key, reservationId);
+      if (!insertedReservation.second) {
+        if (insertedTaskCounter) {
+          activeHandshakesPerTask_.erase(taskIt);
+        }
+        ++totalDuplicateHandshakes_;
+        ++totalHandshakeReservationRejected_;
+        return {nullptr, HandshakeRejectReason::kDuplicate, contract};
+      }
+    } catch (...) {
+      if (insertedTaskCounter) {
+        activeHandshakesPerTask_.erase(taskIt);
+      }
+      ++totalHandshakeReservationRejected_;
+      return {nullptr, HandshakeRejectReason::kCapacity, contract};
+    }
+    ++taskIt->second;
     ++totalHandshakeReservations_;
   }
-  return {
-      std::shared_ptr<HandshakeReservation>(new HandshakeReservation(
-          std::move(owner),
-          taskIdString,
-          destination,
-          endpointIdentity,
-          reservationId)),
-      HandshakeRejectReason::kNone,
-      contract};
+  try {
+    return {
+        std::shared_ptr<HandshakeReservation>(new HandshakeReservation(
+            std::move(owner),
+            std::move(taskToken),
+            destination,
+            endpointIdentity,
+            reservationId)),
+        HandshakeRejectReason::kNone,
+        contract};
+  } catch (...) {
+    // HandshakeReservation allocation happens outside handshakeMutex_. Roll
+    // back the already-published map entry without a recursive lock.
+    releaseHandshake(
+        taskIdString, destination, endpointIdentity, reservationId);
+    std::lock_guard<std::mutex> lock(handshakeMutex_);
+    ++totalHandshakeReservationRejected_;
+    return {nullptr, HandshakeRejectReason::kCapacity, contract};
+  }
 }
 
 std::optional<UcxTaskLifecycleRegistry::TaskContract>
 UcxOutputQueueManager::taskContract(std::string_view taskId) const {
   return taskLifecycle_.taskContract(taskId);
+}
+
+std::optional<TaskToken> UcxOutputQueueManager::taskToken(
+    std::string_view taskId) const {
+  std::lock_guard<std::mutex> lock(handshakeMutex_);
+  auto token = intraNodeTaskTokens_.find(std::string{taskId});
+  if (token == intraNodeTaskTokens_.end()) {
+    return std::nullopt;
+  }
+  return token->second;
 }
 
 void UcxOutputQueueManager::initializeTask(
@@ -558,11 +630,26 @@ std::string UcxOutputQueueManager::describeQueueForIntraNode(
 void UcxOutputQueueManager::removeTask(std::string_view taskId) {
   totalRemoveCalls_.fetch_add(1, std::memory_order_relaxed);
   std::string taskIdStr{taskId};
-  const auto expected = taskLifecycle_.retireTask(taskIdStr);
-  releaseTaskHandshakes(taskIdStr);
-  // Retire intra-node state before erasing the queue. Pollers become atEnd and
-  // every outstanding entry is fulfilled; no historical task ID is retained.
-  IntraNodeTransferRegistry::getInstance()->cancelTask(taskIdStr);
+  bool expected{false};
+  std::optional<TaskToken> taskToken;
+  {
+    std::lock_guard<std::mutex> incarnationLock(taskIncarnationMutex_);
+    expected = taskLifecycle_.retireTask(taskIdStr);
+    {
+      std::lock_guard<std::mutex> lock(handshakeMutex_);
+      releaseTaskHandshakesLocked(taskIdStr);
+      auto token = intraNodeTaskTokens_.find(taskIdStr);
+      if (token != intraNodeTaskTokens_.end()) {
+        taskToken = token->second;
+        intraNodeTaskTokens_.erase(token);
+      }
+    }
+    if (taskToken.has_value()) {
+      IntraNodeTransferRegistry::getInstance()->cancelTask(*taskToken);
+    }
+  }
+  // Retire intra-node state before erasing the queue. Pollers observe explicit
+  // CANCELLED (never successful EOS), and every producer future is fulfilled.
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
         auto it = queues.find(taskIdStr);
@@ -643,6 +730,11 @@ void UcxOutputQueueManager::releaseHandshake(
 void UcxOutputQueueManager::releaseTaskHandshakes(
     std::string_view taskId) noexcept {
   std::lock_guard<std::mutex> lock(handshakeMutex_);
+  releaseTaskHandshakesLocked(taskId);
+}
+
+void UcxOutputQueueManager::releaseTaskHandshakesLocked(
+    std::string_view taskId) noexcept {
   const std::string taskIdString{taskId};
   for (auto it = activeHandshakes_.begin(); it != activeHandshakes_.end();) {
     if (it->first.taskId == taskIdString) {

@@ -26,46 +26,69 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
+
+#include "velox/experimental/ucx-exchange/UcxTaskToken.h"
 
 namespace facebook::velox::ucx_exchange {
 
 /// @brief Key for identifying intra-node transfer entries in the registry.
 /// Used when UcxExchangeServer and UcxExchangeSource are on the same node.
 struct IntraNodeTransferKey {
-  std::string taskId;
+  TaskToken taskToken;
   uint32_t destination;
   uint32_t sequenceNumber;
 
   bool operator<(const IntraNodeTransferKey& other) const {
-    if (taskId != other.taskId)
-      return taskId < other.taskId;
+    if (taskToken != other.taskToken)
+      return taskToken < other.taskToken;
     if (destination != other.destination)
       return destination < other.destination;
     return sequenceNumber < other.sequenceNumber;
   }
 };
 
-/// @brief Result from intra-node transfer containing data and end marker.
+enum class IntraNodeTransferStatus : uint8_t {
+  kData,
+  kEnd,
+  kCancelled,
+  kTimedOut,
+  kAlreadyConsumed,
+};
+
+/// @brief Result from one exact intra-node transfer entry. Only kEnd is a
+/// successful end-of-stream marker. Cancellation, stale epochs, timeouts, and
+/// duplicate consumption remain explicit errors and must never masquerade as
+/// EOS at the exchange source.
 struct IntraNodeTransferResult {
   std::shared_ptr<cudf::packed_columns> data;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  bool atEnd{false}; // True if this is the end-of-stream marker
+  IntraNodeTransferStatus status{IntraNodeTransferStatus::kData};
 };
+
+std::string_view intraNodeTransferStatusName(IntraNodeTransferStatus status);
 
 /// @brief Entry in the intra-node transfer registry containing the data and
 /// synchronization primitives. The server publishes data via publish() and
-/// waits on retrievedPromise; the source polls via poll() and fulfils the
-/// promise on retrieval.
+/// waits on retrievedFuture; the source polls via poll() and completes the
+/// shared entry through the registry's single fulfillOnce path.
 struct IntraNodeTransferEntry {
+  IntraNodeTransferEntry()
+      : retrievedFuture(retrievedPromise.get_future().share()) {}
+
   std::shared_ptr<cudf::packed_columns> data;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   bool atEnd{false}; // True if this is the end-of-stream marker
-  std::promise<void> retrievedPromise; // Server waits on this after publishing
+  std::promise<void> retrievedPromise; // Completed exactly once.
+  std::shared_future<void> retrievedFuture;
   std::condition_variable dataAvailable; // Source waits on this for data
   std::mutex entryMutex;
   bool ready{false}; // True when data is ready to retrieve
+  bool published{false};
+  bool consumed{false};
+  bool cancelled{false};
+  bool fulfilled{false};
   // One-shot wakeups for sources that registered via registerWaiter() before
   // the data was ready, so a same-process consumer can stay dormant instead of
   // busy-polling the single-threaded Communicator work queue. Fired and cleared
@@ -73,7 +96,7 @@ struct IntraNodeTransferEntry {
   std::vector<std::function<void()>> wakeCallbacks;
   // One-shot wakeups for producers waiting until the source has retrieved the
   // published data. Fired and cleared when poll()/waitFor()/retrieve() consumes
-  // the entry, or when cancelTask() completes it as at-end.
+  // the entry, or when cancelTask() completes it as cancelled.
   std::vector<std::function<void()>> retrievedCallbacks;
 };
 
@@ -103,7 +126,7 @@ class IntraNodeTransferRegistry {
   /// @param data The packed_columns data to share (nullptr for atEnd)
   /// @param atEnd True if this is the end-of-stream marker
   /// @return A future that completes when source has retrieved the data
-  [[nodiscard]] std::future<void> publish(
+  [[nodiscard]] std::shared_future<void> publish(
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
       rmm::cuda_stream_view stream,
@@ -137,38 +160,70 @@ class IntraNodeTransferRegistry {
   /// WARNING: This can block, use with caution on single-threaded contexts.
   /// @param key The unique key identifying this transfer
   /// @param timeout Maximum time to wait for data
-  /// @return IntraNodeTransferResult. Data is nullptr if atEnd or timeout.
+  /// @return Explicit Data, End, Cancelled, TimedOut, or AlreadyConsumed state.
   [[nodiscard]] IntraNodeTransferResult waitFor(
       const IntraNodeTransferKey& key,
       std::chrono::milliseconds timeout);
 
-  /// @brief Retrieve data from intra-node transfer registry (legacy method).
-  /// Called by UcxExchangeSource when isIntraNodeTransfer is true.
-  /// The entry is removed from the registry and the promise is fulfilled.
+  /// @brief Non-blocking legacy retrieval with the same explicit terminal
+  /// status and exactly-once completion semantics as poll().
   /// @param key The unique key identifying this transfer
-  /// @return The shared data, or nullptr if not found
-  std::shared_ptr<cudf::packed_columns> retrieve(
+  /// @return nullopt if the entry is not ready, otherwise its one-shot result.
+  std::optional<IntraNodeTransferResult> retrieve(
       const IntraNodeTransferKey& key);
 
   /// @brief Cancel all pending transfers for a task.
-  /// Called when a producing task is removed. Subsequent poll() calls for
-  /// this taskId will return an atEnd result instead of nullopt.
-  /// @param taskId The task to cancel
-  void cancelTask(std::string_view taskId);
+  /// Called when a producing task is removed. Subsequent poll() calls for this
+  /// exact token return CANCELLED, never successful EOS.
+  /// @param taskToken Exact task incarnation to cancel. A delayed cancellation
+  ///        for an old epoch never removes a replacement incarnation.
+  void cancelTask(const TaskToken& taskToken);
 
   /// Declare a live task. Unknown and retired tasks fail closed in publish,
   /// poll and waiter registration without retaining historical tombstones.
-  void expectTask(std::string_view taskId);
+  struct TaskRegistration {
+    TaskToken token;
+    bool inserted{false};
+  };
+
+  /// Declare a live task or return its existing token for an idempotent repeat.
+  /// Re-declaring an ID after its exact token was cancelled allocates a new
+  /// non-zero epoch.
+  [[nodiscard]] TaskRegistration expectTask(std::string_view taskId);
+
+  [[nodiscard]] std::optional<TaskToken> activeTaskToken(
+      std::string_view taskId) const;
 
  private:
   IntraNodeTransferRegistry() = default;
 
+  struct CompletionActions {
+    std::vector<std::function<void()>> sourceWakeups;
+    std::vector<std::function<void()>> retrievedWakeups;
+    bool notifyDataAvailable{false};
+  };
+
+  static void fulfillOnceLocked(
+      IntraNodeTransferEntry& entry,
+      CompletionActions& actions);
+  static std::optional<IntraNodeTransferResult> consumeOnceLocked(
+      IntraNodeTransferEntry& entry,
+      CompletionActions& actions);
+  static void invokeAll(std::vector<std::function<void()>>& callbacks) noexcept;
+  static std::shared_future<void> readyFuture();
+
+  bool isActiveLocked(const TaskToken& taskToken) const;
+  void eraseIfSame(
+      const IntraNodeTransferKey& key,
+      const std::shared_ptr<IntraNodeTransferEntry>& entry);
+
   std::map<IntraNodeTransferKey, std::shared_ptr<IntraNodeTransferEntry>>
       registry_;
-  // Mirrors UcxOutputQueueManager's bounded expected-task set. Historical
-  // task IDs are erased by cancelTask(); unknown IDs are terminal by default.
-  std::unordered_set<std::string> activeTasks_;
-  std::mutex mutex_;
+  // Mirrors UcxOutputQueueManager's active task incarnations. Historical
+  // tokens are erased by cancelTask(); unknown epochs fail closed.
+  std::unordered_map<std::string, uint64_t> activeTasks_;
+  uint64_t nextEpoch_{1};
+  mutable std::mutex mutex_;
 };
 
 } // namespace facebook::velox::ucx_exchange

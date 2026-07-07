@@ -73,6 +73,7 @@ void sendHandshakeResponse(
     HandshakeStatus status,
     bool isIntraNodeTransfer,
     uint32_t destinationCount,
+    uint64_t taskEpoch,
     std::function<void()> onFailure = {}) {
   auto response = std::make_shared<HandshakeResponse>();
   response->protocolVersion = kUcxExchangeProtocolVersion;
@@ -80,6 +81,8 @@ void sendHandshakeResponse(
   response->isIntraNodeTransfer =
       status == HandshakeStatus::kAccepted && isIntraNodeTransfer;
   response->destinationCount = destinationCount;
+  response->taskEpoch =
+      status == HandshakeStatus::kAccepted ? taskEpoch : uint64_t{0};
 
   const auto responseTag = getHandshakeResponseTag(fnv1a_32(key.toString()));
   endpointRef->endpoint_->tagSend(
@@ -93,11 +96,33 @@ void sendHandshakeResponse(
           LOG(ERROR) << "Failed to send UCX handshake response for "
                      << keyString << ": " << ucs_status_string(sendStatus);
           if (onFailure) {
-            onFailure();
+            try {
+              onFailure();
+            } catch (...) {
+              LOG(ERROR) << "Handshake response failure rollback threw for "
+                         << keyString;
+            }
           }
         }
       },
       response);
+}
+
+void trySendHandshakeResponse(
+    const std::shared_ptr<EndpointRef>& endpointRef,
+    const PartitionKey& key,
+    HandshakeStatus status,
+    uint32_t destinationCount) noexcept {
+  try {
+    sendHandshakeResponse(
+        endpointRef, key, status, false, destinationCount, /*taskEpoch=*/0);
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "Failed to enqueue immediate UCX handshake response for "
+               << key.toString() << ": " << error.what();
+  } catch (...) {
+    LOG(ERROR) << "Failed to enqueue immediate UCX handshake response for "
+               << key.toString();
+  }
 }
 
 class PendingHandshake final
@@ -151,12 +176,16 @@ class PendingHandshake final
     }
 
     bool isIntraNodeTransfer = false;
+    uint64_t taskEpoch = 0;
     std::shared_ptr<UcxExchangeServer> exchangeServer;
     if (status == HandshakeStatus::kAccepted) {
       try {
         auto queueMgr = UcxOutputQueueManager::getInstanceRef();
         const auto currentContract = queueMgr->taskContract(key_.taskId);
-        if (!currentContract.has_value() ||
+        const auto currentToken = queueMgr->taskToken(key_.taskId);
+        if (!currentContract.has_value() || !currentToken.has_value() ||
+            reservation == nullptr ||
+            *currentToken != reservation->taskToken() ||
             currentContract->outputKind != contract.outputKind ||
             currentContract->destinationCount < contract.destinationCount ||
             key_.destination >= currentContract->destinationCount) {
@@ -168,6 +197,7 @@ class PendingHandshake final
           // queued. Report the current monotonic bound rather than treating a
           // safe expansion as task replacement.
           contract = *currentContract;
+          taskEpoch = reservation->taskToken().epoch;
         }
       } catch (...) {
         status = HandshakeStatus::kTaskRetired;
@@ -224,6 +254,7 @@ class PendingHandshake final
           status,
           isIntraNodeTransfer,
           contract.destinationCount,
+          taskEpoch,
           [weakServer]() {
             if (auto server = weakServer.lock()) {
               server->close();
@@ -501,8 +532,7 @@ void Acceptor::cStyleAMCallback(
     // Immediate rejects are sent here so a reject flood cannot enqueue an
     // unbounded number of responder work items while server reservations are
     // exhausted.
-    sendHandshakeResponse(
-        epRef, key, HandshakeStatus::kInvalidRequest, false, 0);
+    trySendHandshakeResponse(epRef, key, HandshakeStatus::kInvalidRequest, 0);
     return;
   }
 
@@ -515,32 +545,71 @@ void Acceptor::cStyleAMCallback(
                                  destination = key.destination,
                                  endpointIdentity = reinterpret_cast<uintptr_t>(
                                      epRef.get())]() {
-    auto reservation =
-        queueMgr->reserveHandshake(taskId, destination, endpointIdentity);
-    if (!reservation) {
-      pending->reject(protocolStatus(reservation.rejectReason));
-      return;
+    try {
+      auto reservation =
+          queueMgr->reserveHandshake(taskId, destination, endpointIdentity);
+      if (!reservation) {
+        pending->reject(protocolStatus(reservation.rejectReason));
+        return;
+      }
+      pending->accept(reservation.contract, std::move(reservation.reservation));
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to reserve deferred UCX handshake for " << taskId
+                 << "/" << destination << ": " << error.what();
+      pending->reject(HandshakeStatus::kAdmissionCapacity);
+    } catch (...) {
+      LOG(ERROR) << "Failed to reserve deferred UCX handshake for " << taskId
+                 << "/" << destination;
+      pending->reject(HandshakeStatus::kAdmissionCapacity);
     }
-    pending->accept(reservation.contract, std::move(reservation.reservation));
   };
-  const auto admission = queueMgr->admitHandshake(
-      key.taskId,
-      key.destination,
-      reserveAndAccept,
-      [pending](UcxTaskLifecycleRegistry::AdmissionRejectReason reason) {
-        pending->reject(protocolStatus(reason));
-      });
+  UcxOutputQueueManager::HandshakeAdmissionResult admission;
+  try {
+    admission = queueMgr->admitHandshake(
+        key.taskId,
+        key.destination,
+        reserveAndAccept,
+        [pending](UcxTaskLifecycleRegistry::AdmissionRejectReason reason) {
+          pending->reject(protocolStatus(reason));
+        });
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "Failed to admit UCX handshake for " << key.toString() << ": "
+               << error.what();
+    trySendHandshakeResponse(
+        epRef, key, HandshakeStatus::kAdmissionCapacity, 0);
+    return;
+  } catch (...) {
+    LOG(ERROR) << "Failed to admit UCX handshake for " << key.toString();
+    trySendHandshakeResponse(
+        epRef, key, HandshakeStatus::kAdmissionCapacity, 0);
+    return;
+  }
 
   if (admission.disposition ==
       UcxTaskLifecycleRegistry::RequestDisposition::kExpected) {
-    auto reservation = queueMgr->reserveHandshake(
-        key.taskId, key.destination, reinterpret_cast<uintptr_t>(epRef.get()));
+    UcxOutputQueueManager::HandshakeReservationResult reservation;
+    try {
+      reservation = queueMgr->reserveHandshake(
+          key.taskId,
+          key.destination,
+          reinterpret_cast<uintptr_t>(epRef.get()));
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to reserve UCX handshake for " << key.toString()
+                 << ": " << error.what();
+      trySendHandshakeResponse(
+          epRef, key, HandshakeStatus::kAdmissionCapacity, 0);
+      return;
+    } catch (...) {
+      LOG(ERROR) << "Failed to reserve UCX handshake for " << key.toString();
+      trySendHandshakeResponse(
+          epRef, key, HandshakeStatus::kAdmissionCapacity, 0);
+      return;
+    }
     if (!reservation) {
-      sendHandshakeResponse(
+      trySendHandshakeResponse(
           epRef,
           key,
           protocolStatus(reservation.rejectReason),
-          false,
           reservation.contract.destinationCount);
       return;
     }
@@ -548,11 +617,10 @@ void Acceptor::cStyleAMCallback(
   } else if (
       admission.disposition ==
       UcxTaskLifecycleRegistry::RequestDisposition::kRejected) {
-    sendHandshakeResponse(
+    trySendHandshakeResponse(
         epRef,
         key,
         protocolStatus(admission.rejectReason),
-        false,
         admission.contract.destinationCount);
   }
 }

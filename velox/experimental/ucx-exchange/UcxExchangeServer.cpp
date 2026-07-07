@@ -119,6 +119,10 @@ UcxExchangeServer::UcxExchangeServer(
         handshakeReservation)
     : CommElement(communicator, endpointRef),
       partitionKey_(key),
+      taskToken_(
+          handshakeReservation == nullptr
+              ? TaskToken{key.taskId, 0}
+              : handshakeReservation->taskToken()),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
       queueMgr_(UcxOutputQueueManager::getInstanceRef()),
@@ -126,6 +130,9 @@ UcxExchangeServer::UcxExchangeServer(
   setState(ServerState::Created);
 
   if (isIntraNodeTransfer_) {
+    VELOX_CHECK(
+        taskToken_,
+        "Intra-node exchange server requires an admitted task token");
     VLOG(3) << "@" << partitionKey_.taskId
             << " Detected same-node source (intra-node transfer) for "
             << partitionKey_.toString();
@@ -247,7 +254,8 @@ void UcxExchangeServer::process() {
         auto status =
             intraNodeRetrieveFuture_.wait_for(std::chrono::milliseconds(0));
         if (status == std::future_status::ready) {
-          intraNodeRetrieveFuture_.get(); // Clear the future
+          intraNodeRetrieveFuture_.get();
+          intraNodeRetrieveFuture_ = {};
           intraNodePollCount_ = 0;
           onIntraNodeRetrieveComplete();
         } else if (
@@ -362,7 +370,7 @@ void UcxExchangeServer::sendData() {
               << sequenceNumber_ << " of size " << bytes_;
 
       IntraNodeTransferKey key{
-          partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+          taskToken_, partitionKey_.destination, sequenceNumber_};
       const auto stream = dataPtr_->gpu_data->stream();
       // The consumer tags uniquely owned pages with this stream so downstream
       // reads and stream-ordered async frees remain ordered with the buffer.
@@ -391,7 +399,7 @@ void UcxExchangeServer::sendData() {
               << sequenceNumber_;
 
       IntraNodeTransferKey key{
-          partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+          taskToken_, partitionKey_.destination, sequenceNumber_};
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
               key,

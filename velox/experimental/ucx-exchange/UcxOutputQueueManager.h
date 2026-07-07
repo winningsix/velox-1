@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 #include "velox/experimental/ucx-exchange/UcxTaskLifecycleRegistry.h"
+#include "velox/experimental/ucx-exchange/UcxTaskToken.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -64,22 +65,25 @@ class UcxOutputQueueManager
     HandshakeReservation& operator=(const HandshakeReservation&) = delete;
     ~HandshakeReservation();
 
+    const TaskToken& taskToken() const {
+      return taskToken_;
+    }
+
    private:
     friend class UcxOutputQueueManager;
     HandshakeReservation(
         std::weak_ptr<UcxOutputQueueManager> owner,
-        std::string taskId,
+        TaskToken taskToken,
         uint32_t destination,
         uintptr_t endpointIdentity,
         uint64_t reservationId);
 
     std::weak_ptr<UcxOutputQueueManager> owner_;
-    const std::string taskId_;
+    const TaskToken taskToken_;
     const uint32_t destination_;
     const uintptr_t endpointIdentity_;
-    // A manager-local incarnation. Task epochs are added by the follow-up
-    // TaskToken work, but this already prevents a retired reservation from
-    // erasing a newer reservation that reused the same wire tuple.
+    // A manager-local reservation incarnation, independent of the task epoch.
+    // Both must match before a release may erase live state.
     const uint64_t reservationId_;
   };
 
@@ -139,6 +143,8 @@ class UcxOutputQueueManager
 
   std::optional<UcxTaskLifecycleRegistry::TaskContract> taskContract(
       std::string_view taskId) const;
+
+  std::optional<TaskToken> taskToken(std::string_view taskId) const;
 
   /// @brief Initializes a task and creates the corresponding output queues that
   /// are associated with this task.
@@ -260,6 +266,7 @@ class UcxOutputQueueManager
       uintptr_t endpointIdentity,
       uint64_t reservationId) noexcept;
   void releaseTaskHandshakes(std::string_view taskId) noexcept;
+  void releaseTaskHandshakesLocked(std::string_view taskId) noexcept;
   UcxTaskLifecycleRegistry::TaskContract reconcileOutputBufferContract(
       std::string_view taskId,
       uint32_t numBuffers);
@@ -278,6 +285,10 @@ class UcxOutputQueueManager
 
   UcxTaskLifecycleRegistry taskLifecycle_;
 
+  // Serializes declaration/retirement so a delayed retirement for one task ID
+  // cannot cancel the token allocated to its replacement incarnation.
+  mutable std::mutex taskIncarnationMutex_;
+
   const size_t activeHandshakeCapacity_;
   const size_t activeHandshakesPerTaskCapacity_;
   mutable std::mutex handshakeMutex_;
@@ -287,6 +298,7 @@ class UcxOutputQueueManager
       HandshakeReservationKeyHash>
       activeHandshakes_;
   std::unordered_map<std::string, size_t> activeHandshakesPerTask_;
+  std::unordered_map<std::string, TaskToken> intraNodeTaskTokens_;
   uint64_t totalHandshakeReservations_{0};
   uint64_t totalDuplicateHandshakes_{0};
   uint64_t totalHandshakeReservationRejected_{0};

@@ -31,7 +31,7 @@
 
 namespace facebook::velox::ucx_exchange {
 
-constexpr uint32_t kUcxExchangeProtocolVersion = 2;
+constexpr uint32_t kUcxExchangeProtocolVersion = 3;
 constexpr size_t kUcxHandshakeTaskIdCapacity = 256;
 constexpr size_t kUcxHandshakeMaxTaskIdLength = kUcxHandshakeTaskIdCapacity - 1;
 
@@ -110,6 +110,12 @@ enum class HandshakeStatus : uint8_t {
 
 std::string_view handshakeStatusName(HandshakeStatus status);
 
+struct HandshakeResponse;
+
+bool isValidAcceptedHandshakeResponse(
+    const HandshakeResponse& response,
+    uint32_t destination);
+
 /// @brief Response sent from server to source after handshake.
 /// Informs the source whether intra-node transfer optimization is available,
 /// allowing the source to bypass UCXX for all subsequent data transfers.
@@ -122,11 +128,16 @@ struct HandshakeResponse {
   uint8_t padding[2]{};
   /// Exact producer-side destination bound admitted for this task.
   uint32_t destinationCount{0};
+  uint32_t reserved{0};
+  /// Exact producer-task incarnation captured by handshake admission. Sources
+  /// must use this value directly; looking up an epoch by taskId after the
+  /// response races task replacement.
+  uint64_t taskEpoch{0};
 };
 
 static_assert(sizeof(HandshakeMsg) == 272, "Unexpected handshake wire ABI");
 static_assert(
-    sizeof(HandshakeResponse) == 12,
+    sizeof(HandshakeResponse) == 24,
     "Unexpected handshake response wire ABI");
 
 constexpr uint32_t kMagicNumber = 0x12345678;

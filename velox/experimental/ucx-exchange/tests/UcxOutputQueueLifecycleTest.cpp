@@ -276,17 +276,20 @@ TEST(UcxOutputQueueLifecycleTest, RetiredReservationCannotReleaseReusedTuple) {
       "reused-task", 1, core::PartitionedOutputNode::Kind::kPartitioned);
   auto retired = manager->reserveHandshake("reused-task", 0, 7);
   ASSERT_TRUE(retired);
+  const auto retiredToken = retired.reservation->taskToken();
+  ASSERT_TRUE(retiredToken);
 
   manager->removeTask("reused-task");
   EXPECT_EQ(manager->registryStats().activeHandshakeReservations, 0);
 
-  // TaskToken epochs are carried on the wire in the follow-up change. Until
-  // then, the local reservation incarnation must still make delayed teardown
-  // safe when an identical wire tuple is reused.
   manager->expectTask(
       "reused-task", 1, core::PartitionedOutputNode::Kind::kPartitioned);
   auto current = manager->reserveHandshake("reused-task", 0, 7);
   ASSERT_TRUE(current);
+  const auto currentToken = current.reservation->taskToken();
+  EXPECT_EQ(currentToken.taskId, retiredToken.taskId);
+  EXPECT_NE(currentToken.epoch, retiredToken.epoch);
+  EXPECT_EQ(manager->taskToken("reused-task"), currentToken);
   EXPECT_EQ(manager->registryStats().activeHandshakeReservations, 1);
 
   retired.reservation.reset();

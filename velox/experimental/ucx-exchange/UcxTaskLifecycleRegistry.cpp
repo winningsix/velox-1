@@ -144,12 +144,22 @@ UcxTaskLifecycleRegistry::admitRequest(
           RequestDisposition::kRejected, AdmissionRejectReason::kCapacity, {}};
     }
   }
-  pending_[id].push_back(
-      PendingRequest{
-          Clock::now() + options_.unknownTaskWait,
-          destination,
-          std::move(onExpected),
-          std::move(onRejected)});
+  try {
+    pending_[id].push_back(
+        PendingRequest{
+            Clock::now() + options_.unknownTaskWait,
+            destination,
+            std::move(onExpected),
+            std::move(onRejected)});
+  } catch (...) {
+    auto pendingIt = pending_.find(id);
+    if (pendingIt != pending_.end() && pendingIt->second.empty()) {
+      pending_.erase(pendingIt);
+    }
+    ++totalRejected_;
+    return AdmissionResult{
+        RequestDisposition::kRejected, AdmissionRejectReason::kCapacity, {}};
+  }
   ++pendingRequestCount_;
   ++totalDeferred_;
   cv_.notify_all();

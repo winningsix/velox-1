@@ -68,6 +68,14 @@ std::string_view handshakeStatusName(HandshakeStatus status) {
   return "UNKNOWN";
 }
 
+bool isValidAcceptedHandshakeResponse(
+    const HandshakeResponse& response,
+    uint32_t destination) {
+  return response.protocolVersion == kUcxExchangeProtocolVersion &&
+      response.status == HandshakeStatus::kAccepted &&
+      response.taskEpoch != 0 && destination < response.destinationCount;
+}
+
 uint32_t fnv1a_32(std::string_view s) {
   uint32_t hash = 0x811C9DC5u; // FNV offset basis
   for (unsigned char c : s) {
