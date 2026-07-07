@@ -523,9 +523,9 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
   bool earlyTermination = false;
   int destination = 0;
 
-  // Clear stale state from prior tests (removeTask on a non-existing queue
-  // clears the removedTasks_ set, allowing getData to create a placeholder).
+  // Declare the producer lifecycle before its queue is initialized.
   queueManager_->removeTask(taskId);
+  queueManager_->expectTask(taskId);
 
   // Fetch data from a non-existing task.
   struct Response {
@@ -638,6 +638,7 @@ TEST_F(UcxOutputQueueManagerTest, multiFetchers) {
 TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateBeforeInit) {
   const std::string taskId = "orphanTest";
   queueManager_->removeTask(taskId); // ensure clean state
+  queueManager_->expectTask(taskId);
 
   bool callbackFired = false;
   bool receivedNullptr = false;

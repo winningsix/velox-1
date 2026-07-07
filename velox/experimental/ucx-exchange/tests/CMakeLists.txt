@@ -15,8 +15,10 @@
 add_executable(
   ucx_exchange_test
   UcxOutputQueueManagerTest.cpp
+  UcxOutputQueueLifecycleTest.cpp
   UcxExchangeTest.cpp
   IntraNodeTransferRegistryTest.cpp
+  UcxTaskLifecycleRegistryTest.cpp
   Main.cpp
   UcxTestHelpers.cpp
   UcxTestData.cpp

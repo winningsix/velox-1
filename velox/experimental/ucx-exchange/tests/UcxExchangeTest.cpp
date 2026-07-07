@@ -1021,6 +1021,7 @@ TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
   // Step 1: Create sink tasks and start them BEFORE initializeTask().
   // This triggers handshakes that create a placeholder queue in
   // UcxOutputQueueManager with intra-node potentially enabled.
+  queueManager_->expectTask(srcTaskId);
   std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
   for (int destId = 0; destId < numDestinations; ++destId) {
     const std::string sinkTaskId =

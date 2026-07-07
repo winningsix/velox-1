@@ -156,18 +156,18 @@ class IntraNodeTransferRegistry {
   /// @param taskId The task to cancel
   void cancelTask(std::string_view taskId);
 
-  /// @brief Remove a task from the cancelled set.
-  /// Called when a task ID is (re)initialized, so that the cancelledTasks_
-  /// set does not grow unboundedly across queries.
-  /// @param taskId The task to clear from the cancelled set
-  void clearCancelledTask(std::string_view taskId);
+  /// Declare a live task. Unknown and retired tasks fail closed in publish,
+  /// poll and waiter registration without retaining historical tombstones.
+  void expectTask(std::string_view taskId);
 
  private:
   IntraNodeTransferRegistry() = default;
 
   std::map<IntraNodeTransferKey, std::shared_ptr<IntraNodeTransferEntry>>
       registry_;
-  std::unordered_set<std::string> cancelledTasks_;
+  // Mirrors UcxOutputQueueManager's bounded expected-task set. Historical
+  // task IDs are erased by cancelTask(); unknown IDs are terminal by default.
+  std::unordered_set<std::string> activeTasks_;
   std::mutex mutex_;
 };
 

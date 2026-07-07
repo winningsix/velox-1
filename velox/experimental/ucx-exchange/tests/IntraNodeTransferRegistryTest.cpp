@@ -34,6 +34,7 @@ IntraNodeTransferKey makeKey(const std::string& taskId) {
 TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
   auto registry = IntraNodeTransferRegistry::getInstance();
   const auto key = makeKey("registerWaiterWokenByPublish");
+  registry->expectTask(key.taskId);
 
   std::atomic<int> woken{0};
   const bool readyNow = registry->registerWaiter(key, [&woken]() { ++woken; });
@@ -48,6 +49,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
   auto result = registry->poll(key);
   ASSERT_TRUE(result.has_value());
   EXPECT_FALSE(result->atEnd);
+  registry->cancelTask(key.taskId);
 }
 
 // A waiter registered after the data is already published returns true (re-poll,
@@ -55,6 +57,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
 TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   auto registry = IntraNodeTransferRegistry::getInstance();
   const auto key = makeKey("registerWaiterReadyReturnsTrue");
+  registry->expectTask(key.taskId);
 
   auto future = registry->publish(
       key, /*data=*/nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
@@ -67,6 +70,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   auto result = registry->poll(key);
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->atEnd);
+  registry->cancelTask(key.taskId);
 }
 
 // cancelTask wakes a dormant waiter so it re-polls and observes the atEnd result
@@ -75,6 +79,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByCancel) {
   auto registry = IntraNodeTransferRegistry::getInstance();
   const std::string taskId = "registerWaiterWokenByCancel";
   const auto key = makeKey(taskId);
+  registry->expectTask(taskId);
 
   std::atomic<int> woken{0};
   const bool readyNow = registry->registerWaiter(key, [&woken]() { ++woken; });
@@ -86,7 +91,4 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByCancel) {
   auto result = registry->poll(key);
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->atEnd);
-
-  // Clear singleton state so the cancelled task does not leak into other tests.
-  registry->clearCancelledTask(taskId);
 }

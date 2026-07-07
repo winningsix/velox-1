@@ -20,18 +20,85 @@
 #include <fmt/format.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
+#include <cerrno>
+#include <cstdlib>
 #include <limits>
+#include <utility>
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+size_t positiveEnvironmentValue(const char* name, size_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0' || value[0] == '-') {
+    return fallback;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed == 0 ||
+      parsed > std::numeric_limits<size_t>::max()) {
+    return fallback;
+  }
+  return static_cast<size_t>(parsed);
+}
+
+UcxTaskLifecycleRegistry::Options processLifecycleOptions() {
+  UcxTaskLifecycleRegistry::Options options;
+  options.expectedTaskCapacity = positiveEnvironmentValue(
+      "VELOX_UCX_MAX_EXPECTED_TASKS", options.expectedTaskCapacity);
+  options.pendingRequestCapacity = positiveEnvironmentValue(
+      "VELOX_UCX_MAX_PENDING_UNKNOWN_REQUESTS",
+      options.pendingRequestCapacity);
+  const auto unknownWaitMs = positiveEnvironmentValue(
+      "VELOX_UCX_UNKNOWN_TASK_WAIT_MS",
+      static_cast<size_t>(options.unknownTaskWait.count()));
+  if (unknownWaitMs <= static_cast<size_t>(
+                           std::numeric_limits<
+                               std::chrono::milliseconds::rep>::max())) {
+    options.unknownTaskWait = std::chrono::milliseconds(unknownWaitMs);
+  }
+  return options;
+}
+
+} // namespace
 
 /* static */
 std::shared_ptr<UcxOutputQueueManager> UcxOutputQueueManager::getInstanceRef() {
   // In C++11, the static local variable is guaranteed to only be initialized
   // once even in a multi-threaded context.
   static std::shared_ptr<UcxOutputQueueManager> instance =
-      std::make_shared<UcxOutputQueueManager>();
+      create(processLifecycleOptions());
   return instance;
+}
+
+std::shared_ptr<UcxOutputQueueManager> UcxOutputQueueManager::create(
+    UcxTaskLifecycleRegistry::Options options) {
+  return std::make_shared<UcxOutputQueueManager>(std::move(options));
+}
+
+UcxOutputQueueManager::UcxOutputQueueManager()
+    : UcxOutputQueueManager(UcxTaskLifecycleRegistry::Options{}) {}
+
+UcxOutputQueueManager::UcxOutputQueueManager(
+    UcxTaskLifecycleRegistry::Options options)
+    : taskLifecycle_(std::move(options)) {}
+
+UcxOutputQueueManager::~UcxOutputQueueManager() {
+  taskLifecycle_.shutdown();
+}
+
+void UcxOutputQueueManager::expectTask(std::string_view taskId) {
+  auto intraNodeRegistry = IntraNodeTransferRegistry::getInstance();
+  intraNodeRegistry->expectTask(taskId);
+  try {
+    taskLifecycle_.expectTask(taskId);
+  } catch (...) {
+    intraNodeRegistry->cancelTask(taskId);
+    throw;
+  }
 }
 
 void UcxOutputQueueManager::initializeTask(
@@ -41,6 +108,7 @@ void UcxOutputQueueManager::initializeTask(
     int numDrivers) {
   totalInitializeCalls_.fetch_add(1, std::memory_order_relaxed);
   const auto& taskId = task->taskId();
+  expectTask(taskId);
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskId);
     if (it == queues.end()) {
@@ -57,12 +125,6 @@ void UcxOutputQueueManager::initializeTask(
       }
     }
   });
-  // Clear any stale "removed" state so that getData() calls after this
-  // initializeTask() create proper placeholder queues if needed.
-  removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
-  // Clear any stale "cancelled" state in the intra-node registry so
-  // that the cancelledTasks_ set doesn't grow unboundedly across queries.
-  IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
 }
 
 void UcxOutputQueueManager::updateOutputBuffers(
@@ -118,20 +180,33 @@ void UcxOutputQueueManager::getData(
     int destination,
     UcxDataAvailableCallback notify) {
   std::shared_ptr<UcxOutputQueue> outputQueue;
-  bool taskRemoved = false;
+  bool requestDeferred = false;
+  bool requestRejected = false;
+  std::shared_ptr<UcxDataAvailableCallback> pendingNotify;
   std::string taskIdStr{taskId};
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskIdStr);
     if (it == queues.end()) {
-      // Check if the task was already removed. If so, don't re-create a
-      // placeholder — the task is dead and any server calling getData() is a
-      // stale leftover. Re-creating would produce an undersized queue that
-      // crashes when deleteResults() is called for other destinations.
-      if (removedTasks_.withLock(
-              [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
-        VLOG(2) << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
-                << " getData ignored (task already removed)";
-        taskRemoved = true;
+      pendingNotify =
+          std::make_shared<UcxDataAvailableCallback>(std::move(notify));
+      const auto disposition = taskLifecycle_.deferIfUnexpected(
+          taskIdStr,
+          [this, taskIdStr, destination, pendingNotify]() mutable {
+            getData(taskIdStr, destination, std::move(*pendingNotify));
+          },
+          [pendingNotify]() mutable {
+            if (*pendingNotify) {
+              (*pendingNotify)(nullptr, {});
+            }
+          });
+      if (disposition ==
+          UcxTaskLifecycleRegistry::RequestDisposition::kDeferred) {
+        requestDeferred = true;
+        return;
+      }
+      if (disposition ==
+          UcxTaskLifecycleRegistry::RequestDisposition::kRejected) {
+        requestRejected = true;
         return;
       }
       // create the queue structures such that the notify callback can be
@@ -146,14 +221,20 @@ void UcxOutputQueueManager::getData(
       outputQueue = it->second;
     }
   });
-  if (taskRemoved) {
-    // Fire callback immediately with nullptr to signal end-of-stream.
-    notify(nullptr, {});
+  if (requestDeferred) {
+    return;
+  }
+  if (requestRejected) {
+    if (*pendingNotify) {
+      (*pendingNotify)(nullptr, {});
+    }
     return;
   }
   // outside of lock. Queue must exist.
   // get the data or install the notify callback.
-  outputQueue->getData(destination, notify);
+  outputQueue->getData(
+      destination,
+      pendingNotify ? std::move(*pendingNotify) : std::move(notify));
 }
 
 void UcxOutputQueueManager::getData(
@@ -163,16 +244,43 @@ void UcxOutputQueueManager::getData(
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
   std::shared_ptr<UcxOutputQueue> outputQueue;
-  bool taskRemoved = false;
+  bool requestDeferred = false;
+  bool requestRejected = false;
+  std::shared_ptr<UcxDataAvailableCallbackV2> pendingNotify;
   std::string taskIdStr{taskId};
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskIdStr);
     if (it == queues.end()) {
-      if (removedTasks_.withLock(
-              [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
-        VLOG(2) << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
-                << " getData ignored (task already removed)";
-        taskRemoved = true;
+      pendingNotify =
+          std::make_shared<UcxDataAvailableCallbackV2>(std::move(notify));
+      const auto disposition = taskLifecycle_.deferIfUnexpected(
+          taskIdStr,
+          [this,
+           taskIdStr,
+           destination,
+           maxBytes,
+           sequence,
+           pendingNotify]() mutable {
+            getData(
+                taskIdStr,
+                destination,
+                maxBytes,
+                sequence,
+                std::move(*pendingNotify));
+          },
+          [sequence, pendingNotify]() mutable {
+            if (*pendingNotify) {
+              (*pendingNotify)(nullptr, sequence, {});
+            }
+          });
+      if (disposition ==
+          UcxTaskLifecycleRegistry::RequestDisposition::kDeferred) {
+        requestDeferred = true;
+        return;
+      }
+      if (disposition ==
+          UcxTaskLifecycleRegistry::RequestDisposition::kRejected) {
+        requestRejected = true;
         return;
       }
       VLOG(2)
@@ -184,11 +292,20 @@ void UcxOutputQueueManager::getData(
       outputQueue = it->second;
     }
   });
-  if (taskRemoved) {
-    notify(nullptr, sequence, {});
+  if (requestDeferred) {
     return;
   }
-  outputQueue->getData(destination, maxBytes, sequence, notify);
+  if (requestRejected) {
+    if (*pendingNotify) {
+      (*pendingNotify)(nullptr, sequence, {});
+    }
+    return;
+  }
+  outputQueue->getData(
+      destination,
+      maxBytes,
+      sequence,
+      pendingNotify ? std::move(*pendingNotify) : std::move(notify));
 }
 
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
@@ -217,32 +334,27 @@ std::string UcxOutputQueueManager::describeQueueForIntraNode(
 void UcxOutputQueueManager::removeTask(std::string_view taskId) {
   totalRemoveCalls_.fetch_add(1, std::memory_order_relaxed);
   std::string taskIdStr{taskId};
+  const auto expected = taskLifecycle_.retireTask(taskIdStr);
+  // Retire intra-node state before erasing the queue. Pollers become atEnd and
+  // every outstanding entry is fulfilled; no historical task ID is retained.
+  IntraNodeTransferRegistry::getInstance()->cancelTask(taskIdStr);
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
         auto it = queues.find(taskIdStr);
         if (it == queues.end()) {
-          // Already removed. Keep the tombstone so late getData() calls from
-          // stale UCX servers cannot recreate zombie placeholder queues.
           return nullptr;
         }
         auto taskQueue = it->second;
         queues.erase(it);
-        // Insert into removedTasks_ while still holding the queues_ lock
-        // to prevent getData() from seeing a gap between erase and insert,
-        // which would cause it to create a zombie placeholder queue.
-        removedTasks_.withLock(
-            [&](auto& removed) { removed.insert(taskIdStr); });
         return taskQueue;
       });
   VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
-          << " queueExists=" << (queue != nullptr);
+          << " queueExists=" << (queue != nullptr)
+          << " expected=" << expected;
   if (queue != nullptr) {
     totalQueuesRemoved_.fetch_add(1, std::memory_order_relaxed);
     queue->terminate();
   }
-  // Notify the intra-node registry so that any sources polling for this
-  // task get an atEnd result instead of spinning forever.
-  IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);
 }
 
 UcxOutputQueueManager::RegistryStats
@@ -250,13 +362,22 @@ UcxOutputQueueManager::registryStats() const {
   RegistryStats result;
   result.activeQueues =
       queues_.withLock([](const auto& queues) { return queues.size(); });
-  result.removedTaskTombstones = removedTasks_.withLock(
-      [](const auto& removed) { return removed.size(); });
+  const auto lifecycle = taskLifecycle_.stats();
+  result.activeExpectedTasks = lifecycle.activeExpectedTasks;
+  result.pendingUnknownRequests = lifecycle.pendingUnknownRequests;
+  result.expectedTaskCapacity = lifecycle.expectedTaskCapacity;
+  result.pendingRequestCapacity = lifecycle.pendingRequestCapacity;
   result.totalInitializeCalls =
       totalInitializeCalls_.load(std::memory_order_relaxed);
   result.totalRemoveCalls = totalRemoveCalls_.load(std::memory_order_relaxed);
   result.totalQueuesRemoved =
       totalQueuesRemoved_.load(std::memory_order_relaxed);
+  result.totalExpected = lifecycle.totalExpected;
+  result.totalRetired = lifecycle.totalRetired;
+  result.totalDeferred = lifecycle.totalDeferred;
+  result.totalAdopted = lifecycle.totalAdopted;
+  result.totalExpired = lifecycle.totalExpired;
+  result.totalRejected = lifecycle.totalRejected;
   return result;
 }
 

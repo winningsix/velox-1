@@ -20,8 +20,8 @@
 #include <atomic>
 #include <functional>
 #include <string_view>
-#include <unordered_set>
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
+#include "velox/experimental/ucx-exchange/UcxTaskLifecycleRegistry.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -29,21 +29,40 @@ class UcxOutputQueueManager {
  public:
   struct RegistryStats {
     size_t activeQueues{0};
-    size_t removedTaskTombstones{0};
+    size_t activeExpectedTasks{0};
+    size_t pendingUnknownRequests{0};
+    size_t expectedTaskCapacity{0};
+    size_t pendingRequestCapacity{0};
     uint64_t totalInitializeCalls{0};
     uint64_t totalRemoveCalls{0};
     uint64_t totalQueuesRemoved{0};
+    uint64_t totalExpected{0};
+    uint64_t totalRetired{0};
+    uint64_t totalDeferred{0};
+    uint64_t totalAdopted{0};
+    uint64_t totalExpired{0};
+    uint64_t totalRejected{0};
   };
 
   /// Factory method to retrieve a reference to the output queue manager.
   static std::shared_ptr<UcxOutputQueueManager> getInstanceRef();
 
-  // no constructor to prevent direct instantiation.
-  UcxOutputQueueManager() = default;
+  /// Creates an isolated manager with explicit lifecycle bounds. Primarily
+  /// used by concurrency tests and embedders that do not use the singleton.
+  static std::shared_ptr<UcxOutputQueueManager> create(
+      UcxTaskLifecycleRegistry::Options options);
+
+  UcxOutputQueueManager();
+  explicit UcxOutputQueueManager(UcxTaskLifecycleRegistry::Options options);
+  ~UcxOutputQueueManager();
   // no copy constructor.
   UcxOutputQueueManager(const UcxOutputQueueManager&) = delete;
   // no copy assignment.
   UcxOutputQueueManager& operator=(const UcxOutputQueueManager&) = delete;
+
+  /// Declares a task before initializeTask(). Early requests for undeclared
+  /// tasks are held only within the lifecycle registry's hard cap/deadline.
+  void expectTask(std::string_view taskId);
 
   /// @brief Initializes a task and creates the corresponding output queues that
   /// are associated with this task.
@@ -135,8 +154,8 @@ class UcxOutputQueueManager {
   /// Calls "terminate" on the queue to awake waiting producers.
   void removeTask(std::string_view taskId);
 
-  /// Process-registry observability. Removed-task tombstones intentionally
-  /// remain fail-closed so late UCX requests cannot recreate zombie queues.
+  /// Process-registry observability for active queues and bounded lifecycle
+  /// state. Historical task IDs are never retained.
   RegistryStats registryStats() const;
 
   /// @brief Returns the queue statistics of the queue associated with the given
@@ -156,12 +175,7 @@ class UcxOutputQueueManager {
       std::mutex>
       queues_;
 
-  // Tasks that have been removed via removeTask(). Prevents getData() from
-  // re-creating placeholder queues for tasks that are already dead, which
-  // would cause crashes when deleteResults() is called with destinations
-  // that exceed the placeholder's undersized queues_ vector.
-  folly::Synchronized<std::unordered_set<std::string>, std::mutex>
-      removedTasks_;
+  UcxTaskLifecycleRegistry taskLifecycle_;
 
   std::atomic<uint64_t> totalInitializeCalls_{0};
   std::atomic<uint64_t> totalRemoveCalls_{0};

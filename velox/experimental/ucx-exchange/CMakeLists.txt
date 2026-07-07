@@ -15,6 +15,7 @@ set(
   UCX_EXCHANGE_SOURCES
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp
+  UcxTaskLifecycleRegistry.cpp
   UcxQueues.cpp
   UcxExchange.cpp
   UcxExchangeProtocol.cpp

@@ -44,10 +44,9 @@ std::future<void> IntraNodeTransferRegistry::publish(
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // If the task was already cancelled (removeTask was called), don't create
-    // a registry entry. Return an already-fulfilled future so the server
-    // doesn't block waiting for a source that will never come.
-    if (cancelledTasks_.count(key.taskId)) {
+    // Unknown and retired tasks fail closed. The output queue manager declares
+    // every live task explicitly and never retains historical tombstones.
+    if (activeTasks_.count(key.taskId) == 0) {
       cancelled = true;
     } else {
       // Check if entry already exists (source may have started waiting)
@@ -118,8 +117,7 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Check if this task has been cancelled (producer removed).
-    if (cancelledTasks_.count(key.taskId)) {
+    if (activeTasks_.count(key.taskId) == 0) {
       VLOG(2) << "[INTRA-REG] poll cancelled: task=" << key.taskId
               << " dest=" << key.destination << " seq=" << key.sequenceNumber;
       return IntraNodeTransferResult{nullptr, rmm::cuda_stream_default, true};
@@ -184,9 +182,9 @@ bool IntraNodeTransferRegistry::registerWaiter(
   std::shared_ptr<IntraNodeTransferEntry> entry;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    // A cancelled task will never publish; tell the caller to re-poll so it
-    // observes the atEnd result instead of going dormant forever.
-    if (cancelledTasks_.count(key.taskId)) {
+    // An unknown or retired task will never publish; tell the caller to
+    // re-poll so it observes the atEnd result instead of going dormant.
+    if (activeTasks_.count(key.taskId) == 0) {
       return true;
     }
     auto it = registry_.find(key);
@@ -217,6 +215,10 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (activeTasks_.count(key.taskId) == 0) {
+      return {nullptr, rmm::cuda_stream_default, true};
+    }
 
     // Check if entry already exists (server may have published)
     auto it = registry_.find(key);
@@ -282,6 +284,10 @@ std::shared_ptr<cudf::packed_columns> IntraNodeTransferRegistry::retrieve(
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if (activeTasks_.count(key.taskId) == 0) {
+      return nullptr;
+    }
+
     auto it = registry_.find(key);
     if (it == registry_.end()) {
       VLOG(0) << "Intra-node transfer entry not found: " << key.taskId
@@ -319,7 +325,7 @@ void IntraNodeTransferRegistry::cancelTask(std::string_view taskId) {
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    cancelledTasks_.insert(taskIdStr);
+    activeTasks_.erase(taskIdStr);
 
     // Clean up any existing registry entries for this task so servers
     // waiting on the retrieved-promise don't hang.
@@ -369,9 +375,9 @@ void IntraNodeTransferRegistry::cancelTask(std::string_view taskId) {
           << " entriesCleaned=" << entriesToFulfill.size();
 }
 
-void IntraNodeTransferRegistry::clearCancelledTask(std::string_view taskId) {
+void IntraNodeTransferRegistry::expectTask(std::string_view taskId) {
   std::lock_guard<std::mutex> lock(mutex_);
-  cancelledTasks_.erase(std::string{taskId});
+  activeTasks_.insert(std::string{taskId});
 }
 
 } // namespace facebook::velox::ucx_exchange
