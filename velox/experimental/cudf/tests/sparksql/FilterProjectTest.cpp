@@ -214,10 +214,10 @@ TEST_F(CudfFilterProjectTest, arrayExcept) {
 TEST_F(CudfFilterProjectTest, arrayExceptSequence) {
   auto upper = makeNullableFlatVector<int32_t>({5, 3, 1, std::nullopt});
   auto values = makeNullableArrayVector<int32_t>({
-      {{2, 4}},
-      {{1}},
-      {{}},
-      {{1}},
+      {2, 4},
+      {1},
+      {},
+      {1},
   });
   auto input = makeRowVector({upper, values});
 
