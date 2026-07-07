@@ -45,6 +45,7 @@ velox_add_library(
   MakeTimestamp.cpp
   Map.cpp
   RegexFunctions.cpp
+  SimpleComparisonMatcher.cpp
   Size.cpp
   String.cpp
   TimestampUtils.cpp

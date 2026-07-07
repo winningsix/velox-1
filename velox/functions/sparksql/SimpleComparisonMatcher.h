@@ -42,6 +42,10 @@ class SparkSimpleComparisonChecker : public SimpleComparisonChecker {
  public:
   ~SparkSimpleComparisonChecker() override = default;
 
+  std::optional<SimpleComparison> isSimpleComparison(
+      const std::string& prefix,
+      const core::LambdaTypedExpr& expr) override;
+
  protected:
   std::shared_ptr<Matcher> comparison(
       const std::string& prefix,

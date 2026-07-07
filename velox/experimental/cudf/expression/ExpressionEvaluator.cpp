@@ -1811,6 +1811,27 @@ class SortArrayFunction : public CudfFunction {
   bool asc_{true};
 };
 
+class ArraySortFunction : public CudfFunction {
+ public:
+  explicit ArraySortFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "array_sort expects exactly 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    return cudf::lists::sort_lists(
+        cudf::lists_column_view(asView(inputColumns[0])),
+        cudf::order::ASCENDING,
+        cudf::null_order::AFTER,
+        stream,
+        mr);
+  }
+};
+
 class ArrayDistinctFunction : public CudfFunction {
  public:
   explicit ArrayDistinctFunction(
@@ -4511,6 +4532,13 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(T)")
            .constantArgumentType("boolean")
            .build()});
+
+  registerCudfFunction(
+      prefix + "array_sort",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ArraySortFunction>(expr);
+      },
+      {arrayIdentitySignature});
 
   registerCudfFunction(
       prefix + "array_distinct",

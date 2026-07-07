@@ -17,6 +17,7 @@
 #include <optional>
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/expression/ExprRewriteRegistry.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 #include "velox/functions/sparksql/tests/ArraySortTestData.h"
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
@@ -211,6 +212,37 @@ TEST_F(ArraySortTest, lambda) {
       true,
       data,
       sortedDesc);
+
+  // Spark emits explicit null ordering around the value comparator. The
+  // rewrite recognizes this exact nulls-last contract and preserves nulls at
+  // the end while sorting non-null values in ascending order.
+  auto sortedValuesAsc = makeNullableArrayVector<std::string>({
+      {"abc", "abc123", "abcd", std::nullopt},
+      {"x", "xyz", "xyz123", std::nullopt},
+  });
+  testArraySort(
+      "(left, right) -> if(and(isnull(left), isnull(right)), 0, "
+      "if(isnull(left), 1, if(isnull(right), -1, "
+      "if(lessthan(left, right), -1, "
+      "if(greaterthan(left, right), 1, 0)))))",
+      true,
+      data,
+      sortedValuesAsc);
+
+  auto typedExpr = makeTypedExpr(
+      "array_sort(c0, (left, right) -> "
+      "if(and(isnull(left), isnull(right)), 0, "
+      "if(isnull(left), 1, if(isnull(right), -1, "
+      "if(lessthan(left, right), -1, "
+      "if(greaterthan(left, right), 1, 0))))))",
+      ROW({"c0"}, {ARRAY(VARCHAR())}));
+  auto rewritten =
+      expression::ExprRewriteRegistry::instance().rewrite(typedExpr);
+  auto rewrittenCall =
+      std::dynamic_pointer_cast<const core::CallTypedExpr>(rewritten);
+  ASSERT_NE(rewrittenCall, nullptr);
+  EXPECT_EQ(rewrittenCall->name(), "array_sort");
+  EXPECT_EQ(rewrittenCall->inputs().size(), 1);
 }
 
 TEST_F(ArraySortTest, unsupporteLambda) {
@@ -220,6 +252,27 @@ TEST_F(ArraySortTest, unsupporteLambda) {
 
   VELOX_ASSERT_THROW(
       evaluate("array_sort(c0, (a, b) -> 0)", data),
+      "array_sort with comparator lambda that cannot be rewritten into a transform is not supported");
+
+  // Do not rewrite nulls-first or malformed null guards as Spark's nulls-last
+  // array_sort implementation.
+  VELOX_ASSERT_THROW(
+      evaluate(
+          "array_sort(c0, (left, right) -> "
+          "if(and(isnull(left), isnull(right)), 0, "
+          "if(isnull(left), -1, if(isnull(right), 1, "
+          "if(lessthan(left, right), -1, "
+          "if(greaterthan(left, right), 1, 0))))))",
+          data),
+      "array_sort with comparator lambda that cannot be rewritten into a transform is not supported");
+  VELOX_ASSERT_THROW(
+      evaluate(
+          "array_sort(c0, (left, right) -> "
+          "if(and(isnull(left), isnull(right)), 0, "
+          "if(isnull(left), 1, if(isnull(left), -1, "
+          "if(lessthan(left, right), -1, "
+          "if(greaterthan(left, right), 1, 0))))))",
+          data),
       "array_sort with comparator lambda that cannot be rewritten into a transform is not supported");
 }
 } // namespace

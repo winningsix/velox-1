@@ -230,6 +230,25 @@ TEST_F(CudfFilterProjectTest, arrayExceptSequence) {
       input->rowType());
 }
 
+TEST_F(CudfFilterProjectTest, arraySortNullsLast) {
+  auto arrays = makeNullableArrayVector<std::string>({
+      {"c", std::nullopt, "a", "b"},
+      {std::nullopt, "z", std::nullopt, "x"},
+      {},
+  });
+  auto input = makeRowVector({arrays});
+
+  assertExpressionMatchesCpu("array_sort(c0)", input, input->rowType());
+  assertExpressionMatchesCpu(
+      "array_sort(c0, (left, right) -> "
+      "if(and(isnull(left), isnull(right)), 0, "
+      "if(isnull(left), 1, if(isnull(right), -1, "
+      "if(lessthan(left, right), -1, "
+      "if(greaterthan(left, right), 1, 0))))))",
+      input,
+      input->rowType());
+}
+
 TEST_F(CudfFilterProjectTest, castStringToBoolean) {
   auto input = makeRowVector({
       makeNullableFlatVector<std::string>({

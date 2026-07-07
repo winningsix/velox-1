@@ -477,6 +477,15 @@ core::CallTypedExprPtr asArraySortCall(
   return nullptr;
 }
 
+bool isIdentityTransform(
+    const core::TypedExprPtr& expr,
+    const core::LambdaTypedExpr& lambda) {
+  const auto* field =
+      dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get());
+  return field != nullptr && field->isInputColumn() &&
+      field->name() == lambda.signature()->nameOf(0);
+}
+
 } // namespace
 
 std::shared_ptr<exec::VectorFunction> makeArraySortLambdaFunction(
@@ -543,6 +552,15 @@ core::TypedExprPtr rewriteArraySortCall(
 
     if (!comparison->expr->type()->isOrderable()) {
       VELOX_USER_FAIL(kNotSupported, lambda->toString());
+    }
+
+    // The identity transform adds no semantics. Preserve the canonical
+    // one-argument form so backends that implement array_sort directly do not
+    // need to evaluate a redundant lambda.
+    if (comparison->isLessThen &&
+        isIdentityTransform(comparison->expr, *lambda)) {
+      return std::make_shared<core::CallTypedExpr>(
+          call->type(), name, call->inputs()[0]);
     }
 
     auto rewritten = std::make_shared<core::CallTypedExpr>(
