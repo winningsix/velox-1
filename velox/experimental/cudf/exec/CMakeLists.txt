@@ -42,6 +42,7 @@ add_library(
   DecimalAggregationState.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
+  UcxExchangeClientRegistry.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
   ToCudf.cpp

@@ -17,6 +17,7 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <velox/exec/Task.h>
+#include <atomic>
 #include <functional>
 #include <string_view>
 #include <unordered_set>
@@ -26,6 +27,14 @@ namespace facebook::velox::ucx_exchange {
 
 class UcxOutputQueueManager {
  public:
+  struct RegistryStats {
+    size_t activeQueues{0};
+    size_t removedTaskTombstones{0};
+    uint64_t totalInitializeCalls{0};
+    uint64_t totalRemoveCalls{0};
+    uint64_t totalQueuesRemoved{0};
+  };
+
   /// Factory method to retrieve a reference to the output queue manager.
   static std::shared_ptr<UcxOutputQueueManager> getInstanceRef();
 
@@ -126,6 +135,10 @@ class UcxOutputQueueManager {
   /// Calls "terminate" on the queue to awake waiting producers.
   void removeTask(std::string_view taskId);
 
+  /// Process-registry observability. Removed-task tombstones intentionally
+  /// remain fail-closed so late UCX requests cannot recreate zombie queues.
+  RegistryStats registryStats() const;
+
   /// @brief Returns the queue statistics of the queue associated with the given
   /// task. Returns nullopt when the specified output queue doesn't exist.
   std::optional<exec::OutputBuffer::Stats> stats(std::string_view taskId);
@@ -149,6 +162,10 @@ class UcxOutputQueueManager {
   // that exceed the placeholder's undersized queues_ vector.
   folly::Synchronized<std::unordered_set<std::string>, std::mutex>
       removedTasks_;
+
+  std::atomic<uint64_t> totalInitializeCalls_{0};
+  std::atomic<uint64_t> totalRemoveCalls_{0};
+  std::atomic<uint64_t> totalQueuesRemoved_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

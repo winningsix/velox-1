@@ -19,11 +19,13 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/UcxExchangeClientRegistry.h"
 
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {

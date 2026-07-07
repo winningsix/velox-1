@@ -39,6 +39,7 @@ void UcxOutputQueueManager::initializeTask(
     core::PartitionedOutputNode::Kind kind,
     int numDestinations,
     int numDrivers) {
+  totalInitializeCalls_.fetch_add(1, std::memory_order_relaxed);
   const auto& taskId = task->taskId();
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskId);
@@ -214,6 +215,7 @@ std::string UcxOutputQueueManager::describeQueueForIntraNode(
 }
 
 void UcxOutputQueueManager::removeTask(std::string_view taskId) {
+  totalRemoveCalls_.fetch_add(1, std::memory_order_relaxed);
   std::string taskIdStr{taskId};
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
@@ -235,11 +237,27 @@ void UcxOutputQueueManager::removeTask(std::string_view taskId) {
   VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
           << " queueExists=" << (queue != nullptr);
   if (queue != nullptr) {
+    totalQueuesRemoved_.fetch_add(1, std::memory_order_relaxed);
     queue->terminate();
   }
   // Notify the intra-node registry so that any sources polling for this
   // task get an atEnd result instead of spinning forever.
   IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);
+}
+
+UcxOutputQueueManager::RegistryStats
+UcxOutputQueueManager::registryStats() const {
+  RegistryStats result;
+  result.activeQueues =
+      queues_.withLock([](const auto& queues) { return queues.size(); });
+  result.removedTaskTombstones = removedTasks_.withLock(
+      [](const auto& removed) { return removed.size(); });
+  result.totalInitializeCalls =
+      totalInitializeCalls_.load(std::memory_order_relaxed);
+  result.totalRemoveCalls = totalRemoveCalls_.load(std::memory_order_relaxed);
+  result.totalQueuesRemoved =
+      totalQueuesRemoved_.load(std::memory_order_relaxed);
+  return result;
 }
 
 std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueueIfExists(

@@ -72,45 +72,9 @@
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
-#include <mutex>
-#include <unordered_map>
+#include <utility>
 
 namespace facebook::velox::cudf_velox {
-
-namespace {
-
-struct TaskExchangeKey {
-  std::string taskId;
-  core::PlanNodeId planNodeId;
-
-  bool operator==(const TaskExchangeKey& other) const {
-    return taskId == other.taskId && planNodeId == other.planNodeId;
-  }
-
-  struct Hash {
-    std::size_t operator()(const TaskExchangeKey& key) const {
-      return std::hash<std::string>{}(key.taskId) ^
-          (std::hash<std::string>{}(key.planNodeId) << 1);
-    }
-  };
-};
-
-using UcxExchangeClientMap = std::unordered_map<
-    TaskExchangeKey,
-    std::weak_ptr<ucx_exchange::UcxExchangeClient>,
-    TaskExchangeKey::Hash>;
-
-UcxExchangeClientMap& getUcxExchangeClientMap() {
-  static UcxExchangeClientMap instance;
-  return instance;
-}
-
-std::mutex& getUcxExchangeClientMapMutex() {
-  static std::mutex instance;
-  return instance;
-}
-
-} // namespace
 
 bool prepareUcxExchangeSources(
     const std::string& taskId,
@@ -119,20 +83,12 @@ bool prepareUcxExchangeSources(
     std::chrono::milliseconds timeout,
     const std::function<bool()>& cancelled,
     std::string* detail) {
-  std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
-  {
-    std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
-    auto& clientMap = getUcxExchangeClientMap();
-    const auto it = clientMap.find(TaskExchangeKey{taskId, planNodeId});
-    if (it == clientMap.end() || !(client = it->second.lock())) {
-      if (it != clientMap.end()) {
-        clientMap.erase(it);
-      }
-      if (detail != nullptr) {
-        *detail = "UCX exchange client was not created for the prepared task/node";
-      }
-      return false;
+  auto client = ucxExchangeClientRegistry().find(taskId, planNodeId);
+  if (client == nullptr) {
+    if (detail != nullptr) {
+      *detail = "UCX exchange client was not created for the prepared task/node";
     }
+    return false;
   }
 
   for (const auto& remoteTaskUrl : remoteTaskUrls) {
@@ -1317,31 +1273,19 @@ class ExchangeAdapter : public OperatorAdapter {
                  << " operatorId=" << operatorId
                  << " node=" << planNode->id();
 
-    std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
-    auto key = TaskExchangeKey{op->taskId(), planNode->id()};
-    {
-      std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
-      auto& clientMap = getUcxExchangeClientMap();
-      auto it = clientMap.find(key);
-      if (it != clientMap.end()) {
-        client = it->second.lock();
-        if (!client) {
-          clientMap.erase(it);
-        }
-      }
-
-      if (!client) {
-        auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
-        VELOX_CHECK_NOT_NULL(
-            veloxExchangeClient, "Velox exchange client can't be null.");
-        client = std::make_shared<ucx_exchange::UcxExchangeClient>(
-            op->taskId(),
-            veloxExchangeClient->getDestination(),
-            veloxExchangeClient->getNumberOfConsumers());
-        clientMap[key] = client;
-      } else {
-        exchangeOp->resetExchangeClient();
-      }
+    auto lookup = ucxExchangeClientRegistry().getOrCreate(
+        op->taskId(), planNode->id(), [&]() {
+          auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
+          VELOX_CHECK_NOT_NULL(
+              veloxExchangeClient, "Velox exchange client can't be null.");
+          return std::make_shared<ucx_exchange::UcxExchangeClient>(
+              op->taskId(),
+              veloxExchangeClient->getDestination(),
+              veloxExchangeClient->getNumberOfConsumers());
+        });
+    auto client = std::move(lookup.client);
+    if (!lookup.created) {
+      exchangeOp->resetExchangeClient();
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;
