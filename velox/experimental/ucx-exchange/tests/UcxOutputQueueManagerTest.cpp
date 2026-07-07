@@ -36,6 +36,20 @@ using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
 
+namespace facebook::velox::ucx_exchange {
+
+class UcxExchangeClientTestPeer {
+ public:
+  static void addClosedSourceMetrics(
+      UcxExchangeClient& client,
+      const UcxExchangeSource::BackpressureMetrics& metrics) {
+    std::lock_guard<std::mutex> lock(client.queue_->mutex());
+    client.mergeClosedSourceMetricsLocked(metrics);
+  }
+};
+
+} // namespace facebook::velox::ucx_exchange
+
 class UcxOutputQueueManagerTest : public testing::Test {
  protected:
   UcxOutputQueueManagerTest() {}
@@ -507,10 +521,122 @@ TEST_F(UcxOutputQueueManagerTest, receiveBudgetIsPerClientAndValidated) {
 
   EXPECT_EQ(smallClient.queue()->maxInflightReceiveBytes(), kSmallCap);
   EXPECT_EQ(largeClient.queue()->maxInflightReceiveBytes(), kLargeCap);
+  const auto initialStats = smallClient.stats();
+  EXPECT_FALSE(initialStats.empty());
+  EXPECT_EQ(
+      initialStats.at(UcxExchangeClient::kMetricMaxInflightReceiveBytes).sum,
+      kSmallCap);
+  EXPECT_EQ(
+      initialStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      0);
+  EXPECT_EQ(
+      initialStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
+      0);
+  EXPECT_EQ(
+      initialStats.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
+      0);
+
+  EXPECT_TRUE(smallClient.queue()->tryReserveReceive(1024));
+  const auto reservedStats = smallClient.stats();
+  EXPECT_EQ(
+      reservedStats.at(UcxExchangeClient::kMetricCurrentPendingReceiveBytes).sum,
+      1024);
+  EXPECT_EQ(
+      reservedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      1024);
+  EXPECT_EQ(
+      reservedStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
+      1024);
+  smallClient.queue()->releaseReservedReceive(1024);
+  const auto releasedStats = smallClient.stats();
+  EXPECT_EQ(
+      releasedStats.at(UcxExchangeClient::kMetricCurrentInflightReceiveBytes).sum,
+      0);
+  EXPECT_EQ(
+      releasedStats.at(UcxExchangeClient::kMetricPeakInflightReceiveBytes).sum,
+      1024);
   EXPECT_ANY_THROW(UcxExchangeQueue(1, 0));
   EXPECT_ANY_THROW(UcxExchangeQueue(1, -1));
   EXPECT_ANY_THROW(UcxExchangeQueue(
       1, UcxExchangeQueue::kMaxInflightReceiveBytesCeiling + 1));
+}
+
+TEST_F(UcxOutputQueueManagerTest, closedSourceStatsRemainMonotonic) {
+  UcxExchangeClient client("closed-stats-query", 0, 1, 1024);
+  UcxExchangeClientTestPeer::addClosedSourceMetrics(
+      client,
+      UcxExchangeSource::BackpressureMetrics{
+          /*pauseCount=*/3,
+          /*resumeCount=*/2,
+          /*receiveCreditWaitCount=*/1,
+          /*pausedNanos=*/100});
+
+  const auto beforeClose = client.stats();
+  EXPECT_EQ(
+      beforeClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
+      3);
+  EXPECT_EQ(
+      beforeClose.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum,
+      2);
+  EXPECT_EQ(
+      beforeClose.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum,
+      1);
+  EXPECT_EQ(
+      beforeClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
+      100);
+
+  client.close();
+  const auto afterClose = client.stats();
+  EXPECT_FALSE(afterClose.empty());
+  EXPECT_GE(
+      afterClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
+      beforeClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum);
+  EXPECT_GE(
+      afterClose.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum,
+      beforeClose.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum);
+  EXPECT_GE(
+      afterClose.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum,
+      beforeClose.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum);
+  EXPECT_GE(
+      afterClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
+      beforeClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum);
+
+  client.close();
+  const auto afterRepeatedClose = client.stats();
+  EXPECT_EQ(
+      afterRepeatedClose.at(UcxExchangeClient::kMetricBackpressurePauseCount)
+          .sum,
+      afterClose.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum);
+  EXPECT_EQ(
+      afterRepeatedClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos)
+          .sum,
+      afterClose.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum);
+
+  // A source added concurrently with close may retire after close() returns.
+  // Its cumulative metrics must merge without wrapping.
+  UcxExchangeClientTestPeer::addClosedSourceMetrics(
+      client,
+      UcxExchangeSource::BackpressureMetrics{
+          /*pauseCount=*/std::numeric_limits<uint64_t>::max(),
+          /*resumeCount=*/std::numeric_limits<uint64_t>::max(),
+          /*receiveCreditWaitCount=*/std::numeric_limits<uint64_t>::max(),
+          /*pausedNanos=*/std::numeric_limits<uint64_t>::max()});
+  UcxExchangeClientTestPeer::addClosedSourceMetrics(
+      client,
+      UcxExchangeSource::BackpressureMetrics{1, 1, 1, 1});
+  const auto saturated = client.stats();
+  EXPECT_EQ(
+      saturated.at(UcxExchangeClient::kMetricBackpressurePauseCount).sum,
+      std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(
+      saturated.at(UcxExchangeClient::kMetricBackpressureResumeCount).sum,
+      std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(
+      saturated.at(UcxExchangeClient::kMetricReceiveCreditWaitCount).sum,
+      std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(
+      saturated.at(UcxExchangeClient::kMetricBackpressurePausedNanos).sum,
+      std::numeric_limits<int64_t>::max());
 }
 
 TEST_F(UcxOutputQueueManagerTest, receiveBudgetAggregatesAndResumesSafely) {
@@ -524,6 +650,11 @@ TEST_F(UcxOutputQueueManagerTest, receiveBudgetAggregatesAndResumesSafely) {
   EXPECT_EQ(stats.inFlightBytes, 40);
   EXPECT_TRUE(queue.tryReserveReceive(24, &stats));
   EXPECT_EQ(stats.inFlightBytes, kCap);
+  auto metrics = queue.metricsSnapshot();
+  EXPECT_EQ(metrics.pendingReceiveBytes, kCap);
+  EXPECT_EQ(metrics.inFlightBytes, kCap);
+  EXPECT_EQ(metrics.peakInflightReceiveBytes, kCap);
+  EXPECT_EQ(metrics.maxInflightReceiveBytes, kCap);
 
   queue.releaseReservedReceive(kCap);
   EXPECT_FALSE(queue.shouldPauseReceive(32, &stats));
@@ -531,8 +662,12 @@ TEST_F(UcxOutputQueueManagerTest, receiveBudgetAggregatesAndResumesSafely) {
   EXPECT_TRUE(queue.tryReserveReceive(kCap + 1, &stats));
   EXPECT_TRUE(queue.shouldPauseReceive(32, &stats));
   EXPECT_FALSE(queue.tryReserveReceive(1, &stats));
+  metrics = queue.metricsSnapshot();
+  EXPECT_EQ(metrics.inFlightBytes, kCap + 1);
+  EXPECT_EQ(metrics.peakInflightReceiveBytes, kCap + 1);
   queue.releaseReservedReceive(kCap + 1);
   EXPECT_FALSE(queue.shouldPauseReceive(32, &stats));
+  EXPECT_EQ(queue.metricsSnapshot().inFlightBytes, 0);
 }
 
 TEST_F(UcxOutputQueueManagerTest, oversizeFirstReceiveAvoidsSignedOverflow) {

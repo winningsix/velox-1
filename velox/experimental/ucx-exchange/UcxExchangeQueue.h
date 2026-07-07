@@ -18,6 +18,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <cinttypes>
+#include <limits>
 #include <memory>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
@@ -54,6 +55,18 @@ class UcxExchangeQueue {
     int64_t queuedBytes{0};
     int64_t pendingReceiveBytes{0};
     int64_t inFlightBytes{0};
+  };
+
+  struct MetricsSnapshot {
+    int32_t queueSize{0};
+    int64_t queuedBytes{0};
+    int64_t pendingReceiveBytes{0};
+    int64_t inFlightBytes{0};
+    int64_t peakQueuedBytes{0};
+    int64_t peakInflightReceiveBytes{0};
+    int64_t maxInflightReceiveBytes{0};
+    int64_t receivedTables{0};
+    int64_t averageReceivedTableBytes{0};
   };
 
   explicit UcxExchangeQueue(
@@ -141,7 +154,7 @@ class UcxExchangeQueue {
         sizeLocked(),
         totalBytes_,
         pendingReceiveBytes_,
-        totalBytes_ + pendingReceiveBytes_};
+        inFlightBytesLocked()};
   }
 
   int64_t maxInflightReceiveBytes() const {
@@ -157,6 +170,10 @@ class UcxExchangeQueue {
       BackpressureStats* stats = nullptr);
 
   void releaseReservedReceive(int64_t bytes);
+
+  /// Thread-safe current/peak snapshot exported through Exchange operator
+  /// runtimeStats. The receive cap is a frozen per-client value.
+  MetricsSnapshot metricsSnapshot() const;
 
   /// Returns the maximum value of total bytes.
   uint64_t peakBytes() const {
@@ -184,6 +201,13 @@ class UcxExchangeQueue {
   void close();
 
  private:
+  int64_t inFlightBytesLocked() const {
+    const auto maximum = std::numeric_limits<int64_t>::max();
+    return pendingReceiveBytes_ > maximum - totalBytes_
+        ? maximum
+        : totalBytes_ + pendingReceiveBytes_;
+  }
+
   std::vector<ContinuePromise> closeLocked() {
     queue_.clear();
     totalBytes_ = 0;
@@ -262,6 +286,8 @@ class UcxExchangeQueue {
   int64_t peakBytes_{0};
   // Peak queue size (number of items). Used for high-water-mark alerts.
   int64_t peakSize_{0};
+  // Maximum queued + posted-receive bytes observed for this client.
+  int64_t peakInflightReceiveBytes_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

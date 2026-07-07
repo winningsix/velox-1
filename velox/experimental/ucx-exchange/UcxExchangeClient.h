@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <functional>
+#include <string_view>
 #include <unordered_set>
 
 namespace facebook::velox::ucx_exchange {
@@ -33,6 +34,32 @@ class UcxExchangeClient
   // in the UcxExchangeQueue
   static constexpr int32_t kDefaultMaxQueuedColumns = 32;
   static constexpr std::chrono::milliseconds kRequestDataMaxWait{100};
+  static constexpr char kMetricQueueSize[] =
+      "ucxExchangeQueue.currentSize";
+  static constexpr char kMetricCurrentQueuedBytes[] =
+      "ucxExchangeQueue.currentQueuedBytes";
+  static constexpr char kMetricCurrentPendingReceiveBytes[] =
+      "ucxExchangeQueue.currentPendingReceiveBytes";
+  static constexpr char kMetricCurrentInflightReceiveBytes[] =
+      "ucxExchangeQueue.currentInflightReceiveBytes";
+  static constexpr char kMetricPeakQueuedBytes[] =
+      "ucxExchangeQueue.peakQueuedBytes";
+  static constexpr char kMetricPeakInflightReceiveBytes[] =
+      "ucxExchangeQueue.peakInflightReceiveBytes";
+  static constexpr char kMetricMaxInflightReceiveBytes[] =
+      "ucxExchangeQueue.maxInflightReceiveBytes";
+  static constexpr char kMetricReceivedTables[] =
+      "ucxExchangeQueue.receivedTables";
+  static constexpr char kMetricAverageReceivedTableBytes[] =
+      "ucxExchangeQueue.averageReceivedTableBytes";
+  static constexpr char kMetricBackpressurePauseCount[] =
+      "ucxExchangeSource.backpressurePauseCount";
+  static constexpr char kMetricBackpressureResumeCount[] =
+      "ucxExchangeSource.backpressureResumeCount";
+  static constexpr char kMetricReceiveCreditWaitCount[] =
+      "ucxExchangeSource.receiveCreditWaitCount";
+  static constexpr char kMetricBackpressurePausedNanos[] =
+      "ucxExchangeSource.backpressurePausedNanos";
 
   UcxExchangeClient(
       std::string taskId,
@@ -106,6 +133,11 @@ class UcxExchangeClient
   }
 
  private:
+  friend class UcxExchangeClientTestPeer;
+
+  void mergeClosedSourceMetricsLocked(
+      const UcxExchangeSource::BackpressureMetrics& metrics);
+
   // Handy for ad-hoc logging.
   const std::string taskId_;
   const int destination_;
@@ -116,6 +148,9 @@ class UcxExchangeClient
 
   std::unordered_set<std::string> remoteTaskIds_;
   std::vector<std::shared_ptr<UcxExchangeSource>> sources_;
+  // Cumulative source metrics survive source retirement and client close.
+  // Guarded by queue_->mutex().
+  UcxExchangeSource::BackpressureMetrics closedSourceMetrics_;
   bool closed_{false};
 
   // Total number of packed_clumns in flight.

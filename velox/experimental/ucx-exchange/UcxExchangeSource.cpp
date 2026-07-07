@@ -32,6 +32,17 @@ using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+void saturatingIncrement(uint64_t& value) {
+  if (value != std::numeric_limits<uint64_t>::max()) {
+    ++value;
+  }
+}
+
+void saturatingAdd(uint64_t& value, uint64_t increment) {
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  value = increment > maximum - value ? maximum : value + increment;
+}
+
 const folly::F14FastMap<UcxExchangeSource::ReceiverState, std::string_view>&
 receiverStateNames() {
   static const folly::F14FastMap<
@@ -182,7 +193,7 @@ void UcxExchangeSource::process() {
       // O(#peers) and OOMs/deadlocks the GPU at 4 peers (the count cap alone
       // let a few large chunks fill the device before pausing).
       if (queue_->shouldPauseReceive(kBackpressureHighWaterMark, &stats)) {
-        if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
+        if (enterBackpressure(/*waitingForReceiveCredit=*/false)) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
                   << "] pausing, queueSize=" << stats.queueSize
                   << " (high=" << kBackpressureHighWaterMark
@@ -232,6 +243,7 @@ void UcxExchangeSource::process() {
 }
 
 void UcxExchangeSource::cleanUp() {
+  leaveBackpressure(/*resumedByConsumer=*/false);
   releaseReceiveReservation();
   pendingReceive_.reset();
 
@@ -284,6 +296,7 @@ void UcxExchangeSource::close() {
           expected, desired, std::memory_order_acq_rel)) {
     return; // already closed.
   }
+  leaveBackpressure(/*resumedByConsumer=*/false);
 
   VLOG(2) << "[UCX-SOURCE-CLOSE] " << toString()
           << " state=" << toName(getState()) << " seq=" << sequenceNumber_
@@ -298,9 +311,7 @@ void UcxExchangeSource::close() {
 }
 
 void UcxExchangeSource::resumeFromBackpressure() {
-  bool expected = true;
-  if (backpressureActive_.compare_exchange_strong(
-          expected, false, std::memory_order_acq_rel)) {
+  if (leaveBackpressure(/*resumedByConsumer=*/true)) {
     VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
             << "] resumed by consumer, queueSize=" << queue_->size();
     communicator_->addToWorkQueue(getSelfPtr());
@@ -338,6 +349,60 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
   map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
   return map;
+}
+
+UcxExchangeSource::BackpressureMetrics
+UcxExchangeSource::backpressureMetrics() const {
+  std::lock_guard<std::mutex> lock(backpressureMetricsMutex_);
+  auto pausedNanos = totalPausedNanos_;
+  if (backpressureActive_) {
+    const auto activeNanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - backpressureStartedAt_)
+            .count();
+    if (activeNanos > 0) {
+      saturatingAdd(pausedNanos, static_cast<uint64_t>(activeNanos));
+    }
+  }
+  return BackpressureMetrics{
+      backpressurePauseCount_,
+      backpressureResumeCount_,
+      receiveCreditWaitCount_,
+      pausedNanos};
+}
+
+bool UcxExchangeSource::enterBackpressure(bool waitingForReceiveCredit) {
+  std::lock_guard<std::mutex> lock(backpressureMetricsMutex_);
+  if (backpressureActive_) {
+    return false;
+  }
+  backpressureActive_ = true;
+  backpressureStartedAt_ = std::chrono::steady_clock::now();
+  saturatingIncrement(backpressurePauseCount_);
+  if (waitingForReceiveCredit) {
+    saturatingIncrement(receiveCreditWaitCount_);
+  }
+  return true;
+}
+
+bool UcxExchangeSource::leaveBackpressure(bool resumedByConsumer) {
+  std::lock_guard<std::mutex> lock(backpressureMetricsMutex_);
+  if (!backpressureActive_) {
+    return false;
+  }
+  const auto pausedNanos =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - backpressureStartedAt_)
+          .count();
+  if (pausedNanos > 0) {
+    saturatingAdd(totalPausedNanos_, static_cast<uint64_t>(pausedNanos));
+  }
+  backpressureActive_ = false;
+  backpressureStartedAt_ = std::chrono::steady_clock::time_point{};
+  if (resumedByConsumer) {
+    saturatingIncrement(backpressureResumeCount_);
+  }
+  return true;
 }
 
 // private methods ---
@@ -616,7 +681,7 @@ bool UcxExchangeSource::tryStartDataReceive(
 
   UcxExchangeQueue::BackpressureStats stats;
   if (!queue_->tryReserveReceive(ptr->metadata.dataSizeBytes, &stats)) {
-    if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
+    if (enterBackpressure(/*waitingForReceiveCredit=*/true)) {
       VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
               << "] waiting for receive credit, requestedBytes="
               << ptr->metadata.dataSizeBytes

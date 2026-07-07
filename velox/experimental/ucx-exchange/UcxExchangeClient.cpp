@@ -19,9 +19,28 @@
 #include "velox/common/base/StatsReporter.h"
 
 #include <fmt/ranges.h>
+#include <limits>
 #include <thread>
 
 namespace facebook::velox::ucx_exchange {
+namespace {
+
+void saturatingAdd(uint64_t& value, uint64_t increment) {
+  const auto maximum = std::numeric_limits<uint64_t>::max();
+  value = increment > maximum - value ? maximum : value + increment;
+}
+
+void mergeBackpressureMetrics(
+    UcxExchangeSource::BackpressureMetrics& aggregate,
+    const UcxExchangeSource::BackpressureMetrics& metrics) {
+  saturatingAdd(aggregate.pauseCount, metrics.pauseCount);
+  saturatingAdd(aggregate.resumeCount, metrics.resumeCount);
+  saturatingAdd(
+      aggregate.receiveCreditWaitCount, metrics.receiveCreditWaitCount);
+  saturatingAdd(aggregate.pausedNanos, metrics.pausedNanos);
+}
+
+} // namespace
 
 void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
   std::shared_ptr<UcxExchangeSource> toClose;
@@ -52,6 +71,9 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
   // Outside of lock.
   if (toClose) {
     toClose->close();
+    const auto metrics = toClose->backpressureMetrics();
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    mergeClosedSourceMetricsLocked(metrics);
   }
 }
 
@@ -125,20 +147,96 @@ void UcxExchangeClient::close() {
       return;
     }
     closed_ = true;
-    sources = std::move(sources_);
+    // Keep sources_ visible to concurrent stats() calls until close() settles
+    // every active pause and atomically replaces the live sources with their
+    // cumulative metrics.
+    sources = sources_;
   }
 
   // Outside of mutex.
+  UcxExchangeSource::BackpressureMetrics closedMetrics;
   for (auto& source : sources) {
     source->close();
+    mergeBackpressureMetrics(closedMetrics, source->backpressureMetrics());
+  }
+  {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    mergeClosedSourceMetricsLocked(closedMetrics);
+    sources_.clear();
   }
   queue_->close();
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
-  // TODO: Implement stats collection.
+  std::vector<std::shared_ptr<UcxExchangeSource>> sources;
+  UcxExchangeSource::BackpressureMetrics sourceMetrics;
+  {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    sources = sources_;
+    sourceMetrics = closedSourceMetrics_;
+  }
+  const auto queueStats = queue_->metricsSnapshot();
+
+  for (const auto& source : sources) {
+    mergeBackpressureMetrics(sourceMetrics, source->backpressureMetrics());
+  }
+
   folly::F14FastMap<std::string, RuntimeMetric> stats;
+  stats.insert_or_assign(kMetricQueueSize, RuntimeMetric(queueStats.queueSize));
+  stats.insert_or_assign(
+      kMetricCurrentQueuedBytes,
+      RuntimeMetric(
+          queueStats.queuedBytes, RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricCurrentPendingReceiveBytes,
+      RuntimeMetric(
+          queueStats.pendingReceiveBytes, RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricCurrentInflightReceiveBytes,
+      RuntimeMetric(
+          queueStats.inFlightBytes, RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricPeakQueuedBytes,
+      RuntimeMetric(
+          queueStats.peakQueuedBytes, RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricPeakInflightReceiveBytes,
+      RuntimeMetric(
+          queueStats.peakInflightReceiveBytes,
+          RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricMaxInflightReceiveBytes,
+      RuntimeMetric(
+          queueStats.maxInflightReceiveBytes,
+          RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricReceivedTables,
+      RuntimeMetric(queueStats.receivedTables));
+  stats.insert_or_assign(
+      kMetricAverageReceivedTableBytes,
+      RuntimeMetric(
+          queueStats.averageReceivedTableBytes,
+          RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      kMetricBackpressurePauseCount,
+      RuntimeMetric(saturateCast(sourceMetrics.pauseCount)));
+  stats.insert_or_assign(
+      kMetricBackpressureResumeCount,
+      RuntimeMetric(saturateCast(sourceMetrics.resumeCount)));
+  stats.insert_or_assign(
+      kMetricReceiveCreditWaitCount,
+      RuntimeMetric(saturateCast(sourceMetrics.receiveCreditWaitCount)));
+  stats.insert_or_assign(
+      kMetricBackpressurePausedNanos,
+      RuntimeMetric(
+          saturateCast(sourceMetrics.pausedNanos),
+          RuntimeCounter::Unit::kNanos));
   return stats;
+}
+
+void UcxExchangeClient::mergeClosedSourceMetricsLocked(
+    const UcxExchangeSource::BackpressureMetrics& metrics) {
+  mergeBackpressureMetrics(closedSourceMetrics_, metrics);
 }
 
 PackedTableWithStreamPtr

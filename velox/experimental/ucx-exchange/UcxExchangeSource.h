@@ -37,6 +37,9 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <optional>
 
 namespace facebook::velox::ucx_exchange {
@@ -68,6 +71,13 @@ class UcxExchangeSource
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeSource> {
  public:
+  struct BackpressureMetrics {
+    uint64_t pauseCount{0};
+    uint64_t resumeCount{0};
+    uint64_t receiveCreditWaitCount{0};
+    uint64_t pausedNanos{0};
+  };
+
   // Public for logging and the VELOX_DEFINE_EMBEDDED_ENUM_NAME names map.
   enum class ReceiverState : uint32_t {
     Created,
@@ -151,6 +161,10 @@ class UcxExchangeSource
   /// for an example: 'totalBytes ：count: 9, sum: 11.17GB, max: 1.39GB,
   /// min:  1.16GB'
   folly::F14FastMap<std::string, RuntimeMetric> metrics() const;
+
+  /// Thread-safe monotonic counters used by UcxExchangeClient::stats(). An
+  /// active pause contributes elapsed time through the observation instant.
+  BackpressureMetrics backpressureMetrics() const;
 
   std::string toString() const {
     std::stringstream out;
@@ -271,6 +285,9 @@ class UcxExchangeSource
 
   void releaseReceiveReservation();
 
+  bool enterBackpressure(bool waitingForReceiveCredit);
+  bool leaveBackpressure(bool resumedByConsumer);
+
   /// @brief Sets the state to "desired" if and only if the current
   /// state is "expected".
   /// @param expected The expected state
@@ -319,7 +336,13 @@ class UcxExchangeSource
   // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
-  std::atomic<bool> backpressureActive_{false};
+  mutable std::mutex backpressureMetricsMutex_;
+  bool backpressureActive_{false};
+  uint64_t backpressurePauseCount_{0};
+  uint64_t backpressureResumeCount_{0};
+  uint64_t receiveCreditWaitCount_{0};
+  uint64_t totalPausedNanos_{0};
+  std::chrono::steady_clock::time_point backpressureStartedAt_{};
   std::shared_ptr<DataAndMetadata> pendingReceive_;
   int64_t reservedReceiveBytes_{0};
 

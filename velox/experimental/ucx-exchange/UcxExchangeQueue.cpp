@@ -65,6 +65,8 @@ void UcxExchangeQueue::enqueueLocked(
   if (peakBytes_ < totalBytes_) {
     peakBytes_ = totalBytes_;
   }
+  peakInflightReceiveBytes_ = std::max(
+      peakInflightReceiveBytes_, inFlightBytesLocked());
 
   ++receivedTables_;
   receivedBytes_ += dataSize;
@@ -140,6 +142,8 @@ bool UcxExchangeQueue::tryReserveReceive(
     }
   }
   pendingReceiveBytes_ += bytes;
+  peakInflightReceiveBytes_ = std::max(
+      peakInflightReceiveBytes_, inFlightBytesLocked());
   if (stats != nullptr) {
     *stats = backpressureStatsLocked();
   }
@@ -153,6 +157,21 @@ void UcxExchangeQueue::releaseReservedReceive(int64_t bytes) {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_GE(pendingReceiveBytes_, bytes);
   pendingReceiveBytes_ -= bytes;
+}
+
+UcxExchangeQueue::MetricsSnapshot UcxExchangeQueue::metricsSnapshot() const {
+  std::lock_guard<std::mutex> l(mutex_);
+  const auto current = backpressureStatsLocked();
+  return MetricsSnapshot{
+      current.queueSize,
+      current.queuedBytes,
+      current.pendingReceiveBytes,
+      current.inFlightBytes,
+      peakBytes_,
+      peakInflightReceiveBytes_,
+      maxInflightReceiveBytes_,
+      receivedTables_,
+      receivedTables_ > 0 ? receivedBytes_ / receivedTables_ : 0};
 }
 
 void UcxExchangeQueue::addPromiseLocked(
