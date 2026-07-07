@@ -22,6 +22,52 @@
 
 namespace facebook::velox::ucx_exchange {
 
+bool isValidHandshakeTaskId(std::string_view taskId) {
+  return !taskId.empty() && taskId.size() <= kUcxHandshakeMaxTaskIdLength &&
+      taskId.find('\0') == std::string_view::npos;
+}
+
+bool isCanonicalHandshakeTaskIdBuffer(const char* taskId, size_t capacity) {
+  if (taskId == nullptr || capacity < 2 || taskId[0] == '\0') {
+    return false;
+  }
+  size_t length = 0;
+  while (length < capacity && taskId[length] != '\0') {
+    ++length;
+  }
+  if (length == capacity) {
+    return false;
+  }
+  for (size_t index = length + 1; index < capacity; ++index) {
+    if (taskId[index] != '\0') {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string_view handshakeStatusName(HandshakeStatus status) {
+  switch (status) {
+    case HandshakeStatus::kAccepted:
+      return "ACCEPTED";
+    case HandshakeStatus::kInvalidRequest:
+      return "INVALID_REQUEST";
+    case HandshakeStatus::kInvalidDestination:
+      return "INVALID_DESTINATION";
+    case HandshakeStatus::kDuplicateRequest:
+      return "DUPLICATE_REQUEST";
+    case HandshakeStatus::kAdmissionCapacity:
+      return "ADMISSION_CAPACITY";
+    case HandshakeStatus::kAdmissionExpired:
+      return "ADMISSION_EXPIRED";
+    case HandshakeStatus::kTaskRetired:
+      return "TASK_RETIRED";
+    case HandshakeStatus::kShuttingDown:
+      return "SHUTTING_DOWN";
+  }
+  return "UNKNOWN";
+}
+
 uint32_t fnv1a_32(std::string_view s) {
   uint32_t hash = 0x811C9DC5u; // FNV offset basis
   for (unsigned char c : s) {

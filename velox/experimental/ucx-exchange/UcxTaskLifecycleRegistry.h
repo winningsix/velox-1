@@ -22,12 +22,12 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace facebook::velox::ucx_exchange {
@@ -48,10 +48,41 @@ class UcxTaskLifecycleRegistry {
  public:
   using Callback = std::function<void()>;
 
+  enum class OutputKind : uint8_t {
+    kPartitioned,
+    kBroadcast,
+    kArbitrary,
+  };
+
+  struct TaskContract {
+    uint32_t destinationCount{0};
+    OutputKind outputKind{OutputKind::kPartitioned};
+
+    bool operator==(const TaskContract& other) const {
+      return destinationCount == other.destinationCount &&
+          outputKind == other.outputKind;
+    }
+  };
+
+  enum class AdmissionRejectReason : uint8_t {
+    kNone,
+    kInvalidDestination,
+    kDuplicate,
+    kCapacity,
+    kExpired,
+    kRetired,
+    kShutdown,
+  };
+
+  using RejectCallback = std::function<void(AdmissionRejectReason)>;
+
   struct Options {
     size_t expectedTaskCapacity{65536};
     size_t pendingRequestCapacity{4096};
     std::chrono::milliseconds unknownTaskWait{30000};
+    uint32_t maxDestinationsPerTask{65536};
+    size_t activeHandshakeCapacity{65536};
+    size_t activeHandshakesPerTaskCapacity{65536};
   };
 
   struct Stats {
@@ -59,6 +90,7 @@ class UcxTaskLifecycleRegistry {
     size_t pendingUnknownRequests{0};
     size_t expectedTaskCapacity{0};
     size_t pendingRequestCapacity{0};
+    uint32_t maxDestinationsPerTask{0};
     uint64_t totalExpected{0};
     uint64_t totalRetired{0};
     uint64_t totalDeferred{0};
@@ -73,24 +105,42 @@ class UcxTaskLifecycleRegistry {
     kRejected,
   };
 
+  struct AdmissionResult {
+    RequestDisposition disposition{RequestDisposition::kRejected};
+    AdmissionRejectReason rejectReason{AdmissionRejectReason::kNone};
+    TaskContract contract;
+  };
+
   UcxTaskLifecycleRegistry();
   explicit UcxTaskLifecycleRegistry(Options options);
   UcxTaskLifecycleRegistry(const UcxTaskLifecycleRegistry&) = delete;
-  UcxTaskLifecycleRegistry& operator=(const UcxTaskLifecycleRegistry&) =
-      delete;
+  UcxTaskLifecycleRegistry& operator=(const UcxTaskLifecycleRegistry&) = delete;
   ~UcxTaskLifecycleRegistry();
 
-  /// Declares a task and synchronously adopts any bounded early requests.
+  /// Declares the exact output contract for a task and synchronously adopts any
+  /// bounded early requests. Re-declaration is idempotent only when the full
+  /// contract is identical.
   /// Returns true for a new declaration and false for an existing one.
-  bool expectTask(std::string_view taskId);
+  bool expectTask(std::string_view taskId, TaskContract contract);
 
-  /// Atomically checks expectation or stores an early request. The caller must
-  /// invoke onExpired itself for kRejected; stored callbacks are invoked by
-  /// expectTask(), retireTask(), or the deadline reaper, never under a lock.
-  RequestDisposition deferIfUnexpected(
+  /// Atomically validates a destination against an expected task contract or
+  /// stores an early request. The caller invokes onRejected for an immediate
+  /// kRejected result. Deferred callbacks are resolved exactly once by
+  /// expectTask(), retireTask(), the deadline reaper, or shutdown, never under
+  /// the registry lock.
+  AdmissionResult admitRequest(
       std::string_view taskId,
+      uint32_t destination,
       Callback onExpected,
-      Callback onExpired);
+      RejectCallback onRejected);
+
+  /// Expands a live broadcast task's exact destination contract before new
+  /// destinations are exposed. Partitioned and arbitrary contracts are fixed.
+  bool expandBroadcastDestinations(
+      std::string_view taskId,
+      uint32_t destinationCount);
+
+  std::optional<TaskContract> taskContract(std::string_view taskId) const;
 
   /// Retires a task and fails any still-pending early requests closed.
   bool retireTask(std::string_view taskId);
@@ -107,17 +157,25 @@ class UcxTaskLifecycleRegistry {
 
   struct PendingRequest {
     Clock::time_point deadline;
+    uint32_t destination;
     Callback onExpected;
-    Callback onExpired;
+    RejectCallback onRejected;
   };
 
-  static void invokeAll(std::vector<Callback>& callbacks) noexcept;
+  struct ResolvedRequest {
+    Callback onExpected;
+    RejectCallback onRejected;
+    AdmissionRejectReason reason{AdmissionRejectReason::kNone};
+    bool accepted{false};
+  };
+
+  static void invokeAll(std::vector<ResolvedRequest>& callbacks) noexcept;
   void reaperLoop();
 
   const Options options_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::unordered_set<std::string> expectedTasks_;
+  std::unordered_map<std::string, TaskContract> expectedTasks_;
   std::unordered_map<std::string, std::vector<PendingRequest>> pending_;
   size_t pendingRequestCount_{0};
   uint64_t totalExpected_{0};

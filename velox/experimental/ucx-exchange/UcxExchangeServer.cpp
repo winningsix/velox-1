@@ -28,6 +28,8 @@
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+std::atomic<size_t> gLiveUcxExchangeServers{0};
+
 const folly::F14FastMap<UcxExchangeServer::ServerState, std::string_view>&
 serverStateNames() {
   static const folly::
@@ -112,12 +114,15 @@ UcxExchangeServer::UcxExchangeServer(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
     const PartitionKey& key,
-    bool isIntraNodeTransfer)
+    bool isIntraNodeTransfer,
+    std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+        handshakeReservation)
     : CommElement(communicator, endpointRef),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
-      queueMgr_(UcxOutputQueueManager::getInstanceRef()) {
+      queueMgr_(UcxOutputQueueManager::getInstanceRef()),
+      handshakeReservation_(std::move(handshakeReservation)) {
   setState(ServerState::Created);
 
   if (isIntraNodeTransfer_) {
@@ -125,6 +130,17 @@ UcxExchangeServer::UcxExchangeServer(
             << " Detected same-node source (intra-node transfer) for "
             << partitionKey_.toString();
   }
+  // Increment only after all potentially throwing constructor work. A failed
+  // constructor has no matching destructor and must not leak the test count.
+  gLiveUcxExchangeServers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+UcxExchangeServer::~UcxExchangeServer() {
+  gLiveUcxExchangeServers.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+size_t UcxExchangeServer::testingLiveServerCount() {
+  return gLiveUcxExchangeServers.load(std::memory_order_acquire);
 }
 
 // static
@@ -132,9 +148,15 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::create(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
     const PartitionKey& key,
-    bool isIntraNodeTransfer) {
+    bool isIntraNodeTransfer,
+    std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+        handshakeReservation) {
   auto ptr = std::shared_ptr<UcxExchangeServer>(new UcxExchangeServer(
-      communicator, endpointRef, key, isIntraNodeTransfer));
+      communicator,
+      endpointRef,
+      key,
+      isIntraNodeTransfer,
+      std::move(handshakeReservation)));
   return ptr;
 }
 
@@ -274,6 +296,7 @@ void UcxExchangeServer::close() {
   if (queueMgr_) {
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
   }
+  handshakeReservation_.reset();
 
   // Cancel any outstanding requests. With weak_ptr callbacks, the callbacks
   // will safely no-op if we're destroyed before they complete.

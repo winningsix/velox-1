@@ -270,13 +270,16 @@ void Communicator::stop() {
           << " workQueue_.size(): " << workQueue_.size();
 }
 
-void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
+void Communicator::registerCommElement(
+    std::shared_ptr<CommElement> comms,
+    bool schedule) {
   std::lock_guard<std::mutex> lock(elemMutex_);
   auto ret = elements_.insert(comms);
   VELOX_CHECK(ret.second, "CommElement already registered!");
-  // Also put the comms element into the work queue.
-  workQueue_.push(comms);
-  signalWorker();
+  if (schedule) {
+    workQueue_.push(comms);
+    signalWorker();
+  }
 }
 
 void Communicator::signalWorker() {

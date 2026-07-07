@@ -211,8 +211,19 @@ UcxOutputQueue::UcxOutputQueue(
     std::shared_ptr<exec::Task> task,
     uint32_t numDestinations,
     uint32_t numDrivers,
-    core::PartitionedOutputNode::Kind kind)
-    : task_(task), kind_(kind), numDrivers_(numDrivers) {
+    core::PartitionedOutputNode::Kind kind,
+    uint32_t destinationLimit)
+    : task_(task),
+      kind_(kind),
+      destinationLimit_(
+          destinationLimit == 0 ? numDestinations : destinationLimit),
+      numDrivers_(numDrivers) {
+  VELOX_CHECK_GT(
+      destinationLimit_, 0, "UCX destination limit must be positive");
+  VELOX_CHECK_LE(
+      numDestinations,
+      destinationLimit_,
+      "UCX initial destination count exceeds admitted limit");
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
@@ -231,12 +242,27 @@ bool UcxOutputQueue::initialize(
     std::shared_ptr<exec::Task> task,
     uint32_t numDestinations,
     uint32_t numDrivers,
-    core::PartitionedOutputNode::Kind kind) {
+    core::PartitionedOutputNode::Kind kind,
+    uint32_t destinationLimit) {
   std::lock_guard<std::mutex> l(mutex_);
   if (task_) {
     // already initialized!
     return false;
   }
+  const auto exactLimit =
+      destinationLimit == 0 ? numDestinations : destinationLimit;
+  VELOX_CHECK_EQ(
+      destinationLimit_,
+      exactLimit,
+      "UCX initialized task destination limit differs from placeholder contract");
+  VELOX_CHECK_LE(
+      numDestinations,
+      destinationLimit_,
+      "UCX initialized task exceeds admitted destination limit");
+  VELOX_CHECK_EQ(
+      kind_,
+      kind,
+      "UCX initialized task output kind differs from placeholder contract");
   kind_ = kind;
   numDrivers_ = numDrivers;
   task_ = task;
@@ -334,10 +360,15 @@ bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
 }
 
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
+  VELOX_CHECK_GE(destination, 0, "UCX destination must not be negative");
   UcxDestinationQueue::Data data;
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_LT(
+        static_cast<uint32_t>(destination),
+        destinationLimit_,
+        "UCX destination exceeds admitted task contract");
     // If the queue doesn't exist yet, create an empty queue to store
     // the notify callback. The queue will eventually be initialized when
     // the task is being created.
@@ -403,10 +434,15 @@ void UcxOutputQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
+  VELOX_CHECK_GE(destination, 0, "UCX destination must not be negative");
   UcxDestinationQueue::Data data;
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_LT(
+        static_cast<uint32_t>(destination),
+        destinationLimit_,
+        "UCX destination exceeds admitted task contract");
     for (int i = queues_.size(); i <= destination; ++i) {
       queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
     }
@@ -558,9 +594,14 @@ bool UcxOutputQueue::isFinishedLocked() {
 }
 
 void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
+  VELOX_CHECK_GT(numBuffers, 0, "UCX output buffer count must be positive");
   using Kind = core::PartitionedOutputNode::Kind;
   if (kind_ == Kind::kPartitioned) {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_LE(
+        static_cast<uint32_t>(numBuffers),
+        destinationLimit_,
+        "UCX output buffer count exceeds admitted task contract");
     VELOX_CHECK_EQ(queues_.size(), numBuffers);
     VELOX_CHECK(noMoreBuffers);
     noMoreQueues_ = true;
@@ -571,6 +612,10 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   bool isFinished;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_LE(
+        static_cast<uint32_t>(numBuffers),
+        destinationLimit_,
+        "UCX output buffer count exceeds admitted task contract");
 
     if (numBuffers > queues_.size()) {
       // Add new destination queues and backfill with broadcast data.
@@ -604,6 +649,21 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   if (isFinished && task_) {
     task_->setAllOutputConsumed();
   }
+}
+
+void UcxOutputQueue::expandBroadcastDestinationLimit(
+    uint32_t destinationLimit) {
+  VELOX_CHECK_GT(destinationLimit, 0, "UCX destination limit must be positive");
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_EQ(
+      kind_,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      "Only a broadcast UCX queue may expand its destination contract");
+  VELOX_CHECK_GE(
+      destinationLimit,
+      destinationLimit_,
+      "UCX broadcast destination contract cannot shrink");
+  destinationLimit_ = destinationLimit;
 }
 
 void UcxOutputQueue::deleteResults(int destination) {
@@ -658,13 +718,15 @@ void UcxOutputQueue::terminate() {
       LOG(WARNING) << "UcxOutputQueue::terminate() called while task "
                    << task_->taskId() << " is still running";
     }
-    // Fire all pending getData callbacks with nullptr to signal end-of-stream.
-    // This handles the case where a producer task fails or is cancelled before
-    // noMoreData() is called, preventing consumers from being orphaned.
+    // Fire all pending getData callbacks with nullptr to signal terminal task
+    // removal. getAndClearNotify() cannot be used here: a V2 waiter may request
+    // a future sequence and would be re-installed instead of woken. Extract the
+    // waiter unconditionally, discard terminal task data, then leave one EOS
+    // marker for a later fetch.
     for (auto& queue : queues_) {
       if (queue != nullptr) {
+        pendingCallbacks.push_back(queue->deleteResults());
         queue->enqueueBack(nullptr);
-        pendingCallbacks.push_back(queue->getAndClearNotify());
       }
     }
     // Release any outstanding producer-side promises (blocked on queue-full).

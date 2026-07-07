@@ -31,6 +31,7 @@ void EndpointRef::onClose(ucs_status_t status, std::shared_ptr<void> arg) {
   size_t registeredCommElements = 0;
   std::string peerAddress = "(unknown)";
   if (ep) {
+    ep->acceptingCommElements_.store(false, std::memory_order_release);
     peerAddress = ep->getPeerAddress();
     registeredCommElements =
         ep->commElementCount_.load(std::memory_order_acquire);
@@ -53,6 +54,9 @@ bool EndpointRef::addCommElem(std::shared_ptr<CommElement> commElem) {
     return false; // nothing to do, no commElem.
   }
   std::lock_guard<std::mutex> lock(commMutex_);
+  if (!acceptingCommElements_.load(std::memory_order_acquire)) {
+    return false;
+  }
   cleanup();
   auto ret = communicators_.insert(commElem);
   commElementCount_.store(communicators_.size(), std::memory_order_release);
@@ -81,6 +85,7 @@ void EndpointRef::closeAndDrainCommunicators() {
       localCopy;
   {
     std::lock_guard<std::mutex> lock(commMutex_);
+    acceptingCommElements_.store(false, std::memory_order_release);
     localCopy.swap(communicators_);
     commElementCount_.store(0, std::memory_order_release);
   }
@@ -105,7 +110,6 @@ void EndpointRef::closeAndDrainCommunicators() {
   }
   // localCopy is destroyed here, releasing all weak_ptrs.
 }
-
 
 bool EndpointRef::operator<(EndpointRef const& other) {
   if (endpoint_ == other.endpoint_) {

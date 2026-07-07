@@ -158,7 +158,8 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       uint32_t numDestinations,
       uint32_t numDrivers,
       core::PartitionedOutputNode::Kind kind =
-          core::PartitionedOutputNode::Kind::kPartitioned);
+          core::PartitionedOutputNode::Kind::kPartitioned,
+      uint32_t destinationLimit = 0);
 
   /// @brief initializes an unitialized queue. This is needed in order to
   /// support delayed construction, i.e. if a "getData" arrives before the queue
@@ -172,7 +173,8 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       uint32_t numDestinations,
       uint32_t numDrivers,
       core::PartitionedOutputNode::Kind kind =
-          core::PartitionedOutputNode::Kind::kPartitioned);
+          core::PartitionedOutputNode::Kind::kPartitioned,
+      uint32_t destinationLimit = 0);
 
   core::PartitionedOutputNode::Kind kind() const {
     return kind_;
@@ -229,6 +231,11 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// new destinations are backfilled with previously broadcast data.
   /// Modeled on OutputBuffer::updateOutputBuffers().
   void updateOutputBuffers(int numBuffers, bool noMoreBuffers);
+
+  /// Reconciles this queue with an already-admitted broadcast contract
+  /// expansion. The manager must expand the bounded lifecycle contract first;
+  /// this method never allocates destination queues by itself.
+  void expandBroadcastDestinationLimit(uint32_t destinationLimit);
 
   /// @brief Returns true if the OutputQueue is finished. Thread-safe.
   bool isFinished();
@@ -302,6 +309,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // (canUseIntraNode) load with memory_order_acquire so kind_ and task_
   // written before the store are visible.
   std::atomic<bool> initialized_{false};
+
+  // Exact upper bound admitted before any handshake can create a placeholder.
+  // This prevents an untrusted destination from growing queues_ without bound.
+  uint32_t destinationLimit_{0};
 
   // For broadcast: stores data for late-arriving destinations that need
   // backfill. Cleared once noMoreQueues_ is set.

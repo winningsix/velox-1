@@ -79,9 +79,14 @@ class Communicator {
   void stop();
 
   /// @brief Registers a communication element with the communicator.
-  /// This also automatically puts the element into the work queue.
+  /// By default this also puts the element into the work queue. A resolved
+  /// handshake responder uses schedule=false until it has atomically attached
+  /// to a still-open EndpointRef.
   /// @param comms The element to register.
-  void registerCommElement(std::shared_ptr<CommElement> comms);
+  /// @param schedule Whether to enqueue the initial process() call.
+  void registerCommElement(
+      std::shared_ptr<CommElement> comms,
+      bool schedule = true);
 
   /// @brief Adds an already registered communication element to the work queue
   /// such that "process" will be called on it.

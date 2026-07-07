@@ -22,6 +22,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
@@ -35,8 +36,10 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
@@ -207,6 +210,109 @@ INSTANTIATE_TEST_SUITE_P(
     UcxExchangeTest,
     ::testing::ValuesIn(generateTestParams()),
     ExchangeTestParamsPrinter());
+
+TEST_P(UcxExchangeTest, duplicateHandshakeFloodIsBoundedBeforeServerCreation) {
+  const auto params = GetParam();
+  if (params.numSrcDrivers != 1 || params.numDstDrivers != 1 ||
+      params.numPartitions != 1 || params.numChunks != 100 ||
+      params.numUpstreamTasks != 1 || params.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "duplicate handshake flood runs once";
+  }
+
+  const auto prefix = getUniqueTaskPrefix();
+  const auto producerTaskId = prefix + "floodProducer";
+  queueManager_->removeTask(producerTaskId);
+  queueManager_->expectTask(
+      producerTaskId, 1, core::PartitionedOutputNode::Kind::kPartitioned);
+
+  const auto initialStats = queueManager_->registryStats();
+  const auto initialServers = UcxExchangeServer::testingLiveServerCount();
+  const auto initialResponders = Acceptor::testingActiveHandshakeResponders();
+  Acceptor::testingResetHandshakeResponderPeak();
+  Acceptor::testingSetHandshakeRespondersPaused(true);
+  auto unpauseResponders = folly::makeGuard(
+      []() { Acceptor::testingSetHandshakeRespondersPaused(false); });
+
+  constexpr size_t kClients = 64;
+  std::vector<std::shared_ptr<UcxExchangeClient>> clients;
+  clients.reserve(kClients);
+  const auto remoteUrl = fmt::format(
+      "http://127.0.0.1:{}/v1/task/{}/results/0",
+      kCommunicatorPort - 3,
+      producerTaskId);
+  for (size_t i = 0; i < kClients; ++i) {
+    auto client = std::make_shared<UcxExchangeClient>(
+        prefix + "floodConsumer" + std::to_string(i), 0, 1);
+    client->addRemoteTaskId(remoteUrl);
+    clients.push_back(std::move(client));
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  UcxOutputQueueManager::RegistryStats pausedStats;
+  bool observedFlood = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    pausedStats = queueManager_->registryStats();
+    if (pausedStats.totalDuplicateHandshakes >=
+            initialStats.totalDuplicateHandshakes + kClients - 1 &&
+        pausedStats.activeHandshakeReservations ==
+            initialStats.activeHandshakeReservations + 1) {
+      observedFlood = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto pausedResponders = Acceptor::testingActiveHandshakeResponders();
+  const auto peakResponders = Acceptor::testingPeakHandshakeResponders();
+  const auto pausedServers = UcxExchangeServer::testingLiveServerCount();
+  Acceptor::testingSetHandshakeRespondersPaused(false);
+  unpauseResponders.dismiss();
+
+  EXPECT_TRUE(observedFlood);
+  EXPECT_EQ(
+      pausedStats.activeHandshakeReservations,
+      initialStats.activeHandshakeReservations + 1);
+  EXPECT_EQ(pausedResponders, initialResponders + 1);
+  EXPECT_LE(peakResponders, initialResponders + 1);
+  EXPECT_EQ(pausedServers, initialServers);
+
+  const auto resumeDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (Acceptor::testingActiveHandshakeResponders() > initialResponders &&
+         std::chrono::steady_clock::now() < resumeDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(Acceptor::testingActiveHandshakeResponders(), initialResponders);
+  EXPECT_EQ(UcxExchangeServer::testingLiveServerCount(), initialServers + 1);
+
+  const auto serverReadyDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (queueManager_->registryStats().activeQueues !=
+             initialStats.activeQueues + 1 &&
+         std::chrono::steady_clock::now() < serverReadyDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(
+      queueManager_->registryStats().activeQueues,
+      initialStats.activeQueues + 1);
+
+  queueManager_->removeTask(producerTaskId);
+  const auto releaseDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while ((queueManager_->registryStats().activeHandshakeReservations !=
+              initialStats.activeHandshakeReservations ||
+          UcxExchangeServer::testingLiveServerCount() != initialServers) &&
+         std::chrono::steady_clock::now() < releaseDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  for (auto& client : clients) {
+    client->close();
+  }
+  EXPECT_EQ(
+      queueManager_->registryStats().activeHandshakeReservations,
+      initialStats.activeHandshakeReservations);
+  EXPECT_EQ(UcxExchangeServer::testingLiveServerCount(), initialServers);
+}
 
 TEST_P(UcxExchangeTest, basicTest) {
   VLOG(3) << "+ UcxExchangeTest::basicTest";
@@ -1021,7 +1127,10 @@ TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
   // Step 1: Create sink tasks and start them BEFORE initializeTask().
   // This triggers handshakes that create a placeholder queue in
   // UcxOutputQueueManager with intra-node potentially enabled.
-  queueManager_->expectTask(srcTaskId);
+  queueManager_->expectTask(
+      srcTaskId,
+      static_cast<uint32_t>(numDestinations),
+      core::PartitionedOutputNode::Kind::kBroadcast);
   std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
   for (int destId = 0; destId < numDestinations; ++destId) {
     const std::string sinkTaskId =

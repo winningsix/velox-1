@@ -19,13 +19,18 @@
 #include <velox/exec/Task.h>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 #include "velox/experimental/ucx-exchange/UcxTaskLifecycleRegistry.h"
 
 namespace facebook::velox::ucx_exchange {
 
-class UcxOutputQueueManager {
+class UcxOutputQueueManager
+    : public std::enable_shared_from_this<UcxOutputQueueManager> {
  public:
   struct RegistryStats {
     size_t activeQueues{0};
@@ -33,6 +38,10 @@ class UcxOutputQueueManager {
     size_t pendingUnknownRequests{0};
     size_t expectedTaskCapacity{0};
     size_t pendingRequestCapacity{0};
+    uint32_t maxDestinationsPerTask{0};
+    size_t activeHandshakeReservations{0};
+    size_t activeHandshakeCapacity{0};
+    size_t activeHandshakesPerTaskCapacity{0};
     uint64_t totalInitializeCalls{0};
     uint64_t totalRemoveCalls{0};
     uint64_t totalQueuesRemoved{0};
@@ -42,6 +51,47 @@ class UcxOutputQueueManager {
     uint64_t totalAdopted{0};
     uint64_t totalExpired{0};
     uint64_t totalRejected{0};
+    uint64_t totalHandshakeReservations{0};
+    uint64_t totalDuplicateHandshakes{0};
+    uint64_t totalHandshakeReservationRejected{0};
+  };
+
+  /// A live reservation for one admitted (task, destination, endpoint)
+  /// exchange server. The last owner releases it exactly once.
+  class HandshakeReservation {
+   public:
+    HandshakeReservation(const HandshakeReservation&) = delete;
+    HandshakeReservation& operator=(const HandshakeReservation&) = delete;
+    ~HandshakeReservation();
+
+   private:
+    friend class UcxOutputQueueManager;
+    HandshakeReservation(
+        std::weak_ptr<UcxOutputQueueManager> owner,
+        std::string taskId,
+        uint32_t destination,
+        uintptr_t endpointIdentity,
+        uint64_t reservationId);
+
+    std::weak_ptr<UcxOutputQueueManager> owner_;
+    const std::string taskId_;
+    const uint32_t destination_;
+    const uintptr_t endpointIdentity_;
+    // A manager-local incarnation. Task epochs are added by the follow-up
+    // TaskToken work, but this already prevents a retired reservation from
+    // erasing a newer reservation that reused the same wire tuple.
+    const uint64_t reservationId_;
+  };
+
+  struct HandshakeReservationResult {
+    std::shared_ptr<HandshakeReservation> reservation;
+    UcxTaskLifecycleRegistry::AdmissionRejectReason rejectReason{
+        UcxTaskLifecycleRegistry::AdmissionRejectReason::kNone};
+    UcxTaskLifecycleRegistry::TaskContract contract;
+
+    explicit operator bool() const {
+      return reservation != nullptr;
+    }
   };
 
   /// Factory method to retrieve a reference to the output queue manager.
@@ -60,9 +110,35 @@ class UcxOutputQueueManager {
   // no copy assignment.
   UcxOutputQueueManager& operator=(const UcxOutputQueueManager&) = delete;
 
-  /// Declares a task before initializeTask(). Early requests for undeclared
-  /// tasks are held only within the lifecycle registry's hard cap/deadline.
-  void expectTask(std::string_view taskId);
+  /// Declares an exact task output contract before initializeTask(). Early
+  /// handshakes for undeclared tasks are held only within the lifecycle
+  /// registry's hard cap/deadline.
+  void expectTask(
+      std::string_view taskId,
+      uint32_t destinationCount,
+      core::PartitionedOutputNode::Kind kind);
+
+  using HandshakeAdmissionResult = UcxTaskLifecycleRegistry::AdmissionResult;
+  using HandshakeRejectReason = UcxTaskLifecycleRegistry::AdmissionRejectReason;
+
+  /// Performs task and destination admission before Acceptor creates an
+  /// exchange server or acknowledges a handshake.
+  HandshakeAdmissionResult admitHandshake(
+      std::string_view taskId,
+      uint32_t destination,
+      UcxTaskLifecycleRegistry::Callback onAccepted,
+      UcxTaskLifecycleRegistry::RejectCallback onRejected);
+
+  /// Reserves bounded server state after task admission and before any
+  /// endpoint element or communicator work item is created. Duplicate keys
+  /// and global/per-task capacity exhaustion fail closed.
+  HandshakeReservationResult reserveHandshake(
+      std::string_view taskId,
+      uint32_t destination,
+      uintptr_t endpointIdentity);
+
+  std::optional<UcxTaskLifecycleRegistry::TaskContract> taskContract(
+      std::string_view taskId) const;
 
   /// @brief Initializes a task and creates the corresponding output queues that
   /// are associated with this task.
@@ -163,6 +239,31 @@ class UcxOutputQueueManager {
   std::optional<exec::OutputBuffer::Stats> stats(std::string_view taskId);
 
  private:
+  struct HandshakeReservationKey {
+    std::string taskId;
+    uint32_t destination;
+    uintptr_t endpointIdentity;
+
+    bool operator==(const HandshakeReservationKey& other) const {
+      return taskId == other.taskId && destination == other.destination &&
+          endpointIdentity == other.endpointIdentity;
+    }
+  };
+
+  struct HandshakeReservationKeyHash {
+    size_t operator()(const HandshakeReservationKey& key) const;
+  };
+
+  void releaseHandshake(
+      std::string_view taskId,
+      uint32_t destination,
+      uintptr_t endpointIdentity,
+      uint64_t reservationId) noexcept;
+  void releaseTaskHandshakes(std::string_view taskId) noexcept;
+  UcxTaskLifecycleRegistry::TaskContract reconcileOutputBufferContract(
+      std::string_view taskId,
+      uint32_t numBuffers);
+
   // Retrieves the queue for a task if it exists.
   // Returns NULL if task not found.
   std::shared_ptr<UcxOutputQueue> getQueueIfExists(std::string_view taskId);
@@ -176,6 +277,20 @@ class UcxOutputQueueManager {
       queues_;
 
   UcxTaskLifecycleRegistry taskLifecycle_;
+
+  const size_t activeHandshakeCapacity_;
+  const size_t activeHandshakesPerTaskCapacity_;
+  mutable std::mutex handshakeMutex_;
+  std::unordered_map<
+      HandshakeReservationKey,
+      uint64_t,
+      HandshakeReservationKeyHash>
+      activeHandshakes_;
+  std::unordered_map<std::string, size_t> activeHandshakesPerTask_;
+  uint64_t totalHandshakeReservations_{0};
+  uint64_t totalDuplicateHandshakes_{0};
+  uint64_t totalHandshakeReservationRejected_{0};
+  uint64_t nextHandshakeReservationId_{1};
 
   std::atomic<uint64_t> totalInitializeCalls_{0};
   std::atomic<uint64_t> totalRemoveCalls_{0};

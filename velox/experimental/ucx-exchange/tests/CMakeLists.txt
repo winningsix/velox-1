@@ -16,6 +16,7 @@ add_executable(
   ucx_exchange_test
   UcxOutputQueueManagerTest.cpp
   UcxOutputQueueLifecycleTest.cpp
+  UcxExchangeProtocolTest.cpp
   UcxExchangeTest.cpp
   IntraNodeTransferRegistryTest.cpp
   UcxTaskLifecycleRegistryTest.cpp
@@ -49,3 +50,28 @@ target_link_libraries(
   fmt::fmt
   ucxx::ucxx
 )
+
+# GCC toolset installations on CentOS can expose a newer compiler through an
+# older toolset path while CMake also injects an older system libstdc++ search
+# directory. Newer inline ABI helpers then live in libstdc++_nonshared but are
+# not selected by the generated link line. Ask the active compiler for its
+# matching compatibility archive instead of hard-coding a toolset version.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  execute_process(
+    COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++_nonshared.a
+    OUTPUT_VARIABLE LIBSTDCPP_NONSHARED
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if(EXISTS "${LIBSTDCPP_NONSHARED}")
+    # Pull every compatibility definition into the executable.  A plain
+    # archive entry can be emitted before transitive shared libraries (such as
+    # libcudf), in which case the linker has not seen their unresolved symbols
+    # yet and skips the required objects.
+    target_link_libraries(
+      ucx_exchange_test
+      "-Wl,--whole-archive"
+      "${LIBSTDCPP_NONSHARED}"
+      "-Wl,--no-whole-archive"
+    )
+  endif()
+endif()

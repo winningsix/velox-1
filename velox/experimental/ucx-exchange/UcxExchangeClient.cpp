@@ -76,6 +76,12 @@ bool UcxExchangeClient::waitForSourcesPrepared(
     std::vector<std::string> pending;
     {
       std::lock_guard<std::mutex> lock(queue_->mutex());
+      if (queue_->isInError()) {
+        if (detail != nullptr) {
+          *detail = "exchange source handshake failed";
+        }
+        return false;
+      }
       if (closed_) {
         if (detail != nullptr) {
           *detail = "exchange client closed during PREPARE";
@@ -85,10 +91,11 @@ bool UcxExchangeClient::waitForSourcesPrepared(
       sourceCount = sources_.size();
       for (const auto& source : sources_) {
         if (!source->isReceiverPrepared()) {
-          pending.push_back(fmt::format(
-              "{}(state={})",
-              source->toString(),
-              static_cast<uint32_t>(source->receiverState())));
+          pending.push_back(
+              fmt::format(
+                  "{}(state={})",
+                  source->toString(),
+                  static_cast<uint32_t>(source->receiverState())));
         }
       }
     }
@@ -97,13 +104,12 @@ bool UcxExchangeClient::waitForSourcesPrepared(
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       if (detail != nullptr) {
-        *detail = sourceCount == 0
-            ? "no UCX exchange sources were registered"
-            : fmt::format(
-                  "{} of {} source(s) not prepared: {}",
-                  pending.size(),
-                  sourceCount,
-                  fmt::join(pending, ", "));
+        *detail = sourceCount == 0 ? "no UCX exchange sources were registered"
+                                   : fmt::format(
+                                         "{} of {} source(s) not prepared: {}",
+                                         pending.size(),
+                                         sourceCount,
+                                         fmt::join(pending, ", "));
       }
       return false;
     }

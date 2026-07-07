@@ -108,5 +108,9 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
       communicators_;
   std::mutex commMutex_; // Protects communicators_
   std::atomic<size_t> commElementCount_{0};
+  // Published as soon as UCX reports endpoint closure. This prevents a
+  // deferred handshake admission callback from attaching a new work item to
+  // an endpoint after closeAndDrainCommunicators() has already drained it.
+  std::atomic<bool> acceptingCommElements_{true};
 };
 } // namespace facebook::velox::ucx_exchange

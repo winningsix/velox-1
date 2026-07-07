@@ -436,7 +436,7 @@ TEST_F(UcxOutputQueueManagerTest, v2OversizeRequestReturnsOneChunk) {
   queueManager_->removeTask(taskId);
 }
 
-TEST_F(UcxOutputQueueManagerTest, v2RemovedTaskReturnsNullAtRequestedSequence) {
+TEST_F(UcxOutputQueueManagerTest, v2TaskRemovalWakesAtRequestedSequence) {
   const std::string taskId = "v2RemovedTask";
   const int destination = 0;
   const int64_t requestedSequence = 7;
@@ -446,12 +446,30 @@ TEST_F(UcxOutputQueueManagerTest, v2RemovedTaskReturnsNullAtRequestedSequence) {
   task->requestAbort().wait();
   queueManager_->removeTask(taskId);
 
-  auto response = fetchV2Data(
+  // A retired wire task cannot be distinguished from a new incarnation until
+  // TaskToken epochs are added. New incarnations must therefore be declared
+  // before admission; removeTask then wakes the already-admitted waiter while
+  // preserving its requested sequence.
+  queueManager_->expectTask(
+      taskId, 1, core::PartitionedOutputNode::Kind::kPartitioned);
+  bool received = false;
+  FetchResponse response;
+  queueManager_->getData(
       taskId,
       destination,
       std::numeric_limits<uint64_t>::max(),
-      requestedSequence);
+      requestedSequence,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          int64_t receivedSequence,
+          std::vector<int64_t> remainingBytes) {
+        received = true;
+        response = FetchResponse{
+            std::move(data), receivedSequence, std::move(remainingBytes)};
+      });
+  EXPECT_FALSE(received);
+  queueManager_->removeTask(taskId);
 
+  EXPECT_TRUE(received);
   EXPECT_EQ(response.data, nullptr);
   EXPECT_EQ(response.sequence, requestedSequence);
   EXPECT_TRUE(response.remainingBytes.empty());
@@ -525,7 +543,10 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
 
   // Declare the producer lifecycle before its queue is initialized.
   queueManager_->removeTask(taskId);
-  queueManager_->expectTask(taskId);
+  queueManager_->expectTask(
+      taskId,
+      static_cast<uint32_t>(numPartitions),
+      core::PartitionedOutputNode::Kind::kPartitioned);
 
   // Fetch data from a non-existing task.
   struct Response {
@@ -638,7 +659,8 @@ TEST_F(UcxOutputQueueManagerTest, multiFetchers) {
 TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateBeforeInit) {
   const std::string taskId = "orphanTest";
   queueManager_->removeTask(taskId); // ensure clean state
-  queueManager_->expectTask(taskId);
+  queueManager_->expectTask(
+      taskId, 1, core::PartitionedOutputNode::Kind::kPartitioned);
 
   bool callbackFired = false;
   bool receivedNullptr = false;
@@ -715,6 +737,27 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
 }
 
 // --- Broadcast tests ---
+
+// A predeclared Spark contract can contain the final fanout before Velox
+// incrementally exposes the first buffers. Intermediate counts must not be
+// misclassified as an attempt to shrink the admitted contract.
+TEST_F(UcxOutputQueueManagerTest, broadcastPredeclaredFinalFanout) {
+  const std::string taskId = "broadcast-predeclared";
+  queueManager_->removeTask(taskId);
+  queueManager_->expectTask(
+      taskId, 4, core::PartitionedOutputNode::Kind::kBroadcast);
+
+  auto task = createSourceTask(taskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      1,
+      1 /* numDrivers */);
+
+  EXPECT_NO_THROW(queueManager_->updateOutputBuffers(taskId, 2, false));
+  EXPECT_NO_THROW(queueManager_->updateOutputBuffers(taskId, 4, true));
+  queueManager_->removeTask(taskId);
+}
 
 // Basic broadcast: enqueue data, all destinations receive the same data.
 TEST_F(UcxOutputQueueManagerTest, broadcastBasic) {

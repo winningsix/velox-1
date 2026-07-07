@@ -61,7 +61,13 @@ class UcxExchangeServer
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
       const PartitionKey& key,
-      bool isIntraNodeTransfer);
+      bool isIntraNodeTransfer,
+      std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+          handshakeReservation = nullptr);
+
+  ~UcxExchangeServer() override;
+
+  static size_t testingLiveServerCount();
 
   void process() override;
 
@@ -83,7 +89,9 @@ class UcxExchangeServer
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
       const PartitionKey& key,
-      bool isIntraNodeTransfer);
+      bool isIntraNodeTransfer,
+      std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+          handshakeReservation);
 
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
@@ -158,6 +166,10 @@ class UcxExchangeServer
   std::size_t bytes_;
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
+  // Bounds the number of live exchange servers and deduplicates repeated
+  // handshakes. Released on close/terminal or task retirement.
+  std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+      handshakeReservation_;
 };
 
 } // namespace facebook::velox::ucx_exchange

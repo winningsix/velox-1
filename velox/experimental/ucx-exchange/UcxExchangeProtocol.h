@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cinttypes>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -29,6 +30,20 @@
 /// supported.
 
 namespace facebook::velox::ucx_exchange {
+
+constexpr uint32_t kUcxExchangeProtocolVersion = 2;
+constexpr size_t kUcxHandshakeTaskIdCapacity = 256;
+constexpr size_t kUcxHandshakeMaxTaskIdLength = kUcxHandshakeTaskIdCapacity - 1;
+
+/// A wire task ID must be non-empty, NUL-free, and leave room for its
+/// terminator. Keeping this check shared prevents source-side truncation from
+/// producing a response tag that can never match the source's receive tag.
+bool isValidHandshakeTaskId(std::string_view taskId);
+
+/// Validates the fixed-size wire field. Besides requiring a non-empty,
+/// terminated ID, bytes after the first NUL must remain zero so two peers
+/// cannot hash different byte representations of the same task ID.
+bool isCanonicalHandshakeTaskIdBuffer(const char* taskId, size_t capacity);
 
 // Data and metadata tags are a uint64_t split into 3 fields, most-significant
 // first:
@@ -73,24 +88,46 @@ inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
 /// If the server's workerId matches, both are in the same process, enabling
 /// intra-node transfer via IntraNodeTransferRegistry instead of UCXX.
 struct HandshakeMsg {
-  char taskId[256];
-  uint32_t destination;
+  uint32_t protocolVersion{kUcxExchangeProtocolVersion};
+  char taskId[kUcxHandshakeTaskIdCapacity]{};
+  uint32_t destination{0};
   /// Unique identifier for the source's Communicator instance.
   /// Generated randomly at Communicator startup. The server compares this
   /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
 };
 
+enum class HandshakeStatus : uint8_t {
+  kAccepted = 0,
+  kInvalidRequest = 1,
+  kInvalidDestination = 2,
+  kDuplicateRequest = 3,
+  kAdmissionCapacity = 4,
+  kAdmissionExpired = 5,
+  kTaskRetired = 6,
+  kShuttingDown = 7,
+};
+
+std::string_view handshakeStatusName(HandshakeStatus status);
+
 /// @brief Response sent from server to source after handshake.
 /// Informs the source whether intra-node transfer optimization is available,
 /// allowing the source to bypass UCXX for all subsequent data transfers.
 struct HandshakeResponse {
+  uint32_t protocolVersion{kUcxExchangeProtocolVersion};
+  HandshakeStatus status{HandshakeStatus::kAccepted};
   /// True if server and source are on the same node (same Communicator).
   /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
   bool isIntraNodeTransfer{false};
-  /// Padding for alignment
-  uint8_t padding[7]{};
+  uint8_t padding[2]{};
+  /// Exact producer-side destination bound admitted for this task.
+  uint32_t destinationCount{0};
 };
+
+static_assert(sizeof(HandshakeMsg) == 272, "Unexpected handshake wire ABI");
+static_assert(
+    sizeof(HandshakeResponse) == 12,
+    "Unexpected handshake response wire ABI");
 
 constexpr uint32_t kMagicNumber = 0x12345678;
 /// Maximum metadata buffer size for receiving. This should be large enough

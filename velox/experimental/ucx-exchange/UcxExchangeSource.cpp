@@ -15,6 +15,8 @@
  */
 
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -121,6 +123,10 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
   int port = uri.port() + 3;
   std::shared_ptr<Communicator> communicator = Communicator::getInstance();
   auto key = extractTaskAndDestinationId(uri.path());
+  VELOX_CHECK(
+      isValidHandshakeTaskId(key.taskId),
+      "UCX remote task ID is invalid for the handshake protocol: {} bytes",
+      key.taskId.size());
   auto source = std::shared_ptr<UcxExchangeSource>(
       new UcxExchangeSource(communicator, taskId, host, port, key, queue));
   // register the exchange source with the communicator. This makes sure that
@@ -212,7 +218,8 @@ void UcxExchangeSource::process() {
       // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
       break;
     case ReceiverState::WaitingForReceiveCredit:
-      tryStartDataReceive(pendingReceive_, ReceiverState::WaitingForReceiveCredit);
+      tryStartDataReceive(
+          pendingReceive_, ReceiverState::WaitingForReceiveCredit);
       break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
@@ -344,13 +351,27 @@ PartitionKey UcxExchangeSource::extractTaskAndDestinationId(
   std::vector<folly::StringPiece> components;
   folly::split('/', path, components, true);
 
+  VELOX_CHECK_EQ(
+      components.size(), 5, "Malformed UCX task result URL path: {}", path);
   VELOX_CHECK_EQ(components[0], "v1");
   VELOX_CHECK_EQ(components[1], "task");
   VELOX_CHECK_EQ(components[3], "results");
 
   uint32_t destinationId;
   try {
-    destinationId = static_cast<uint32_t>(std::stoul(components[4].str()));
+    size_t consumed = 0;
+    const auto parsed = std::stoull(components[4].str(), &consumed);
+    VELOX_CHECK_EQ(
+        consumed,
+        components[4].size(),
+        "Illegal destination in task URL: {}",
+        path);
+    VELOX_CHECK_LE(
+        parsed,
+        std::numeric_limits<uint32_t>::max(),
+        "Destination exceeds uint32 range in task URL: {}",
+        path);
+    destinationId = static_cast<uint32_t>(parsed);
   } catch (const std::exception& e) {
     VELOX_UNSUPPORTED("Illegal destination in task URL: {}", path);
   }
@@ -413,14 +434,16 @@ void UcxExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {
 
 void UcxExchangeSource::sendHandshake() {
   std::shared_ptr<HandshakeMsg> handshakeReq = std::make_shared<HandshakeMsg>();
+  handshakeReq->protocolVersion = kUcxExchangeProtocolVersion;
   handshakeReq->destination = partitionKey_.destination;
-  // Use sizeof(...) - 1 and explicitly null-terminate to prevent buffer
-  // overread if taskId is longer than the destination buffer.
-  strncpy(
+  VELOX_CHECK(
+      isValidHandshakeTaskId(partitionKey_.taskId),
+      "UCX remote task ID is invalid for the handshake protocol");
+  std::memcpy(
       handshakeReq->taskId,
-      partitionKey_.taskId.c_str(),
-      sizeof(handshakeReq->taskId) - 1);
-  handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
+      partitionKey_.taskId.data(),
+      partitionKey_.taskId.size());
+  handshakeReq->taskId[partitionKey_.taskId.size()] = '\0';
   handshakeReq->workerId = communicator_->getWorkerId();
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-SEND] localTask=" << taskId_
@@ -628,8 +651,9 @@ bool UcxExchangeSource::tryStartDataReceive(
   //     flight on another stream; UCX writing into it corrupts memory and
   //     SIGSEGVs the process (observed crashing the driver at Q14).
   // cuda_memory_resource (raw cudaMalloc) returns fresh, never-reused memory
-  // that is valid immediately, so no stream sync is needed and there is no reuse
-  // race. These buffers are short-lived and bounded by queue receive credit.
+  // that is valid immediately, so no stream sync is needed and there is no
+  // reuse race. These buffers are short-lived and bounded by queue receive
+  // credit.
   static rmm::mr::cuda_memory_resource recvMemoryResource;
   try {
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
@@ -799,7 +823,6 @@ void UcxExchangeSource::onHandshakeResponse(
         ucs_status_string(status));
     VLOG(0) << errorMsg;
     queue_->setError(errorMsg);
-    deliverEndMarker();
     setState(ReceiverState::Done);
     communicator_->addToWorkQueue(getSelfPtr());
     return;
@@ -807,6 +830,36 @@ void UcxExchangeSource::onHandshakeResponse(
 
   std::shared_ptr<HandshakeResponse> response =
       std::static_pointer_cast<HandshakeResponse>(arg);
+
+  if (response == nullptr ||
+      response->protocolVersion != kUcxExchangeProtocolVersion ||
+      response->status != HandshakeStatus::kAccepted) {
+    const auto statusName = response == nullptr
+        ? std::string_view{"MISSING_RESPONSE"}
+        : (response->protocolVersion != kUcxExchangeProtocolVersion
+               ? std::string_view{"PROTOCOL_VERSION_MISMATCH"}
+               : handshakeStatusName(response->status));
+    const auto errorMsg = fmt::format(
+        "UCX handshake rejected for task {}, destination {}: {}",
+        partitionKey_.taskId,
+        partitionKey_.destination,
+        statusName);
+    queue_->setError(errorMsg);
+    setState(ReceiverState::Done);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+  if (partitionKey_.destination >= response->destinationCount) {
+    const auto errorMsg = fmt::format(
+        "UCX handshake accepted an invalid destination {} for task {} with bound {}",
+        partitionKey_.destination,
+        partitionKey_.taskId,
+        response->destinationCount);
+    queue_->setError(errorMsg);
+    setState(ReceiverState::Done);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
 
   isIntraNodeTransfer_ = response->isIntraNodeTransfer;
 

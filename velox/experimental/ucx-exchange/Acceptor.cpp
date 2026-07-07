@@ -21,7 +21,445 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
+#include <atomic>
+#include <cstring>
+#include <functional>
+#include <mutex>
+#include <vector>
+
 namespace facebook::velox::ucx_exchange {
+namespace {
+
+std::atomic<bool> gHandshakeRespondersPausedForTest{false};
+std::atomic<size_t> gActiveHandshakeResponders{0};
+std::atomic<size_t> gPeakHandshakeResponders{0};
+std::mutex gPausedHandshakeRespondersMutex;
+std::vector<std::function<void()>> gPausedHandshakeResponderWakeups;
+
+void incrementHandshakeResponders() {
+  const auto active =
+      gActiveHandshakeResponders.fetch_add(1, std::memory_order_acq_rel) + 1;
+  auto peak = gPeakHandshakeResponders.load(std::memory_order_acquire);
+  while (active > peak &&
+         !gPeakHandshakeResponders.compare_exchange_weak(
+             peak, active, std::memory_order_acq_rel)) {
+  }
+}
+
+HandshakeStatus protocolStatus(
+    UcxTaskLifecycleRegistry::AdmissionRejectReason reason) {
+  switch (reason) {
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kNone:
+      return HandshakeStatus::kAccepted;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kInvalidDestination:
+      return HandshakeStatus::kInvalidDestination;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kDuplicate:
+      return HandshakeStatus::kDuplicateRequest;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kCapacity:
+      return HandshakeStatus::kAdmissionCapacity;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kExpired:
+      return HandshakeStatus::kAdmissionExpired;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kRetired:
+      return HandshakeStatus::kTaskRetired;
+    case UcxTaskLifecycleRegistry::AdmissionRejectReason::kShutdown:
+      return HandshakeStatus::kShuttingDown;
+  }
+  return HandshakeStatus::kInvalidRequest;
+}
+
+void sendHandshakeResponse(
+    const std::shared_ptr<EndpointRef>& endpointRef,
+    const PartitionKey& key,
+    HandshakeStatus status,
+    bool isIntraNodeTransfer,
+    uint32_t destinationCount,
+    std::function<void()> onFailure = {}) {
+  auto response = std::make_shared<HandshakeResponse>();
+  response->protocolVersion = kUcxExchangeProtocolVersion;
+  response->status = status;
+  response->isIntraNodeTransfer =
+      status == HandshakeStatus::kAccepted && isIntraNodeTransfer;
+  response->destinationCount = destinationCount;
+
+  const auto responseTag = getHandshakeResponseTag(fnv1a_32(key.toString()));
+  endpointRef->endpoint_->tagSend(
+      response.get(),
+      sizeof(*response),
+      ucxx::Tag{responseTag},
+      false,
+      [response, keyString = key.toString(), onFailure = std::move(onFailure)](
+          ucs_status_t sendStatus, std::shared_ptr<void>) {
+        if (sendStatus != UCS_OK) {
+          LOG(ERROR) << "Failed to send UCX handshake response for "
+                     << keyString << ": " << ucs_status_string(sendStatus);
+          if (onFailure) {
+            onFailure();
+          }
+        }
+      },
+      response);
+}
+
+class PendingHandshake final
+    : public CommElement,
+      public std::enable_shared_from_this<PendingHandshake> {
+ public:
+  ~PendingHandshake() override {
+    uncountResponder();
+  }
+
+  static std::shared_ptr<PendingHandshake> create(
+      const std::shared_ptr<Communicator>& communicator,
+      const std::shared_ptr<EndpointRef>& endpointRef,
+      PartitionKey key,
+      uint64_t sourceWorkerId) {
+    return std::shared_ptr<PendingHandshake>(new PendingHandshake(
+        communicator, endpointRef, std::move(key), sourceWorkerId));
+  }
+
+  void accept(
+      UcxTaskLifecycleRegistry::TaskContract contract,
+      std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+          reservation) {
+    VELOX_CHECK_NOT_NULL(reservation);
+    resolve(HandshakeStatus::kAccepted, contract, std::move(reservation));
+  }
+
+  void reject(HandshakeStatus status) {
+    VELOX_CHECK_NE(
+        static_cast<uint32_t>(status),
+        static_cast<uint32_t>(HandshakeStatus::kAccepted));
+    resolve(status, {}, nullptr);
+  }
+
+  void process() override {
+    HandshakeStatus status;
+    UcxTaskLifecycleRegistry::TaskContract contract;
+    std::shared_ptr<UcxOutputQueueManager::HandshakeReservation> reservation;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (decision_ == Decision::kPending || processed_) {
+        return;
+      }
+      if (parkIfPausedForTest()) {
+        return;
+      }
+      processed_ = true;
+      status = status_;
+      contract = contract_;
+      reservation = reservation_;
+    }
+
+    bool isIntraNodeTransfer = false;
+    std::shared_ptr<UcxExchangeServer> exchangeServer;
+    if (status == HandshakeStatus::kAccepted) {
+      try {
+        auto queueMgr = UcxOutputQueueManager::getInstanceRef();
+        const auto currentContract = queueMgr->taskContract(key_.taskId);
+        if (!currentContract.has_value() ||
+            currentContract->outputKind != contract.outputKind ||
+            currentContract->destinationCount < contract.destinationCount ||
+            key_.destination >= currentContract->destinationCount) {
+          status = HandshakeStatus::kTaskRetired;
+          reservation.reset();
+          reservation_.reset();
+        } else {
+          // A broadcast contract may expand while this accepted response is
+          // queued. Report the current monotonic bound rather than treating a
+          // safe expansion as task replacement.
+          contract = *currentContract;
+        }
+      } catch (...) {
+        status = HandshakeStatus::kTaskRetired;
+        reservation.reset();
+        reservation_.reset();
+      }
+    }
+    if (status == HandshakeStatus::kAccepted) {
+      try {
+        auto queueMgr = UcxOutputQueueManager::getInstanceRef();
+        const bool sameWorker = sourceWorkerId_ == communicator_->getWorkerId();
+        isIntraNodeTransfer =
+            cudf_velox::CudfConfig::getInstance().intraNodeExchange &&
+            sameWorker && queueMgr->canUseIntraNode(key_.taskId);
+
+        exchangeServer = UcxExchangeServer::create(
+            communicator_,
+            endpointRef_,
+            key_,
+            isIntraNodeTransfer,
+            reservation);
+        if (!endpointRef_->addCommElem(exchangeServer)) {
+          status = HandshakeStatus::kShuttingDown;
+          isIntraNodeTransfer = false;
+        } else {
+          try {
+            communicator_->registerCommElement(exchangeServer);
+            reservation_.reset();
+          } catch (...) {
+            endpointRef_->removeCommElem(exchangeServer);
+            communicator_->unregister(exchangeServer);
+            exchangeServer.reset();
+            throw;
+          }
+        }
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to create admitted UCX exchange server for "
+                   << key_.toString() << ": " << error.what();
+        status = HandshakeStatus::kInvalidRequest;
+        isIntraNodeTransfer = false;
+      } catch (...) {
+        LOG(ERROR) << "Failed to create admitted UCX exchange server for "
+                   << key_.toString();
+        status = HandshakeStatus::kInvalidRequest;
+        isIntraNodeTransfer = false;
+      }
+    }
+
+    try {
+      std::weak_ptr<UcxExchangeServer> weakServer = exchangeServer;
+      sendHandshakeResponse(
+          endpointRef_,
+          key_,
+          status,
+          isIntraNodeTransfer,
+          contract.destinationCount,
+          [weakServer]() {
+            if (auto server = weakServer.lock()) {
+              server->close();
+            }
+          });
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to enqueue UCX handshake response for "
+                 << key_.toString() << ": " << error.what();
+      if (exchangeServer) {
+        exchangeServer->close();
+      }
+    } catch (...) {
+      LOG(ERROR) << "Failed to enqueue UCX handshake response for "
+                 << key_.toString();
+      if (exchangeServer) {
+        exchangeServer->close();
+      }
+    }
+    reservation_.reset();
+    finish();
+  }
+
+  void close() override {
+    std::shared_ptr<EndpointRef> endpoint;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (processed_) {
+        return;
+      }
+      processed_ = true;
+      decision_ = Decision::kResolved;
+      status_ = HandshakeStatus::kShuttingDown;
+      reservation_.reset();
+      endpoint = endpointRef_;
+    }
+    auto self = shared_from_this();
+    if (endpoint) {
+      endpoint->removeCommElem(self);
+    }
+    uncountResponder();
+    communicator_->unregister(self);
+  }
+
+ private:
+  enum class Decision : uint8_t { kPending, kResolved };
+
+  PendingHandshake(
+      const std::shared_ptr<Communicator>& communicator,
+      const std::shared_ptr<EndpointRef>& endpointRef,
+      PartitionKey key,
+      uint64_t sourceWorkerId)
+      : CommElement(communicator, endpointRef),
+        key_(std::move(key)),
+        sourceWorkerId_(sourceWorkerId) {}
+
+  void resolve(
+      HandshakeStatus status,
+      UcxTaskLifecycleRegistry::TaskContract contract,
+      std::shared_ptr<UcxOutputQueueManager::HandshakeReservation>
+          reservation) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (decision_ != Decision::kPending || processed_) {
+        return;
+      }
+      decision_ = Decision::kResolved;
+      status_ = status;
+      contract_ = contract;
+      reservation_ = std::move(reservation);
+    }
+
+    // Admission callbacks can run on the task thread, the lifecycle reaper,
+    // or a shutdown thread. They must not construct an exchange server or
+    // issue UCX operations. Registering this resolved responder is the only
+    // cross-thread action; process() performs all UCX work on the Communicator
+    // thread. No endpoint element or work item exists before this point.
+    auto self = shared_from_this();
+    bool registered = false;
+    bool attached = false;
+    try {
+      communicator_->registerCommElement(self, false);
+      registered = true;
+      countedResponder_.store(true, std::memory_order_release);
+      incrementHandshakeResponders();
+      attached = endpointRef_ && endpointRef_->addCommElem(self);
+      if (!attached) {
+        // Keep the one-shot responder alive and marshal an explicit reject to
+        // the progress thread. No exchange server is created on this path.
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_ = HandshakeStatus::kShuttingDown;
+        reservation_.reset();
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Endpoint teardown can call close() after addCommElem() and before
+        // this point. In that case close() already unregistered us.
+        if (processed_) {
+          return;
+        }
+      }
+      communicator_->addToWorkQueue(self);
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to register admitted UCX handshake responder for "
+                 << key_.toString() << ": " << error.what();
+      if (attached && endpointRef_) {
+        endpointRef_->removeCommElem(self);
+      }
+      if (registered) {
+        communicator_->unregister(self);
+      }
+      scheduleExplicitRegistrationFailure(self);
+    } catch (...) {
+      LOG(ERROR) << "Failed to register admitted UCX handshake responder for "
+                 << key_.toString();
+      if (attached && endpointRef_) {
+        endpointRef_->removeCommElem(self);
+      }
+      if (registered) {
+        communicator_->unregister(self);
+      }
+      scheduleExplicitRegistrationFailure(self);
+    }
+  }
+
+  void scheduleExplicitRegistrationFailure(
+      const std::shared_ptr<PendingHandshake>& self) noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (processed_) {
+        return;
+      }
+      status_ = HandshakeStatus::kInvalidRequest;
+      reservation_.reset();
+    }
+    // WorkQueue itself owns the responder until process(). This fallback is
+    // intentionally independent of the communicator registry, whose insertion
+    // just failed. All UCX work still happens on the progress thread.
+    try {
+      communicator_->addToWorkQueue(self);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      processed_ = true;
+    }
+  }
+
+  bool parkIfPausedForTest() {
+    if (!gHandshakeRespondersPausedForTest.load(std::memory_order_acquire)) {
+      return false;
+    }
+    std::lock_guard<std::mutex> pauseLock(gPausedHandshakeRespondersMutex);
+    // Synchronize with testingSetHandshakeRespondersPaused(false): if resume
+    // won the race, continue processing instead of parking without a wakeup.
+    if (!gHandshakeRespondersPausedForTest.load(std::memory_order_acquire)) {
+      return false;
+    }
+    if (!parkedForTest_) {
+      parkedForTest_ = true;
+      std::weak_ptr<PendingHandshake> weak = weak_from_this();
+      gPausedHandshakeResponderWakeups.emplace_back([weak]() {
+        if (auto responder = weak.lock()) {
+          responder->resumeFromTestPause();
+        }
+      });
+    }
+    return true;
+  }
+
+  void resumeFromTestPause() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      parkedForTest_ = false;
+      if (processed_) {
+        return;
+      }
+    }
+    communicator_->addToWorkQueue(shared_from_this());
+  }
+
+  void finish() {
+    auto self = shared_from_this();
+    reservation_.reset();
+    if (endpointRef_) {
+      endpointRef_->removeCommElem(self);
+    }
+    uncountResponder();
+    communicator_->unregister(self);
+    endpointRef_.reset();
+  }
+
+  void uncountResponder() noexcept {
+    if (countedResponder_.exchange(false, std::memory_order_acq_rel)) {
+      gActiveHandshakeResponders.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  }
+
+  const PartitionKey key_;
+  const uint64_t sourceWorkerId_;
+  std::mutex mutex_;
+  Decision decision_{Decision::kPending};
+  bool processed_{false};
+  bool parkedForTest_{false};
+  HandshakeStatus status_{HandshakeStatus::kInvalidRequest};
+  UcxTaskLifecycleRegistry::TaskContract contract_;
+  std::shared_ptr<UcxOutputQueueManager::HandshakeReservation> reservation_;
+  std::atomic<bool> countedResponder_{false};
+};
+
+} // namespace
+
+void Acceptor::testingSetHandshakeRespondersPaused(bool paused) {
+  std::vector<std::function<void()>> wakeups;
+  {
+    std::lock_guard<std::mutex> lock(gPausedHandshakeRespondersMutex);
+    gHandshakeRespondersPausedForTest.store(paused, std::memory_order_release);
+    if (!paused) {
+      wakeups.swap(gPausedHandshakeResponderWakeups);
+    }
+  }
+  for (auto& wakeup : wakeups) {
+    wakeup();
+  }
+}
+
+void Acceptor::testingResetHandshakeResponderPeak() {
+  gPeakHandshakeResponders.store(
+      gActiveHandshakeResponders.load(std::memory_order_acquire),
+      std::memory_order_release);
+}
+
+size_t Acceptor::testingActiveHandshakeResponders() {
+  return gActiveHandshakeResponders.load(std::memory_order_acquire);
+}
+
+size_t Acceptor::testingPeakHandshakeResponders() {
+  return gPeakHandshakeResponders.load(std::memory_order_acquire);
+}
 
 /*static*/
 void Acceptor::cStyleAMCallback(
@@ -33,15 +471,17 @@ void Acceptor::cStyleAMCallback(
   auto buffer =
       std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
   VELOX_CHECK_NOT_NULL(buffer, "AMCallback: failed to get receive buffer.");
-  // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
-  VELOX_CHECK_GE(
-      buffer->getSize(),
-      sizeof(HandshakeMsg),
-      "AMCallback: received buffer size ({}) is smaller than HandshakeMsg ({}). "
-      "Possible protocol mismatch or truncated message.",
-      buffer->getSize(),
-      sizeof(HandshakeMsg));
-  HandshakeMsg* handshakePtr = reinterpret_cast<HandshakeMsg*>(buffer->data());
+  // A versioned fixed-size request is required. Accepting a prefix would make
+  // an older peer's bytes look like a valid destination/worker contract. A
+  // malformed active message has no trustworthy response tag, so fail closed
+  // without terminating the progress process.
+  if (buffer->getSize() != sizeof(HandshakeMsg)) {
+    LOG(ERROR) << "Ignoring UCX handshake with size " << buffer->getSize()
+               << "; expected " << sizeof(HandshakeMsg);
+    return;
+  }
+  HandshakeMsg handshake;
+  std::memcpy(&handshake, buffer->data(), sizeof(handshake));
 
   // Create a exchangeServer based on the information received in the initial
   // handshake.
@@ -49,90 +489,72 @@ void Acceptor::cStyleAMCallback(
 
   auto epRef = communicator->findEndpointRefByHandle(ep);
   VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
-  const std::string peerAddress = epRef->getPeerAddress();
+  const auto taskIdLength = strnlen(handshake.taskId, sizeof(handshake.taskId));
+  const std::string taskId(handshake.taskId, taskIdLength);
+  const PartitionKey key{taskId, handshake.destination};
 
-  const PartitionKey key = {handshakePtr->taskId, handshakePtr->destination};
-
-  // Determine if this is an intra-process transfer by comparing the source's
-  // workerId with our Communicator's workerId. A match means both source and
-  // server are in the same Communicator singleton (same process), so
-  // IntraNodeTransferRegistry (in-process std::promise/future) can be used.
-  //
-  // Previous approach used IP comparison (getLocalIpAddresses), which fails
-  // when multiple Docker containers share the same host IP address.
-  const bool sameWorker = handshakePtr->workerId == communicator->getWorkerId();
-  bool isIntraNodeTransfer =
-      cudf_velox::CudfConfig::getInstance().intraNodeExchange && sameWorker;
-
-  // Disable intra-node until the task is initialized. Broadcast is safe after
-  // initialization because the intra-node source clones shared pages.
-  if (isIntraNodeTransfer) {
-    auto queueMgr = UcxOutputQueueManager::getInstanceRef();
-    const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
-    VLOG(2) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
-            << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshakePtr->workerId
-            << " localWorkerId=" << communicator->getWorkerId()
-            << " sameWorker=" << sameWorker
-            << " canUseIntraNode=" << canUseIntraNode
-            << " queue=" << queueMgr->describeQueueForIntraNode(key.taskId);
-    if (!canUseIntraNode) {
-      VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
-              << " (not initialized or broadcast)";
-      isIntraNodeTransfer = false;
-    }
-  } else {
-    VLOG(2) << "[UCX-ACCEPTOR-REMOTE] task=" << key.taskId
-            << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshakePtr->workerId
-            << " localWorkerId=" << communicator->getWorkerId()
-            << " sameWorker=" << sameWorker << " intraNodeEnabled="
-            << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
+  if (handshake.protocolVersion != kUcxExchangeProtocolVersion ||
+      !isCanonicalHandshakeTaskIdBuffer(
+          handshake.taskId, sizeof(handshake.taskId)) ||
+      !isValidHandshakeTaskId(taskId)) {
+    // This callback already runs on the Communicator/UCX progress thread.
+    // Immediate rejects are sent here so a reject flood cannot enqueue an
+    // unbounded number of responder work items while server reservations are
+    // exhausted.
+    sendHandshakeResponse(
+        epRef, key, HandshakeStatus::kInvalidRequest, false, 0);
+    return;
   }
 
-  auto exchangeServer =
-      UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
+  auto queueMgr = UcxOutputQueueManager::getInstanceRef();
+  auto pending =
+      PendingHandshake::create(communicator, epRef, key, handshake.workerId);
+  const auto reserveAndAccept = [pending,
+                                 queueMgr,
+                                 taskId = key.taskId,
+                                 destination = key.destination,
+                                 endpointIdentity = reinterpret_cast<uintptr_t>(
+                                     epRef.get())]() {
+    auto reservation =
+        queueMgr->reserveHandshake(taskId, destination, endpointIdentity);
+    if (!reservation) {
+      pending->reject(protocolStatus(reservation.rejectReason));
+      return;
+    }
+    pending->accept(reservation.contract, std::move(reservation.reservation));
+  };
+  const auto admission = queueMgr->admitHandshake(
+      key.taskId,
+      key.destination,
+      reserveAndAccept,
+      [pending](UcxTaskLifecycleRegistry::AdmissionRejectReason reason) {
+        pending->reject(protocolStatus(reason));
+      });
 
-  // Add this exchangeServer to the endpoint reference.
-  epRef->addCommElem(exchangeServer);
-
-  // Register exchangeServer with communicator.
-  communicator->registerCommElement(exchangeServer);
-  VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
-          << " peer=" << peerAddress
-          << " isIntraNodeTransfer=" << isIntraNodeTransfer;
-
-  // Send HandshakeResponse back to the source to inform about intra-node
-  // transfer. This allows the source to bypass UCXX for all subsequent data
-  // transfers.
-  auto response = std::make_shared<HandshakeResponse>();
-  response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
-
-  uint32_t keyHash = fnv1a_32(key.toString());
-  uint64_t responseTag = getHandshakeResponseTag(keyHash);
-
-  VLOG(3) << "Sending HandshakeResponse to " << key.toString()
-          << " peer=" << peerAddress
-          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
-          << " tag=" << std::hex << responseTag;
-
-  // Fire-and-forget: we don't need to track this request completion
-  epRef->endpoint_->tagSend(
-      response.get(),
-      sizeof(*response),
-      ucxx::Tag{responseTag},
-      false,
-      [response, keyStr = key.toString(), peerAddress](
-          ucs_status_t status, std::shared_ptr<void> arg) {
-        if (status == UCS_OK) {
-          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
-                  << " peer=" << peerAddress;
-        } else {
-          VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
-                  << ucs_status_string(status) << " peer=" << peerAddress;
-        }
-      },
-      response);
+  if (admission.disposition ==
+      UcxTaskLifecycleRegistry::RequestDisposition::kExpected) {
+    auto reservation = queueMgr->reserveHandshake(
+        key.taskId, key.destination, reinterpret_cast<uintptr_t>(epRef.get()));
+    if (!reservation) {
+      sendHandshakeResponse(
+          epRef,
+          key,
+          protocolStatus(reservation.rejectReason),
+          false,
+          reservation.contract.destinationCount);
+      return;
+    }
+    pending->accept(reservation.contract, std::move(reservation.reservation));
+  } else if (
+      admission.disposition ==
+      UcxTaskLifecycleRegistry::RequestDisposition::kRejected) {
+    sendHandshakeResponse(
+        epRef,
+        key,
+        protocolStatus(admission.rejectReason),
+        false,
+        admission.contract.destinationCount);
+  }
 }
 
 // Add endpoint reference to ucp_cp -> epRef map.

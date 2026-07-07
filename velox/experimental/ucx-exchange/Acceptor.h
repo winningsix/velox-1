@@ -21,15 +21,22 @@
 
 namespace facebook::velox::ucx_exchange {
 
-/// @brief The acceptor creates a new UcxExchangeServer each time a handshake
-/// message is received. Handshakes are sent as active messages, using a
-/// worker-wide handler. The acceptor is a passive component that is used by the
+/// @brief The acceptor admits and reserves bounded state before creating a
+/// UcxExchangeServer. Handshakes are sent as active messages, using a
+/// worker-wide handler. The acceptor is a passive component used by the
 /// Communicator.
 struct Acceptor {
   // The static callback function for incoming handshake requests.
   static void cStyleAMCallback(
       std::shared_ptr<ucxx::Request> request,
       ucp_ep_h ep);
+
+  // Test controls/observability for proving that a paused Communicator cannot
+  // accumulate responders beyond the reservation cap.
+  static void testingSetHandshakeRespondersPaused(bool paused);
+  static void testingResetHandshakeResponderPeak();
+  static size_t testingActiveHandshakeResponders();
+  static size_t testingPeakHandshakeResponders();
 
   /// @brief Adds the endpoint reference to the handleToEndpointRef_ map such
   /// that endpoint handles can be resolved

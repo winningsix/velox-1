@@ -25,6 +25,7 @@ DEFINE_int32(
     exchange_log_level,
     0,
     "VLOG level for ucx-exchange modules (0=silent, 1-3=increasing verbosity)");
+DEFINE_bool(velox_ucx_exchange, true, "Enable UCX exchange in tests.");
 
 // This main is needed for some tests on linux.
 int main(int argc, char** argv) {
