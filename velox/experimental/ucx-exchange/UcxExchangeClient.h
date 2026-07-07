@@ -18,6 +18,8 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
+#include <chrono>
+#include <functional>
 #include <unordered_set>
 
 namespace facebook::velox::ucx_exchange {
@@ -55,6 +57,14 @@ class UcxExchangeClient
   void addRemoteTaskId(std::string_view remoteTaskId);
 
   void noMoreRemoteTasks();
+
+  /// Wait until all registered sources have completed their receiver
+  /// handshakes. This is a PREPARE-only control-plane operation; data remains
+  /// blocked because MPP driver execution is still gated.
+  bool waitForSourcesPrepared(
+      std::chrono::milliseconds timeout,
+      const std::function<bool()>& cancelled,
+      std::string* detail = nullptr) const;
 
   // Closes all exchange sources.
   void close();

@@ -304,6 +304,23 @@ void UcxExchangeSource::resumeFromBackpressure() {
   }
 }
 
+bool UcxExchangeSource::isReceiverPrepared() const {
+  switch (state_.load(std::memory_order_acquire)) {
+    case ReceiverState::ReadyToReceive:
+    case ReceiverState::WaitingForMetadata:
+    case ReceiverState::WaitingForReceiveCredit:
+    case ReceiverState::WaitingForData:
+    case ReceiverState::WaitingForIntraNodeData:
+      return true;
+    case ReceiverState::Created:
+    case ReceiverState::WaitingForHandshakeComplete:
+    case ReceiverState::WaitingForHandshakeResponse:
+    case ReceiverState::Done:
+      return false;
+  }
+  return false;
+}
+
 folly::F14FastMap<std::string, int64_t> UcxExchangeSource::stats() const {
   VELOX_UNREACHABLE();
 }

@@ -18,6 +18,9 @@
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 
+#include <fmt/ranges.h>
+#include <thread>
+
 namespace facebook::velox::ucx_exchange {
 
 void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
@@ -55,6 +58,57 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
 void UcxExchangeClient::noMoreRemoteTasks() {
   VLOG(3) << "@" << taskId_ << " UcxExchangeClient::noMoreRemoteTasks called.";
   queue_->noMoreSources();
+}
+
+bool UcxExchangeClient::waitForSourcesPrepared(
+    std::chrono::milliseconds timeout,
+    const std::function<bool()>& cancelled,
+    std::string* detail) const {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    if (cancelled && cancelled()) {
+      if (detail != nullptr) {
+        *detail = "receiver PREPARE was cancelled";
+      }
+      return false;
+    }
+    size_t sourceCount = 0;
+    std::vector<std::string> pending;
+    {
+      std::lock_guard<std::mutex> lock(queue_->mutex());
+      if (closed_) {
+        if (detail != nullptr) {
+          *detail = "exchange client closed during PREPARE";
+        }
+        return false;
+      }
+      sourceCount = sources_.size();
+      for (const auto& source : sources_) {
+        if (!source->isReceiverPrepared()) {
+          pending.push_back(fmt::format(
+              "{}(state={})",
+              source->toString(),
+              static_cast<uint32_t>(source->receiverState())));
+        }
+      }
+    }
+    if (sourceCount > 0 && pending.empty()) {
+      return true;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      if (detail != nullptr) {
+        *detail = sourceCount == 0
+            ? "no UCX exchange sources were registered"
+            : fmt::format(
+                  "{} of {} source(s) not prepared: {}",
+                  pending.size(),
+                  sourceCount,
+                  fmt::join(pending, ", "));
+      }
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 void UcxExchangeClient::close() {

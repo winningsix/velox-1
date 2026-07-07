@@ -20,6 +20,8 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -133,5 +135,16 @@ class OperatorAdapterRegistry {
 /// This function should be called from registerCudf() to register all
 /// operator adapters with the registry.
 void registerAllOperatorAdapters();
+
+/// Register the remote task URLs with the UCX client created for a prepared
+/// exchange operator, then wait for every receiver handshake. Returns false
+/// when the task/node is not backed by the UCX adapter or readiness times out.
+bool prepareUcxExchangeSources(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskUrls,
+    std::chrono::milliseconds timeout,
+    const std::function<bool()>& cancelled,
+    std::string* detail = nullptr);
 
 } // namespace facebook::velox::cudf_velox

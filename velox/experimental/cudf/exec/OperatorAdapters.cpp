@@ -79,26 +79,26 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
-struct TaskPipelineKey {
+struct TaskExchangeKey {
   std::string taskId;
-  int pipelineId;
+  core::PlanNodeId planNodeId;
 
-  bool operator==(const TaskPipelineKey& other) const {
-    return taskId == other.taskId && pipelineId == other.pipelineId;
+  bool operator==(const TaskExchangeKey& other) const {
+    return taskId == other.taskId && planNodeId == other.planNodeId;
   }
 
   struct Hash {
-    std::size_t operator()(const TaskPipelineKey& key) const {
+    std::size_t operator()(const TaskExchangeKey& key) const {
       return std::hash<std::string>{}(key.taskId) ^
-          (std::hash<int>{}(key.pipelineId) << 1);
+          (std::hash<std::string>{}(key.planNodeId) << 1);
     }
   };
 };
 
 using UcxExchangeClientMap = std::unordered_map<
-    TaskPipelineKey,
+    TaskExchangeKey,
     std::weak_ptr<ucx_exchange::UcxExchangeClient>,
-    TaskPipelineKey::Hash>;
+    TaskExchangeKey::Hash>;
 
 UcxExchangeClientMap& getUcxExchangeClientMap() {
   static UcxExchangeClientMap instance;
@@ -111,6 +111,46 @@ std::mutex& getUcxExchangeClientMapMutex() {
 }
 
 } // namespace
+
+bool prepareUcxExchangeSources(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskUrls,
+    std::chrono::milliseconds timeout,
+    const std::function<bool()>& cancelled,
+    std::string* detail) {
+  std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
+  {
+    std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
+    auto& clientMap = getUcxExchangeClientMap();
+    const auto it = clientMap.find(TaskExchangeKey{taskId, planNodeId});
+    if (it == clientMap.end() || !(client = it->second.lock())) {
+      if (it != clientMap.end()) {
+        clientMap.erase(it);
+      }
+      if (detail != nullptr) {
+        *detail = "UCX exchange client was not created for the prepared task/node";
+      }
+      return false;
+    }
+  }
+
+  for (const auto& remoteTaskUrl : remoteTaskUrls) {
+    client->addRemoteTaskId(remoteTaskUrl);
+  }
+  client->noMoreRemoteTasks();
+  // A consumer replica may legitimately own no destinations (for example
+  // when the partition count is smaller than the local replica count). The
+  // adapter client exists and has observed noMoreRemoteTasks(), so this is a
+  // fully prepared, immediately-complete receiver rather than an error.
+  if (remoteTaskUrls.empty()) {
+    if (detail != nullptr) {
+      *detail = "prepared empty UCX receiver";
+    }
+    return true;
+  }
+  return client->waitForSourcesPrepared(timeout, cancelled, detail);
+}
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -1278,7 +1318,7 @@ class ExchangeAdapter : public OperatorAdapter {
                  << " node=" << planNode->id();
 
     std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
-    auto key = TaskPipelineKey{op->taskId(), ctx->pipelineId};
+    auto key = TaskExchangeKey{op->taskId(), planNode->id()};
     {
       std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
       auto& clientMap = getUcxExchangeClientMap();

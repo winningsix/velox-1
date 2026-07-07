@@ -113,6 +113,16 @@ class UcxExchangeSource
   /// Uses CAS to ensure exactly one wake-up per dormant period.
   void resumeFromBackpressure();
 
+  /// True once the receiver handshake has completed and the source has posted
+  /// (or is ready to post) its first metadata receive. MPP PREPARE uses this to
+  /// prove that every consumer endpoint exists before any producer driver is
+  /// released by START.
+  bool isReceiverPrepared() const;
+
+  ReceiverState receiverState() const {
+    return state_.load(std::memory_order_acquire);
+  }
+
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
