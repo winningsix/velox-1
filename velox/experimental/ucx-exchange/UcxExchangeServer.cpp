@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
-#include <algorithm>
 #include <glog/logging.h>
 #include <malloc.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -499,12 +499,12 @@ void UcxExchangeServer::sendData() {
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
+    const bool useHostStaging = !communicator_->hasCudaTransport();
     std::shared_ptr<DataSendContext> dataCtx;
     if (dataPtr_) {
-      const auto hostBytes =
-          static_cast<int64_t>(dataPtr_->gpu_data->size());
+      const auto hostBytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
       dataCtx = std::make_shared<DataSendContext>();
-      if (!dataCtx->reserveHostBytes(hostBytes)) {
+      if (useHostStaging && !dataCtx->reserveHostBytes(hostBytes)) {
         // Keep dataPtr_ and state=DataReady.  Completed UCX callbacks release
         // process-wide credit; requeueing lets this server retry without
         // dequeuing or staging another packed table.
@@ -611,29 +611,36 @@ void UcxExchangeServer::sendData() {
       // it after the DMA completes, while the Request (and context shell)
       // stays alive for UCP wireup replay.
       dataCtx->data = dataPtr_;
-      dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
-      const auto producerStream = dataCtx->data->gpu_data->stream();
-      CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
-      CUDF_CUDA_TRY(cudaMemcpy(
-          dataCtx->hostData->data(),
-          dataCtx->data->gpu_data->data(),
-          bytes_,
-          cudaMemcpyDeviceToHost));
+      void* sendBuffer = dataCtx->data->gpu_data->data();
+      if (useHostStaging) {
+        dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
+        const auto producerStream = dataCtx->data->gpu_data->stream();
+        CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
+        CUDF_CUDA_TRY(cudaMemcpy(
+            dataCtx->hostData->data(),
+            dataCtx->data->gpu_data->data(),
+            bytes_,
+            cudaMemcpyDeviceToHost));
+        sendBuffer = dataCtx->hostData->data();
+      }
+      VLOG(2) << "@" << partitionKey_.taskId << " posting "
+              << (useHostStaging ? "host-staged" : "direct-device")
+              << " send for " << bytes_ << " bytes";
 
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataCtx->hostData->data(),
+          sendBuffer,
           static_cast<size_t>(bytes_),
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-            // Release both payload buffers from the context.  completedRequests_
-            // deliberately retains the UCXX Request (and therefore callbackData)
-            // for wireup replay safety, so leaving hostData in this context leaks
-            // one complete host-staging copy per batch until the exchange server
-            // is destroyed.  Large MPP exchanges otherwise consume hundreds of
-            // GiB even though every send has completed.  The callback means UCX
-            // has finished with both payloads; only the empty context shell must
-            // remain alive with the Request.
+            // Release both payload buffers from the context. completedRequests_
+            // deliberately retains the UCXX Request (and therefore
+            // callbackData) for wireup replay safety, so leaving hostData in
+            // this context leaks one complete host-staging copy per batch until
+            // the exchange server is destroyed.  Large MPP exchanges otherwise
+            // consume hundreds of GiB even though every send has completed. The
+            // callback means UCX has finished with both payloads; only the
+            // empty context shell must remain alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             auto dataHolder = std::move(ctx->data);
             auto hostDataHolder = std::move(ctx->hostData);

@@ -330,7 +330,8 @@ void UcxExchangeSource::process() {
       // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
       break;
     case ReceiverState::WaitingForReceiveCredit:
-      tryStartDataReceive(pendingReceive_, ReceiverState::WaitingForReceiveCredit);
+      tryStartDataReceive(
+          pendingReceive_, ReceiverState::WaitingForReceiveCredit);
       break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
@@ -625,8 +626,7 @@ void UcxExchangeSource::getMetadata() {
       ucxx::TagMaskFull,
       false,
       [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        auto metadata =
-            std::static_pointer_cast<std::vector<uint8_t>>(arg);
+        auto metadata = std::static_pointer_cast<std::vector<uint8_t>>(arg);
         if (auto self = weak.lock()) {
           self->onMetadata(status, metadata);
         }
@@ -722,7 +722,8 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
   reservedReceiveBytes_ = ptr->metadata.dataSizeBytes;
 
-  if (!tryReserveRecvHostBytes(ptr->metadata.dataSizeBytes)) {
+  const bool useHostStaging = !communicator_->hasCudaTransport();
+  if (useHostStaging && !tryReserveRecvHostBytes(ptr->metadata.dataSizeBytes)) {
     queue_->releaseReservedReceive(reservedReceiveBytes_);
     reservedReceiveBytes_ = 0;
     if (getState() == expectedState) {
@@ -734,7 +735,9 @@ bool UcxExchangeSource::tryStartDataReceive(
     communicator_->addToWorkQueue(getSelfPtr());
     return false;
   }
-  reservedGlobalHostReceiveBytes_ = ptr->metadata.dataSizeBytes;
+  if (useHostStaging) {
+    reservedGlobalHostReceiveBytes_ = ptr->metadata.dataSizeBytes;
+  }
 
   if (!hasRecvDeviceCredit(ptr->metadata.dataSizeBytes)) {
     releaseReceiveReservation();
@@ -752,26 +755,31 @@ bool UcxExchangeSource::tryStartDataReceive(
       facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   ptr->stream = stream;
 
-  // Receive buffers MUST come from a dedicated, synchronous, fresh-memory
-  // resource — NOT the shared RMM pool. UCX RDMA-writes this buffer from the
-  // progress thread, out of band of any CUDA stream. The two pool-based
-  // alternatives both fail:
-  //   * pool alloc + stream.synchronize() -> deadlocks the UCX progress thread
-  //     (hang on heavy multi-fragment queries, e.g. Q18).
-  //   * pool alloc + no synchronize -> the pool may hand back a block still in
-  //     flight on another stream; UCX writing into it corrupts memory and
-  //     SIGSEGVs the process (observed crashing the driver at Q14).
-  // cuda_memory_resource (raw cudaMalloc) returns fresh, never-reused memory
-  // that is valid immediately, so no stream sync is needed and there is no reuse
-  // race. These buffers are short-lived and bounded by queue receive credit.
+  // A CUDA-aware receive uses the same async/pool resource as cuDF compute.
+  // Allocating every packet with raw cudaMalloc globally synchronizes the
+  // device and dominates large shuffles. Synchronize only this receive stream
+  // after the allocation so UCX cannot write into a block whose stream-ordered
+  // reuse is still pending. The packed page keeps this stream through the
+  // consumer handoff.
+  //
+  // Without a CUDA transport, keep using fresh synchronous memory. The host
+  // fallback copies into it with cudaMemcpy and does not need to compete with
+  // cuDF's async pool.
   try {
-    auto& recvMemoryResource = receiveDeviceMemoryResource();
-    ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-        ptr->metadata.dataSizeBytes,
-        stream,
-        cuda::mr::any_resource<cuda::mr::device_accessible>{
-            recvMemoryResource});
+    if (useHostStaging) {
+      auto& recvMemoryResource = receiveDeviceMemoryResource();
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes,
+          stream,
+          cuda::mr::any_resource<cuda::mr::device_accessible>{
+              recvMemoryResource});
+    } else {
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes, stream);
+      stream.synchronize();
+    }
     if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+      auto& recvMemoryResource = receiveDeviceMemoryResource();
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
       const auto peakBucket = bytes.peak / kReportStep;
@@ -790,21 +798,22 @@ bool UcxExchangeSource::tryStartDataReceive(
       }
       if (crossedPeakBucket ||
           ptr->metadata.dataSizeBytes >= static_cast<uint64_t>(64) << 20) {
-        facebook::velox::cudf_velox::logDeviceMemorySnapshot(fmt::format(
-            "operator=UcxExchangeSource state=receive.allocate "
-            "task={} remoteTask={} destination={} allocationBytes={} "
-            "ucxRecvCurrentBytes={} ucxRecvPeakBytes={} "
-            "ucxRecvTotalBytes={} queueBytes={} pendingReceiveBytes={} cap={}",
-            taskId_,
-            partitionKey_.taskId,
-            partitionKey_.destination,
-            ptr->metadata.dataSizeBytes,
-            bytes.value,
-            bytes.peak,
-            bytes.total,
-            stats.queuedBytes,
-            stats.pendingReceiveBytes,
-            maxInFlightRecvBytes()));
+        facebook::velox::cudf_velox::logDeviceMemorySnapshot(
+            fmt::format(
+                "operator=UcxExchangeSource state=receive.allocate "
+                "task={} remoteTask={} destination={} allocationBytes={} "
+                "ucxRecvCurrentBytes={} ucxRecvPeakBytes={} "
+                "ucxRecvTotalBytes={} queueBytes={} pendingReceiveBytes={} cap={}",
+                taskId_,
+                partitionKey_.taskId,
+                partitionKey_.destination,
+                ptr->metadata.dataSizeBytes,
+                bytes.value,
+                bytes.peak,
+                bytes.total,
+                stats.queuedBytes,
+                stats.pendingReceiveBytes,
+                maxInFlightRecvBytes()));
       }
     }
   } catch (const rmm::bad_alloc& e) {
@@ -821,17 +830,24 @@ bool UcxExchangeSource::tryStartDataReceive(
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
           << " bytes of device memory";
 
-  // UCX without CUDA transports must receive into host memory.  Receiving
-  // directly into dataBuf lets the sm/tcp transports write through a device
-  // pointer and crashes the executor.  The completed host buffer is copied to
-  // the cuDF device buffer in onData before unpacking.
-  const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
-  if (dataReceiveBuffer_ == nullptr) {
-    dataReceiveBuffer_ = std::make_shared<std::vector<uint8_t>>(receiveSize);
-  } else if (dataReceiveBuffer_->size() < receiveSize) {
-    dataReceiveBuffer_->resize(receiveSize);
+  // CUDA-aware transports can receive directly into the final device buffer.
+  // Only stage through host memory when the active UCX context has confirmed
+  // that no CUDA transport is available; sm/tcp cannot write through a device
+  // pointer safely in that configuration.
+  void* receiveBuffer = ptr->dataBuf->data();
+  if (useHostStaging) {
+    const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
+    if (dataReceiveBuffer_ == nullptr) {
+      dataReceiveBuffer_ = std::make_shared<std::vector<uint8_t>>(receiveSize);
+    } else if (dataReceiveBuffer_->size() < receiveSize) {
+      dataReceiveBuffer_->resize(receiveSize);
+    }
+    ptr->hostData = dataReceiveBuffer_;
+    receiveBuffer = ptr->hostData->data();
   }
-  ptr->hostData = dataReceiveBuffer_;
+  VLOG(2) << toString() << " posting "
+          << (useHostStaging ? "host-staged" : "direct-device")
+          << " receive for " << ptr->metadata.dataSizeBytes << " bytes";
 
   uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
   VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
@@ -846,7 +862,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
   request_ = endpointRef_->endpoint_->tagRecv(
-      ptr->hostData->data(),
+      receiveBuffer,
       ptr->metadata.dataSizeBytes,
       ucxx::Tag{dataTag},
       ucxx::TagMaskFull,
@@ -902,19 +918,20 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     std::shared_ptr<DataAndMetadata> ptr =
         std::static_pointer_cast<DataAndMetadata>(arg);
 
-    CUDF_CUDA_TRY(cudaMemcpy(
-        ptr->dataBuf->data(),
-        ptr->hostData->data(),
-        ptr->metadata.dataSizeBytes,
-        cudaMemcpyHostToDevice));
-    ptr->hostData.reset();
-    if (reservedGlobalHostReceiveBytes_ > 0) {
-      releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
-      reservedGlobalHostReceiveBytes_ = 0;
+    if (ptr->hostData != nullptr) {
+      CUDF_CUDA_TRY(cudaMemcpy(
+          ptr->dataBuf->data(),
+          ptr->hostData->data(),
+          ptr->metadata.dataSizeBytes,
+          cudaMemcpyHostToDevice));
+      ptr->hostData.reset();
+      if (reservedGlobalHostReceiveBytes_ > 0) {
+        releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+        reservedGlobalHostReceiveBytes_ = 0;
+      }
     }
-    // The source-level pageable staging buffer is intentionally retained and
-    // reused by the next serial receive, so there is no host allocation to
-    // trim here.
+    // The source-level pageable fallback buffer is intentionally retained and
+    // reused by the next serial host-staged receive.
 
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);

@@ -118,11 +118,12 @@ class UcxExchangeSource
   static constexpr int32_t kBackpressureLowWaterMark = 16;
 
   // Aggregate in-flight RECEIVE byte cap (in addition to the count caps above).
-  // Receive buffers are allocated off the operator memory pool (raw cudaMalloc
-  // via a process-global resource), so without a byte bound the per-peer
-  // in-flight buffers (one UcxExchangeSource per producer peer) scale
-  // O(#peers) and collectively exhaust the GPU at 4 peers (OOM at
-  // concurrentGpuTasks=2, deadlock at =1). Read once; env-overridable via
+  // Each source can own a queued device buffer independently of downstream
+  // consumption. Without a byte bound these buffers (one UcxExchangeSource per
+  // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
+  // (OOM at concurrentGpuTasks=2, deadlock at =1). CUDA-aware transports use
+  // the current cuDF memory resource; the host fallback uses fresh cudaMalloc
+  // memory. Read once; env-overridable via
   // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
   static int64_t maxInFlightRecvBytes();
 
