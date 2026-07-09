@@ -755,31 +755,22 @@ bool UcxExchangeSource::tryStartDataReceive(
       facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   ptr->stream = stream;
 
-  // A CUDA-aware receive uses the same async/pool resource as cuDF compute.
-  // Allocating every packet with raw cudaMalloc globally synchronizes the
-  // device and dominates large shuffles. Synchronize only this receive stream
-  // after the allocation so UCX cannot write into a block whose stream-ordered
-  // reuse is still pending. The packed page keeps this stream through the
-  // consumer handoff.
+  // UCX writes receive buffers from its progress thread, outside CUDA stream
+  // ordering. Keep these buffers on a dedicated synchronous resource so UCX
+  // can never write into a block that a stream-ordered pool has recycled while
+  // work on another stream is still in flight. This also avoids waiting on an
+  // unrelated compute stream in the single UCX progress thread.
   //
-  // Without a CUDA transport, keep using fresh synchronous memory. The host
-  // fallback copies into it with cudaMemcpy and does not need to compete with
-  // cuDF's async pool.
+  // Only transports without CUDA support stage through host memory and use a
+  // fresh synchronous device allocation for the final copy.
   try {
-    if (useHostStaging) {
-      auto& recvMemoryResource = receiveDeviceMemoryResource();
-      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-          ptr->metadata.dataSizeBytes,
-          stream,
-          cuda::mr::any_resource<cuda::mr::device_accessible>{
-              recvMemoryResource});
-    } else {
-      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-          ptr->metadata.dataSizeBytes, stream);
-      stream.synchronize();
-    }
+    auto& recvMemoryResource = receiveDeviceMemoryResource();
+    ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+        ptr->metadata.dataSizeBytes,
+        stream,
+        cuda::mr::any_resource<cuda::mr::device_accessible>{
+            recvMemoryResource});
     if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
-      auto& recvMemoryResource = receiveDeviceMemoryResource();
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
       const auto peakBucket = bytes.peak / kReportStep;

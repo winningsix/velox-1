@@ -121,9 +121,10 @@ class UcxExchangeSource
   // Each source can own a queued device buffer independently of downstream
   // consumption. Without a byte bound these buffers (one UcxExchangeSource per
   // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
-  // (OOM at concurrentGpuTasks=2, deadlock at =1). CUDA-aware transports use
-  // the current cuDF memory resource; the host fallback uses fresh cudaMalloc
-  // memory. Read once; env-overridable via
+  // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use a
+  // dedicated fresh cudaMalloc resource so UCX writes cannot race with
+  // stream-ordered reuse in the cuDF compute pool. Read once; env-overridable
+  // via
   // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
   static int64_t maxInFlightRecvBytes();
 
