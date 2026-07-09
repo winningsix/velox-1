@@ -298,8 +298,7 @@ bool isComparisonOp(const cudf::ast::ast_operator op) {
   }
 }
 
-bool isTopLevelFieldReference(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+bool isTopLevelFieldReference(const std::shared_ptr<velox::exec::Expr>& expr) {
   using velox::exec::FieldReference;
   auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr);
   if (!fieldExpr || !fieldExpr->inputs().empty()) {
@@ -717,12 +716,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       }
       auto node = createCudfExpression(expr, inputRowSchema[sideIdx]);
       return addPrecomputeInstructionOnSide(
-          sideIdx,
-          0,
-          name,
-          "",
-          node,
-          veloxToCudfDataType(expr->type()));
+          sideIdx, 0, name, "", node, veloxToCudfDataType(expr->type()));
     }
     VELOX_FAIL("Unsupported expression: {}", name);
   }
@@ -779,7 +773,8 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     // that child resolves to BOOL8. Materialize such children as temporary
     // cuDF columns. This preserves Spark null-safe semantics and remains an
     // entirely GPU execution path.
-    auto pushNullEqualOperand = [&](const std::shared_ptr<velox::exec::Expr>& input)
+    auto pushNullEqualOperand =
+        [&](const std::shared_ptr<velox::exec::Expr>& input)
         -> const cudf::ast::expression& {
       if (binaryOps.at(name) != Op::NULL_EQUAL ||
           std::dynamic_pointer_cast<FieldReference>(input) ||
@@ -812,15 +807,14 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     // does not always leave an explicit CastExpr in the converted plan. Mirror
     // that resolved type in the AST rather than presenting libcudf with the
     // original mixed operands.
-    const bool isArithmetic =
-        name == "add" || name == "plus" || name == "subtract" ||
-        name == "minus" || name == "multiply" || name == "divide" ||
-        name == "mod";
+    const bool isArithmetic = name == "add" || name == "plus" ||
+        name == "subtract" || name == "minus" || name == "multiply" ||
+        name == "divide" || name == "mod";
     if (isArithmetic) {
       auto const targetKind = expr->type()->kind();
-      auto castOperand = [&](const cudf::ast::expression& operand,
-                             TypeKind inputKind)
-          -> const cudf::ast::expression& {
+      auto castOperand =
+          [&](const cudf::ast::expression& operand,
+              TypeKind inputKind) -> const cudf::ast::expression& {
         if (inputKind == targetKind) {
           return operand;
         }
@@ -969,7 +963,8 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           get_output_mr(),
           /*finalize=*/true);
       if (expected_type && asView(result).type() != *expected_type) {
-        result = cudf::cast(asView(result), *expected_type, stream, get_output_mr());
+        result =
+            cudf::cast(asView(result), *expected_type, stream, get_output_mr());
       }
       precomputedColumns.push_back(std::move(result));
       continue;

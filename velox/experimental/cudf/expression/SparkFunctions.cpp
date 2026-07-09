@@ -31,9 +31,9 @@
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/filling.hpp>
@@ -48,8 +48,8 @@
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
-#include <cudf/strings/contains.hpp>
 #include <cudf/strings/combine.hpp>
+#include <cudf/strings/contains.hpp>
 #include <cudf/strings/convert/convert_datetime.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -119,9 +119,8 @@ bool isUtf8DecodeCharset(std::string_view charset) {
     normalized[i] =
         static_cast<char>(std::tolower(static_cast<unsigned char>(charset[i])));
   }
-  return charset.size() == 5
-      ? std::string_view(normalized, 5) == "utf-8"
-      : std::string_view(normalized, 4) == "utf8";
+  return charset.size() == 5 ? std::string_view(normalized, 5) == "utf-8"
+                             : std::string_view(normalized, 4) == "utf8";
 }
 
 std::string readTranslatedSparkDatetimePattern(
@@ -374,8 +373,7 @@ bool isSupportedDirectJsonType(const TypePtr& type, bool isRoot) {
   }
 }
 
-bool isSupportedFromJsonNested(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+bool isSupportedFromJsonNested(const std::shared_ptr<velox::exec::Expr>& expr) {
   return expr->inputs().size() == 1 &&
       expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
       isSupportedDirectJsonType(expr->type(), true);
@@ -467,7 +465,8 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
       std::vector<std::unique_ptr<cudf::column>> children;
       children.reserve(type->size());
       for (size_t i = 0; i < type->size(); ++i) {
-        children.push_back(makeEmptyColumnForType(type->childAt(i), stream, mr));
+        children.push_back(
+            makeEmptyColumnForType(type->childAt(i), stream, mr));
       }
       return cudf::make_structs_column(
           0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
@@ -541,10 +540,7 @@ PreparedJsonInput prepareJsonInput(
       mr);
   auto emptyPattern = cudf::strings::regex_program::create("^$");
   auto emptyRows = cudf::strings::contains_re(
-      cudf::strings_column_view(stripped->view()),
-      *emptyPattern,
-      stream,
-      mr);
+      cudf::strings_column_view(stripped->view()), *emptyPattern, stream, mr);
 
   auto sanitized =
       cudf::copy_if_else(replacement, inputCol, emptyRows->view(), stream, mr);
@@ -1398,7 +1394,8 @@ class SequenceFunction : public CudfFunction {
         stream,
         mr);
     auto withinLimitNoNulls = nullToTrue(withinLimit->view(), stream, mr);
-    auto allAggregation = cudf::make_all_aggregation<cudf::reduce_aggregation>();
+    auto allAggregation =
+        cudf::make_all_aggregation<cudf::reduce_aggregation>();
     auto allScalar = cudf::reduce(
         withinLimitNoNulls->view(),
         *allAggregation,
@@ -1408,8 +1405,7 @@ class SequenceFunction : public CudfFunction {
     auto const& allBool =
         static_cast<cudf::numeric_scalar<bool> const&>(*allScalar);
     VELOX_USER_CHECK(
-        allBool.is_valid(stream) && allBool.value(stream),
-        "Too long sequence");
+        allBool.is_valid(stream) && allBool.value(stream), "Too long sequence");
 
     return cudf::cast(
         size64->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
@@ -1563,9 +1559,7 @@ class FromJsonNestedFunction : public CudfFunction {
 class FromJsonFunction : public CudfFunction {
  public:
   explicit FromJsonFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    VELOX_CHECK(
-        isSupportedFromJson(expr),
-        "Unsupported cuDF from_json shape");
+    VELOX_CHECK(isSupportedFromJson(expr), "Unsupported cuDF from_json shape");
     if (isSupportedFromJsonRowOfStrings(expr)) {
       impl_ = std::make_shared<FromJsonRowOfStringsFunction>(expr);
     } else {

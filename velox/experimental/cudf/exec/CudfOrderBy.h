@@ -22,8 +22,8 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
-#include <cudf/types.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/types.hpp>
 
 #include <string>
 

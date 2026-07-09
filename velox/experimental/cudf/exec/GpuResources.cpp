@@ -31,11 +31,12 @@
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
-#include <common/base/Exceptions.h>
-
 #include <cuda_runtime_api.h>
+
+#include <common/base/Exceptions.h>
 #include <dlfcn.h>
 #include <glog/logging.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -43,7 +44,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unistd.h>
 
 namespace facebook::velox::cudf_velox {
 
@@ -116,9 +116,8 @@ bool deviceMemoryDiagnosticsEnabled() {
         normalized.end(),
         normalized.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return !normalized.empty() && normalized != "0" &&
-        normalized != "false" && normalized != "off" &&
-        normalized != "no";
+    return !normalized.empty() && normalized != "0" && normalized != "false" &&
+        normalized != "off" && normalized != "no";
   }();
   return enabled;
 }
@@ -180,8 +179,7 @@ void logDeviceMemorySnapshot(
                << " rmmCurrentBytes=" << snapshot.rmmCurrentBytes
                << " rmmPeakBytes=" << snapshot.rmmPeakBytes
                << " rmmTotalBytes=" << snapshot.rmmTotalBytes
-               << " rmmCurrentAllocations="
-               << snapshot.rmmCurrentAllocations
+               << " rmmCurrentAllocations=" << snapshot.rmmCurrentAllocations
                << " rmmPeakAllocations=" << snapshot.rmmPeakAllocations
                << " rmmTotalAllocations=" << snapshot.rmmTotalAllocations;
 }

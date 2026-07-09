@@ -20,17 +20,18 @@
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
-#include <cudf/sorting.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/search.hpp>
+#include <cudf/sorting.hpp>
+
+#include <malloc.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <filesystem>
-#include <malloc.h>
-#include <unistd.h>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -163,8 +164,7 @@ RowVectorPtr CudfOrderBy::doGetOutput() {
       return nullptr;
     }
     return std::make_shared<CudfVector>(
-        pool(), outputType_, result->num_rows(), std::move(result),
-        stream);
+        pool(), outputType_, result->num_rows(), std::move(result), stream);
   }
   finished_ = true;
   return std::exchange(outputTable_, nullptr);
@@ -177,12 +177,11 @@ void CudfOrderBy::spillSortedRun() {
   namespace fs = std::filesystem;
   if (!spilled_) {
     const auto sequence = orderBySpillDirectorySequence.fetch_add(1);
-    spillDirectory_ = (
-        fs::temp_directory_path() /
-        fmt::format(
-            "velox-cudf-orderby-spill-{}-{}",
-            static_cast<int64_t>(::getpid()),
-            sequence))
+    spillDirectory_ = (fs::temp_directory_path() /
+                       fmt::format(
+                           "velox-cudf-orderby-spill-{}-{}",
+                           static_cast<int64_t>(::getpid()),
+                           sequence))
                           .string();
     fs::create_directories(spillDirectory_);
     spilled_ = true;
@@ -194,8 +193,12 @@ void CudfOrderBy::spillSortedRun() {
       getConcatenatedTable(std::exchange(inputs_, {}), outputType_, stream, mr);
   bufferedBytes_ = 0;
   auto sorted = cudf::sort_by_key(
-      input->view(), input->view().select(sortKeys_), columnOrder_, nullOrder_,
-      stream, mr);
+      input->view(),
+      input->view().select(sortKeys_),
+      columnOrder_,
+      nullOrder_,
+      stream,
+      mr);
   auto path = fmt::format(
       "{}/run-{:06}.parquet", spillDirectory_, spillFileSequence_++);
   auto options = cudf::io::parquet_writer_options::builder(
@@ -269,14 +272,21 @@ std::unique_ptr<cudf::table> CudfOrderBy::mergeNextSortedBatch(
     auto sortedBoundaries = cudf::sort_by_key(
         boundaryCandidates->view(),
         boundaryCandidates->view().select(sortKeys_),
-        columnOrder_, nullOrder_, stream, mr);
+        columnOrder_,
+        nullOrder_,
+        stream,
+        mr);
     auto boundary = cudf::slice(sortedBoundaries->view(), {0, 1}, stream);
     auto positions = cudf::upper_bound(
-        merged->view().select(sortKeys_), boundary.front().select(sortKeys_),
-        columnOrder_, nullOrder_, stream, mr);
+        merged->view().select(sortKeys_),
+        boundary.front().select(sortKeys_),
+        columnOrder_,
+        nullOrder_,
+        stream,
+        mr);
     const auto safeEnd = firstSearchPosition(positions->view(), stream);
-    mergeCarry_ = copyTableSlice(
-        merged->view(), safeEnd, merged->num_rows(), stream, mr);
+    mergeCarry_ =
+        copyTableSlice(merged->view(), safeEnd, merged->num_rows(), stream, mr);
     if (safeEnd > 0) {
       return copyTableSlice(merged->view(), 0, safeEnd, stream, mr);
     }

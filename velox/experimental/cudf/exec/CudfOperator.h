@@ -164,10 +164,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory(
-            "getOutput",
-            "after",
-            -1,
-            result == nullptr ? 0 : result->size());
+            "getOutput", "after", -1, result == nullptr ? 0 : result->size());
       }
       return result;
     } catch (...) {
@@ -245,17 +242,18 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     if (!deviceMemoryDiagnosticsEnabled()) {
       return;
     }
-    logDeviceMemorySnapshot(fmt::format(
-        "operator={} node={} operatorId={} method={} phase={} inputRows={} "
-        "outputRows={} call={}",
-        className_,
-        planNodeId_,
-        operatorId_,
-        method,
-        phase,
-        inputRows,
-        outputRows,
-        deviceMemoryCallCount_));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator={} node={} operatorId={} method={} phase={} inputRows={} "
+            "outputRows={} call={}",
+            className_,
+            planNodeId_,
+            operatorId_,
+            method,
+            phase,
+            inputRows,
+            outputRows,
+            deviceMemoryCallCount_));
   }
 
   const std::string className_;

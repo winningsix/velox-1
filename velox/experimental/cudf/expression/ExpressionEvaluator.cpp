@@ -404,8 +404,7 @@ bool isSupportedDirectJsonType(const TypePtr& type, bool isRoot) {
   }
 }
 
-bool isSupportedFromJsonExpr(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+bool isSupportedFromJsonExpr(const std::shared_ptr<velox::exec::Expr>& expr) {
   return isSupportedFromJsonRowOfStringsExpr(expr) ||
       (expr->inputs().size() == 1 &&
        expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
@@ -515,9 +514,8 @@ bool isUtf8DecodeCharset(std::string_view charset) {
     normalized[i] =
         static_cast<char>(std::tolower(static_cast<unsigned char>(charset[i])));
   }
-  return charset.size() == 5
-      ? std::string_view(normalized, 5) == "utf-8"
-      : std::string_view(normalized, 4) == "utf8";
+  return charset.size() == 5 ? std::string_view(normalized, 5) == "utf-8"
+                             : std::string_view(normalized, 4) == "utf8";
 }
 
 bool hasSupportedConstantDecodeCharset(
@@ -1434,8 +1432,7 @@ class CastFunction : public CudfFunction {
       castMode_ = CastMode::kStringToBool;
     } else if (isStringToDateVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToDate;
-    } else if (isStringToTimestampVeloxCast(
-                   sourceVeloxType, targetVeloxType)) {
+    } else if (isStringToTimestampVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToTimestamp;
     } else if (isNumericToTimestampVeloxCast(
                    sourceVeloxType, targetVeloxType)) {
@@ -1834,8 +1831,7 @@ class ArrayDistinctFunction : public CudfFunction {
 
 class ArrayExceptFunction : public CudfFunction {
  public:
-  explicit ArrayExceptFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit ArrayExceptFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "array_except expects exactly 2 inputs");
     VELOX_CHECK_EQ(
@@ -2914,8 +2910,8 @@ class CoalesceFunction : public CudfFunction {
         result = cudf::copy_if_else(
             asView(inputColumns[i]), current, nullRows->view(), stream, mr);
       } else {
-        result = cudf::replace_nulls(
-            current, asView(inputColumns[i]), stream, mr);
+        result =
+            cudf::replace_nulls(current, asView(inputColumns[i]), stream, mr);
       }
     }
 

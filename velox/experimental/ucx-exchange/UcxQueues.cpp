@@ -43,8 +43,8 @@ void updateDiagnosticGlobalQueue(
                                   columns, std::memory_order_relaxed) +
       columns;
   const auto gib = currentBytes >> 30;
-  const auto previous = diagnosticGlobalQueueGiB.exchange(
-      gib, std::memory_order_relaxed);
+  const auto previous =
+      diagnosticGlobalQueueGiB.exchange(gib, std::memory_order_relaxed);
   if (gib != previous) {
     LOG(WARNING) << "CUDF_DEVICE_QUEUE_GLOBAL event=" << event
                  << " task=" << (task ? task->taskId() : "n/a")
@@ -786,8 +786,7 @@ void UcxOutputQueue::logDeviceQueueResidencyLocked(const char* event) {
                << " task=" << (task_ ? task_->taskId() : "n/a")
                << " queuedBytes=" << queuedBytes_
                << " queuedPackedColumns=" << queuedPackedColumns_
-               << " maxSize=" << maxSize_
-               << " continueSize=" << continueSize_;
+               << " maxSize=" << maxSize_ << " continueSize=" << continueSize_;
 }
 
 void UcxOutputQueue::updateTotalQueuedBytesMsLocked() {

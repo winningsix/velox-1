@@ -15,8 +15,8 @@
  */
 #include <cstring>
 
-#include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"

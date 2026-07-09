@@ -437,8 +437,7 @@ class UnnestAdapter : public OperatorAdapter {
     auto unnestNode =
         std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
+    result.push_back(std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
     return result;
   }
 };
@@ -818,12 +817,11 @@ class WindowAdapter : public OperatorAdapter {
       exec::DriverCtx* /*ctx*/) const override {
     auto windowNode =
         std::dynamic_pointer_cast<const core::WindowNode>(planNode);
-    const bool canRun =
-        canHandle(op) && isSupportedCudfWindowNode(windowNode);
+    const bool canRun = canHandle(op) && isSupportedCudfWindowNode(windowNode);
     if (!canRun) {
       LOG_FALLBACK(
           "WindowAdapter {}, PlanNode id: {}",
-          !canHandle(op) ? "operator is not Window"
+          !canHandle(op)    ? "operator is not Window"
               : !windowNode ? "planNode is not WindowNode"
                             : "isSupportedCudfWindowNode returned false",
           planNode->id());
@@ -1033,7 +1031,7 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
   }
 };
 
-  /// ValuesAdapter - Replaces with CudfValues
+/// ValuesAdapter - Replaces with CudfValues
 class ValuesAdapter : public OperatorAdapter {
  public:
   ValuesAdapter() : OperatorAdapter("Values") {}
@@ -1260,7 +1258,7 @@ class ExchangeAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
     const bool isUcx = exchangeNode &&
         exchangeNode->transportType() ==
-        core::ExchangeNode::TransportType::kUcx;
+            core::ExchangeNode::TransportType::kUcx;
     LOG(WARNING) << "CudfExchangeAdapter: canRunOnGPU node="
                  << (exchangeNode ? exchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx
@@ -1285,10 +1283,8 @@ class ExchangeAdapter : public OperatorAdapter {
         const_cast<exec::Exchange*>(dynamic_cast<const exec::Exchange*>(op));
     VELOX_CHECK_NOT_NULL(exchangeOp);
     LOG(WARNING) << "CudfExchangeAdapter: replacing Exchange with UcxExchange"
-                 << " task=" << op->taskId()
-                 << " pipeline=" << ctx->pipelineId
-                 << " operatorId=" << operatorId
-                 << " node=" << planNode->id();
+                 << " task=" << op->taskId() << " pipeline=" << ctx->pipelineId
+                 << " operatorId=" << operatorId << " node=" << planNode->id();
 
     std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
     auto key = TaskPipelineKey{op->taskId(), ctx->pipelineId};
@@ -1348,7 +1344,7 @@ class MergeExchangeAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
     const bool isUcx = mergeExchangeNode &&
         mergeExchangeNode->transportType() ==
-        core::ExchangeNode::TransportType::kUcx;
+            core::ExchangeNode::TransportType::kUcx;
     LOG(WARNING) << "CudfMergeExchangeAdapter: canRunOnGPU node="
                  << (mergeExchangeNode ? mergeExchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx

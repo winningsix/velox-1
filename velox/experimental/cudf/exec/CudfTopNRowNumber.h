@@ -20,8 +20,8 @@
 
 #include "velox/core/PlanNode.h"
 
-#include <cudf/types.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/types.hpp>
 
 #include <cstdint>
 #include <deque>

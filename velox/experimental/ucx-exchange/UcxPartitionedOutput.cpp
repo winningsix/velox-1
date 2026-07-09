@@ -21,8 +21,8 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/concatenate.hpp>
@@ -160,7 +160,8 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 
 void UcxPartitionedOutput::flushPending() {
   CudaAllocationTraceScope allocationTrace(
-      fmt::format("UcxPartitionedOutput task={} method=flushPending", taskId()));
+      fmt::format(
+          "UcxPartitionedOutput task={} method=flushPending", taskId()));
   if (pendingInputs_.empty()) {
     return;
   }
@@ -232,9 +233,7 @@ void UcxPartitionedOutput::flushPending() {
         auto slicedTables = cudf::slice(tableView, {start, end});
         VELOX_CHECK_EQ(slicedTables.size(), 1);
         auto packedCols = cudf::pack(
-            slicedTables[0],
-            stream,
-            cudf::get_current_device_resource_ref());
+            slicedTables[0], stream, cudf::get_current_device_resource_ref());
         stream.synchronize();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));

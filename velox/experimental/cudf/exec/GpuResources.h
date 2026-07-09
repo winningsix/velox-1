@@ -18,16 +18,16 @@
 
 #include <cudf/detail/utilities/stream_pool.hpp>
 
-#include <rmm/resource_ref.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
 
-#include <optional>
-#include <cstdint>
 #include <cstddef>
-#include <string_view>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace facebook::velox::cudf_velox {
 

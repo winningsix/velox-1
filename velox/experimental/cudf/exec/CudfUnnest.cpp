@@ -132,8 +132,8 @@ RowVectorPtr CudfUnnest::doGetOutput() {
     auto stream = cudfInput->stream();
     auto* inputPool = input_->pool();
     const auto inputSize = static_cast<cudf::size_type>(input_->size());
-    const auto end = std::min(
-        inputSize, inputRowOffset_ + kMaxUnnestInputRowsPerOutput);
+    const auto end =
+        std::min(inputSize, inputRowOffset_ + kMaxUnnestInputRowsPerOutput);
 
     const auto inputView = cudfInput->getTableView();
     std::vector<cudf::column_view> explodeInputColumns;
@@ -143,9 +143,7 @@ RowVectorPtr CudfUnnest::doGetOutput() {
     }
     explodeInputColumns.push_back(inputView.column(unnestChannel_));
     auto slices = cudf::slice(
-        cudf::table_view{explodeInputColumns},
-        {inputRowOffset_, end},
-        stream);
+        cudf::table_view{explodeInputColumns}, {inputRowOffset_, end}, stream);
     VELOX_CHECK_EQ(slices.size(), 1);
     inputRowOffset_ = end;
 

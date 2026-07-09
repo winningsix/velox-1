@@ -86,7 +86,9 @@ RowTypePtr gpuInputBoundaryType(
     const core::PlanNodePtr& planNode) {
   if (dynamic_cast<const exec::HashBuild*>(op) != nullptr) {
     VELOX_CHECK_GT(
-        planNode->sources().size(), 1, "HashBuild requires a build-side source");
+        planNode->sources().size(),
+        1,
+        "HashBuild requires a build-side source");
     return planNode->sources()[1]->outputType();
   }
 
@@ -109,7 +111,8 @@ RowTypePtr gpuInputBoundaryType(
     return topNRowNumber->inputType();
   }
 
-  if (auto window = std::dynamic_pointer_cast<const core::WindowNode>(planNode)) {
+  if (auto window =
+          std::dynamic_pointer_cast<const core::WindowNode>(planNode)) {
     return window->inputType();
   }
 

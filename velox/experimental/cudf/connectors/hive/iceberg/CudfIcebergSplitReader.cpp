@@ -121,7 +121,8 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
     const auto& readName = i < outputReadColumnNames_.size()
         ? outputReadColumnNames_[i]
         : outputType_->nameOf(i);
-    auto it = std::find(readColumnNames_.begin(), readColumnNames_.end(), readName);
+    auto it =
+        std::find(readColumnNames_.begin(), readColumnNames_.end(), readName);
     if (it == readColumnNames_.end()) {
       continue;
     }
@@ -526,8 +527,9 @@ void CudfIcebergSplitReader::adaptColumns() {
   std::unordered_set<std::string> injectedNames;
   for (size_t i = 0; i < outputType_->size(); ++i) {
     const auto& fieldName = outputType_->nameOf(i);
-    const auto& readName =
-        i < outputReadColumnNames_.size() ? outputReadColumnNames_[i] : fieldName;
+    const auto& readName = i < outputReadColumnNames_.size()
+        ? outputReadColumnNames_[i]
+        : fieldName;
 
     if (auto iter = split_->infoColumns.find(readName);
         iter != split_->infoColumns.end()) {
@@ -566,8 +568,9 @@ void CudfIcebergSplitReader::adaptColumns() {
 
     for (size_t i = 0; i < outputType_->size(); ++i) {
       const auto& fieldName = outputType_->nameOf(i);
-      const auto& readName =
-          i < outputReadColumnNames_.size() ? outputReadColumnNames_[i] : fieldName;
+      const auto& readName = i < outputReadColumnNames_.size()
+          ? outputReadColumnNames_[i]
+          : fieldName;
       if (injectedNames.contains(readName)) {
         continue;
       }

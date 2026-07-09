@@ -374,11 +374,13 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
       // synthesize `column == column`: that evaluates to null for a null row
       // and is not semantically equivalent to AlwaysTrue.
       const bool value = filter.kind() == common::FilterKind::kAlwaysTrue;
-      scalars.emplace_back(std::make_unique<cudf::numeric_scalar<bool>>(
-          value, true, stream, mr));
+      scalars.emplace_back(
+          std::make_unique<cudf::numeric_scalar<bool>>(
+              value, true, stream, mr));
       stream.synchronize();
-      return tree.push(cudf::ast::literal{
-          *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
+      return tree.push(
+          cudf::ast::literal{
+              *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
     }
 
     case common::FilterKind::kBigintRange: {

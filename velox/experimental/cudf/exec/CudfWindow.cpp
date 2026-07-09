@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -35,11 +35,12 @@
 #include <cudf/sorting.hpp>
 #include <cudf/unary.hpp>
 
+#include <malloc.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
-#include <malloc.h>
-#include <unistd.h>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -77,8 +78,7 @@ bool isFieldAccessExpr(const core::TypedExprPtr& expr) {
 
 bool isUnboundedPrecedingToCurrentRowFrame(
     const core::WindowNode::Frame& frame) {
-  return frame.startType ==
-      core::WindowNode::BoundType::kUnboundedPreceding &&
+  return frame.startType == core::WindowNode::BoundType::kUnboundedPreceding &&
       frame.endType == core::WindowNode::BoundType::kCurrentRow &&
       frame.startValue == nullptr && frame.endValue == nullptr;
 }
@@ -127,8 +127,7 @@ bool isSupportedFullPartitionSumFunction(
   return isFieldAccessExpr(input) && isSupportedSumInputType(input->type());
 }
 
-bool isSupportedRunningSumFunction(
-    const core::WindowNode::Function& function) {
+bool isSupportedRunningSumFunction(const core::WindowNode::Function& function) {
   if (function.functionCall->name() != "sum" || function.ignoreNulls ||
       function.functionCall->inputs().size() != 1 ||
       function.frame.type != core::WindowNode::WindowType::kRows ||
@@ -139,8 +138,7 @@ bool isSupportedRunningSumFunction(
   return isFieldAccessExpr(input) && isSupportedSumInputType(input->type());
 }
 
-bool isSupportedFirstValueFunction(
-    const core::WindowNode::Function& function) {
+bool isSupportedFirstValueFunction(const core::WindowNode::Function& function) {
   const auto& name = function.functionCall->name();
   if ((name != "first" && name != "first_value") || function.ignoreNulls ||
       function.functionCall->inputs().size() != 1 ||
@@ -225,8 +223,7 @@ bool isSupportedCudfWindowNode(
     return false;
   }
 
-  if ((hasRowNumber || hasFirstValue || hasRunningSum) &&
-      hasFullPartitionSum) {
+  if ((hasRowNumber || hasFirstValue || hasRunningSum) && hasFullPartitionSum) {
     return false;
   }
 
@@ -278,8 +275,7 @@ CudfWindow::CudfWindow(
 
     const auto& order = sortingOrders[i];
     sortOrders_.push_back(
-        order.isAscending() ? cudf::order::ASCENDING
-                            : cudf::order::DESCENDING);
+        order.isAscending() ? cudf::order::ASCENDING : cudf::order::DESCENDING);
     sortNullOrders_.push_back(
         (order.isNullsFirst() ^ !order.isAscending())
             ? cudf::null_order::BEFORE
@@ -299,13 +295,14 @@ void CudfWindow::doAddInput(RowVectorPtr input) {
 
   if (deviceMemoryDiagnosticsEnabled() &&
       bufferedBytes_ >= nextDiagnosticBufferedBytes_) {
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfWindow node={} state=buffering bufferedBytes={} "
-        "bufferedInputs={} spilled={}",
-        windowNode_->id(),
-        bufferedBytes_,
-        inputs_.size(),
-        spilled_));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfWindow node={} state=buffering bufferedBytes={} "
+            "bufferedInputs={} spilled={}",
+            windowNode_->id(),
+            bufferedBytes_,
+            inputs_.size(),
+            spilled_));
     while (nextDiagnosticBufferedBytes_ <= bufferedBytes_) {
       nextDiagnosticBufferedBytes_ += 512ULL << 20;
     }
@@ -380,12 +377,11 @@ void CudfWindow::spillSortedRun() {
   namespace fs = std::filesystem;
   if (!spilled_) {
     const auto sequence = windowSpillDirectorySequence.fetch_add(1);
-    spillDirectory_ = (
-        fs::temp_directory_path() /
-        fmt::format(
-            "velox-cudf-window-spill-{}-{}",
-            static_cast<int64_t>(::getpid()),
-            sequence))
+    spillDirectory_ = (fs::temp_directory_path() /
+                       fmt::format(
+                           "velox-cudf-window-spill-{}-{}",
+                           static_cast<int64_t>(::getpid()),
+                           sequence))
                           .string();
     fs::create_directories(spillDirectory_);
     spilled_ = true;
@@ -393,12 +389,13 @@ void CudfWindow::spillSortedRun() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
   auto mr = get_output_mr();
-  logDeviceMemorySnapshot(fmt::format(
-      "operator=CudfWindow node={} state=sortRun.concatenate.begin "
-      "bufferedBytes={} bufferedInputs={}",
-      windowNode_->id(),
-      bufferedBytes_,
-      inputs_.size()));
+  logDeviceMemorySnapshot(
+      fmt::format(
+          "operator=CudfWindow node={} state=sortRun.concatenate.begin "
+          "bufferedBytes={} bufferedInputs={}",
+          windowNode_->id(),
+          bufferedBytes_,
+          inputs_.size()));
   auto input =
       getConcatenatedTable(std::exchange(inputs_, {}), inputType_, stream, mr);
   bufferedBytes_ = 0;
@@ -414,10 +411,11 @@ void CudfWindow::spillSortedRun() {
   nullOrders.insert(
       nullOrders.end(), sortNullOrders_.begin(), sortNullOrders_.end());
 
-  logDeviceMemorySnapshot(fmt::format(
-      "operator=CudfWindow node={} state=sortRun.sort.begin rows={}",
-      windowNode_->id(),
-      input->num_rows()));
+  logDeviceMemorySnapshot(
+      fmt::format(
+          "operator=CudfWindow node={} state=sortRun.sort.begin rows={}",
+          windowNode_->id(),
+          input->num_rows()));
   auto sorted = cudf::sort_by_key(
       input->view(),
       input->view().select(sortChannels),
@@ -425,10 +423,11 @@ void CudfWindow::spillSortedRun() {
       nullOrders,
       stream,
       mr);
-  logDeviceMemorySnapshot(fmt::format(
-      "operator=CudfWindow node={} state=sortRun.sort.end rows={}",
-      windowNode_->id(),
-      input->num_rows()));
+  logDeviceMemorySnapshot(
+      fmt::format(
+          "operator=CudfWindow node={} state=sortRun.sort.end rows={}",
+          windowNode_->id(),
+          input->num_rows()));
 
   auto path = fmt::format(
       "{}/run-{:06}.parquet", spillDirectory_, spillFileSequence_++);
@@ -515,8 +514,8 @@ std::unique_ptr<cudf::table> CudfWindow::mergeNextSortedBatch(
     if (mergeViews.size() == 1) {
       merged = std::make_unique<cudf::table>(mergeViews.front(), stream, mr);
     } else {
-      merged = cudf::merge(
-          mergeViews, sortChannels, orders, nullOrders, stream, mr);
+      merged =
+          cudf::merge(mergeViews, sortChannels, orders, nullOrders, stream, mr);
     }
     mergeCarry_.reset();
 
@@ -545,8 +544,8 @@ std::unique_ptr<cudf::table> CudfWindow::mergeNextSortedBatch(
         stream,
         mr);
     const auto safeEnd = firstSearchPosition(positions->view(), stream);
-    mergeCarry_ = copyTableSlice(
-        merged->view(), safeEnd, merged->num_rows(), stream, mr);
+    mergeCarry_ =
+        copyTableSlice(merged->view(), safeEnd, merged->num_rows(), stream, mr);
     if (safeEnd > 0) {
       return copyTableSlice(merged->view(), 0, safeEnd, stream, mr);
     }
@@ -574,20 +573,13 @@ std::unique_ptr<cudf::table> CudfWindow::takeCompletePartitions(
 
   auto partitionColumns = sorted->view().select(partitionKeyChannels_);
   auto lastPartition = cudf::slice(
-      partitionColumns,
-      {sorted->num_rows() - 1, sorted->num_rows()},
-      stream);
+      partitionColumns, {sorted->num_rows() - 1, sorted->num_rows()}, stream);
   std::vector<cudf::order> orders(
       partitionKeyChannels_.size(), cudf::order::ASCENDING);
   std::vector<cudf::null_order> nullOrders(
       partitionKeyChannels_.size(), cudf::null_order::BEFORE);
   auto positions = cudf::lower_bound(
-      partitionColumns,
-      lastPartition.front(),
-      orders,
-      nullOrders,
-      stream,
-      mr);
+      partitionColumns, lastPartition.front(), orders, nullOrders, stream, mr);
   const auto completeEnd = firstSearchPosition(positions->view(), stream);
   partitionCarry_ = copyTableSlice(
       sorted->view(), completeEnd, sorted->num_rows(), stream, mr);
@@ -613,8 +605,8 @@ CudfVectorPtr CudfWindow::computeNextSortedOutput() {
       }
       partitionCarry_.reset();
     } else {
-      sorted = takeCompletePartitions(
-          std::move(sorted), finalBatch, stream, mr);
+      sorted =
+          takeCompletePartitions(std::move(sorted), finalBatch, stream, mr);
     }
     if (!sorted || sorted->num_rows() == 0) {
       if (finalBatch) {
@@ -622,8 +614,7 @@ CudfVectorPtr CudfWindow::computeNextSortedOutput() {
       }
       continue;
     }
-    auto output =
-        computeOutputTable(std::move(sorted), stream, mr, true);
+    auto output = computeOutputTable(std::move(sorted), stream, mr, true);
     return std::make_shared<CudfVector>(
         pool(), outputType_, output->num_rows(), std::move(output), stream);
   }
@@ -661,10 +652,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeRowNumberColumn(
   std::unique_ptr<cudf::column> rowNumber;
   if (partitionKeyChannels_.empty()) {
     auto aggregation = cudf::make_rank_aggregation<cudf::scan_aggregation>(
-        cudf::rank_method::FIRST,
-        order,
-        cudf::null_policy::INCLUDE,
-        nullOrder);
+        cudf::rank_method::FIRST, order, cudf::null_policy::INCLUDE, nullOrder);
     rowNumber = cudf::scan(
         valuesColumn,
         *aggregation,
@@ -710,7 +698,8 @@ std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
     const TypePtr& expectedType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const {
-  auto rowNumber = computeRowNumberColumn(sortedInput, expectedType, stream, mr);
+  auto rowNumber =
+      computeRowNumberColumn(sortedInput, expectedType, stream, mr);
 
   std::vector<cudf::size_type> rankKeyChannels = partitionKeyChannels_;
   rankKeyChannels.insert(
@@ -784,8 +773,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionSumColumn(
   const auto valueChannel =
       exec::exprToChannel(function.functionCall->inputs()[0].get(), inputType_);
   VELOX_CHECK(
-      valueChannel != kConstantChannel,
-      "Window sum input must be a column");
+      valueChannel != kConstantChannel, "Window sum input must be a column");
 
   auto partitionColumns = selectColumns(input, partitionKeyChannels_);
 
@@ -896,8 +884,7 @@ std::unique_ptr<cudf::column> CudfWindow::computePartitionFirstColumn(
   const auto valueChannel =
       exec::exprToChannel(function.functionCall->inputs()[0].get(), inputType_);
   VELOX_CHECK(
-      valueChannel != kConstantChannel,
-      "Window first input must be a column");
+      valueChannel != kConstantChannel, "Window first input must be a column");
 
   auto partitionColumns = selectColumns(sortedInput, partitionKeyChannels_);
 
