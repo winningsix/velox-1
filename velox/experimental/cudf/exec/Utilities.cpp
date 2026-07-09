@@ -134,11 +134,7 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
       auto entryStruct = cudf::make_structs_column(
           0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
       return cudf::make_lists_column(
-          0,
-          zeroOffsets(),
-          std::move(entryStruct),
-          0,
-          rmm::device_buffer{});
+          0, zeroOffsets(), std::move(entryStruct), 0, rmm::device_buffer{});
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;
@@ -151,8 +147,7 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
           0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
     }
     default:
-      return cudf::make_empty_column(
-          cudf_velox::veloxToCudfDataType(type));
+      return cudf::make_empty_column(cudf_velox::veloxToCudfDataType(type));
   }
 }
 
@@ -192,15 +187,22 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
 
   cudf::detail::join_streams(inputStreams, stream);
 
-  // Even for a single input table we must concatenate (copy) rather than
-  // release in-place: the output is owned by `stream` but the input buffer was
-  // allocated on a different stream, so releasing it would bind deallocation to
-  // the wrong stream.
-  auto output = cudf::concatenate(tableViews, stream, mr);
+  try {
+    // Even for a single input table we must concatenate (copy) rather than
+    // release in-place: the output is owned by `stream` but the input buffer
+    // was allocated on a different stream, so releasing it would bind
+    // deallocation to the wrong stream.
+    auto output = cudf::concatenate(tableViews, stream, mr);
 
-  orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
-  // Input tables are deallocated here when 'tables' goes out of scope.
-  return output;
+    orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
+    // Input tables are deallocated here when 'tables' goes out of scope.
+    return output;
+  } catch (...) {
+    // concatenate can enqueue work for early columns before a later allocation
+    // fails. Finish that work before owners unwind on their original streams.
+    stream.synchronize();
+    throw;
+  }
 }
 
 std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
@@ -229,39 +231,45 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   cudf::detail::join_streams(inputStreams, stream);
 
-  std::vector<std::unique_ptr<cudf::table>> outputTables;
-  auto const maxRows = maxBatchRows();
-  size_t startpos = 0;
-  size_t runningRows = 0;
-  for (size_t i = 0; i < tableViews.size(); ++i) {
-    auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
-    // If adding this table would exceed the limit, flush current batch
-    // [startpos, i).
-    if (runningRows > 0 && runningRows + numRows > maxRows) {
+  try {
+    std::vector<std::unique_ptr<cudf::table>> outputTables;
+    auto const maxRows = maxBatchRows();
+    size_t startpos = 0;
+    size_t runningRows = 0;
+    for (size_t i = 0; i < tableViews.size(); ++i) {
+      auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
+      // If adding this table would exceed the limit, flush current batch
+      // [startpos, i).
+      if (runningRows > 0 && runningRows + numRows > maxRows) {
+        outputTables.push_back(
+            cudf::concatenate(
+                std::vector<cudf::table_view>(
+                    tableViews.begin() + startpos, tableViews.begin() + i),
+                stream,
+                mr));
+        startpos = i;
+        runningRows = 0;
+      }
+      runningRows += numRows;
+    }
+    // Flush the final batch [startpos, end).
+    if (startpos < tableViews.size()) {
       outputTables.push_back(
           cudf::concatenate(
               std::vector<cudf::table_view>(
-                  tableViews.begin() + startpos, tableViews.begin() + i),
+                  tableViews.begin() + startpos, tableViews.end()),
               stream,
               mr));
-      startpos = i;
-      runningRows = 0;
     }
-    runningRows += numRows;
-  }
-  // Flush the final batch [startpos, end).
-  if (startpos < tableViews.size()) {
-    outputTables.push_back(
-        cudf::concatenate(
-            std::vector<cudf::table_view>(
-                tableViews.begin() + startpos, tableViews.end()),
-            stream,
-            mr));
-  }
-  orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
+    orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 
-  // Input tables are deallocated here when 'tables' goes out of scope.
-  return outputTables;
+    // Input tables are deallocated here when 'tables' goes out of scope.
+    return outputTables;
+  } catch (...) {
+    // A failed later batch may leave earlier concatenate kernels in flight.
+    stream.synchronize();
+    throw;
+  }
 }
 
 std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(

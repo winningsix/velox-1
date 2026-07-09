@@ -53,48 +53,48 @@ using cudf_velox::ResolvedAggregateInfo;
 using cudf_velox::serializeDecimalPartialOrIntermediateState;
 using cudf_velox::validateIntermediateColumnType;
 
-#define DEFINE_SIMPLE_GROUPBY_AGGREGATOR(Name, name, KIND)               \
-  struct Groupby##Name##Aggregator : GroupbyAggregator {                 \
-    Groupby##Name##Aggregator(                                           \
-        core::AggregationNode::Step step,                                \
-        uint32_t inputIndex,                                             \
-        VectorPtr constant,                                              \
-        const TypePtr& resultType)                                       \
-        : GroupbyAggregator(step, inputIndex, constant, resultType) {}   \
-                                                                         \
-    void addGroupbyRequest(                                              \
-        cudf::table_view const& tbl,                                     \
-        std::vector<cudf::groupby::aggregation_request>& requests,       \
-        rmm::cuda_stream_view stream) override {                         \
-      auto& request = requests.emplace_back();                           \
-      output_idx = requests.size() - 1;                                  \
-      if (constant != nullptr) {                                         \
+#define DEFINE_SIMPLE_GROUPBY_AGGREGATOR(Name, name, KIND)                \
+  struct Groupby##Name##Aggregator : GroupbyAggregator {                  \
+    Groupby##Name##Aggregator(                                            \
+        core::AggregationNode::Step step,                                 \
+        uint32_t inputIndex,                                              \
+        VectorPtr constant,                                               \
+        const TypePtr& resultType)                                        \
+        : GroupbyAggregator(step, inputIndex, constant, resultType) {}    \
+                                                                          \
+    void addGroupbyRequest(                                               \
+        cudf::table_view const& tbl,                                      \
+        std::vector<cudf::groupby::aggregation_request>& requests,        \
+        rmm::cuda_stream_view stream) override {                          \
+      auto& request = requests.emplace_back();                            \
+      output_idx = requests.size() - 1;                                   \
+      if (constant != nullptr) {                                          \
         auto scalar = cudf_velox::makeScalarFromConstantVector(constant); \
-        constant_input = cudf::make_column_from_scalar(                  \
-            *scalar, tbl.num_rows(), stream, get_temp_mr());             \
-        request.values = constant_input->view();                         \
-      } else {                                                           \
-        request.values = tbl.column(inputIndex);                         \
-      }                                                                  \
-      request.aggregations.push_back(                                    \
-          cudf::make_##name##_aggregation<cudf::groupby_aggregation>()); \
-    }                                                                    \
-                                                                         \
-    std::unique_ptr<cudf::column> makeOutputColumn(                      \
-        std::vector<cudf::groupby::aggregation_result>& results,         \
-        rmm::cuda_stream_view stream,                                    \
-        rmm::device_async_resource_ref mr) override {                    \
-      auto col = std::move(results[output_idx].results[0]);              \
-      const auto cudfType = cudf_velox::veloxToCudfDataType(resultType); \
-      if (col->type() != cudfType) {                                     \
-        col = cudf::cast(*col, cudfType, stream, mr);                    \
-      }                                                                  \
-      return col;                                                        \
-    }                                                                    \
-                                                                         \
-   private:                                                              \
-    uint32_t output_idx;                                                 \
-    std::unique_ptr<cudf::column> constant_input;                        \
+        constant_input = cudf::make_column_from_scalar(                   \
+            *scalar, tbl.num_rows(), stream, get_temp_mr());              \
+        request.values = constant_input->view();                          \
+      } else {                                                            \
+        request.values = tbl.column(inputIndex);                          \
+      }                                                                   \
+      request.aggregations.push_back(                                     \
+          cudf::make_##name##_aggregation<cudf::groupby_aggregation>());  \
+    }                                                                     \
+                                                                          \
+    std::unique_ptr<cudf::column> makeOutputColumn(                       \
+        std::vector<cudf::groupby::aggregation_result>& results,          \
+        rmm::cuda_stream_view stream,                                     \
+        rmm::device_async_resource_ref mr) override {                     \
+      auto col = std::move(results[output_idx].results[0]);               \
+      const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);  \
+      if (col->type() != cudfType) {                                      \
+        col = cudf::cast(*col, cudfType, stream, mr);                     \
+      }                                                                   \
+      return col;                                                         \
+    }                                                                     \
+                                                                          \
+   private:                                                               \
+    uint32_t output_idx;                                                  \
+    std::unique_ptr<cudf::column> constant_input;                         \
   };
 
 DEFINE_SIMPLE_GROUPBY_AGGREGATOR(Sum, sum, SUM)
@@ -1064,8 +1064,8 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
   if (bufferedResult_) {
     auto partialOutputStream = bufferedResult_->stream();
     std::vector<CudfVectorPtr> tablesToConcat;
-    tablesToConcat.push_back(bufferedResult_);
-    tablesToConcat.push_back(groupbyOnInput);
+    tablesToConcat.push_back(std::exchange(bufferedResult_, nullptr));
+    tablesToConcat.push_back(std::move(groupbyOnInput));
     auto concatenatedTable = getConcatenatedTable(
         std::move(tablesToConcat),
         bufferedResultType_,
@@ -1115,18 +1115,56 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
     return;
   }
 
+  auto previousResult = std::exchange(bufferedResult_, nullptr);
   std::vector<cudf::table_view> tablesToConcat;
-  tablesToConcat.push_back(bufferedResult_->getTableView());
+  tablesToConcat.push_back(previousResult->getTableView());
   tablesToConcat.push_back(permutedInputView);
 
-  auto finalStream = bufferedResult_->stream();
-  cudf::detail::join_streams(
-      std::vector<rmm::cuda_stream_view>{inputTableStream}, finalStream);
+  auto finalStream = previousResult->stream();
+  std::vector<CudfVectorPtr> inputOwners;
+  inputOwners.push_back(std::move(previousResult));
+  inputOwners.push_back(std::move(tbl));
+  std::vector<rmm::cuda_stream_view> inputStreams{
+      finalStream, inputTableStream};
+  cudf::detail::join_streams(inputStreams, finalStream);
 
-  auto concatenatedTable =
-      cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
-  cudf::detail::join_streams(
-      std::vector<rmm::cuda_stream_view>{finalStream}, inputTableStream);
+  std::unique_ptr<cudf::table> concatenatedTable;
+  try {
+    concatenatedTable =
+        cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
+
+    // The concatenation has consumed both views. Rebind their allocations to
+    // finalStream (or order their original streams after it for packed inputs)
+    // and drop the owners now. This queues stream-ordered frees before the
+    // intermediate groupby allocates its output and workspace. Keeping these
+    // shared_ptrs until the function returns overlaps the previous buffered
+    // result and incoming batch with both the concatenated table and the next
+    // groupby output, which creates a large transient peak for high-cardinality
+    // FINAL aggregations.
+    orderCudfVectorDeallocationsAfterStream(
+        inputOwners, inputStreams, finalStream);
+    inputOwners.clear();
+
+    // Materialized precomputed columns are owned separately by preparedInput
+    // and still deallocate on inputTableStream. Keep that stream ordered after
+    // the concatenate only when such an owner exists; views need no reverse
+    // fence and preserving their input-stream concurrency avoids a regression.
+    const auto hasOwnedPrecomputed = std::any_of(
+        preparedInput.precomputedColumns.begin(),
+        preparedInput.precomputedColumns.end(),
+        [](const auto& column) {
+          return std::holds_alternative<std::unique_ptr<cudf::column>>(column);
+        });
+    if (hasOwnedPrecomputed) {
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{finalStream}, inputTableStream);
+    }
+  } catch (...) {
+    // concatenate can enqueue work before a later column allocation fails.
+    // Complete it before input owners unwind on their original streams.
+    finalStream.synchronize();
+    throw;
+  }
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
@@ -1158,8 +1196,8 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   if (bufferedResult_) {
     auto partialOutputStream = bufferedResult_->stream();
     std::vector<CudfVectorPtr> tablesToConcat;
-    tablesToConcat.push_back(bufferedResult_);
-    tablesToConcat.push_back(groupbyOnInput);
+    tablesToConcat.push_back(std::exchange(bufferedResult_, nullptr));
+    tablesToConcat.push_back(std::move(groupbyOnInput));
     auto concatenatedTable = getConcatenatedTable(
         std::move(tablesToConcat),
         bufferedResultType_,
@@ -1187,16 +1225,17 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  input.reset();
 
   if (streamingEnabled_) {
     if (isPartialOutput_) {
-      computePartialGroupbyStreaming(cudfInput);
+      computePartialGroupbyStreaming(std::move(cudfInput));
       return;
     } else if (isSingleStep_) {
-      computeSingleGroupbyStreaming(cudfInput);
+      computeSingleGroupbyStreaming(std::move(cudfInput));
       return;
     } else {
-      computeFinalGroupbyStreaming(cudfInput);
+      computeFinalGroupbyStreaming(std::move(cudfInput));
       return;
     }
   }
@@ -1319,12 +1358,13 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     }
     auto& aggs = isSingleStep_ ? finalAggregators_ : aggregators_;
     auto stream = bufferedResult_->stream();
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfGroupby node={} state=finalize.begin bufferedRows={} "
-        "bufferedBytes={}",
-        diagnosticNodeId_,
-        bufferedResult_->size(),
-        bufferedResult_->estimateFlatSize()));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfGroupby node={} state=finalize.begin bufferedRows={} "
+            "bufferedBytes={}",
+            diagnosticNodeId_,
+            bufferedResult_->size(),
+            bufferedResult_->estimateFlatSize()));
     auto result = doGroupByAggregation(
         bufferedResult_->getTableView(),
         groupingKeyOutputChannels_,
@@ -1333,12 +1373,13 @@ RowVectorPtr CudfGroupby::doGetOutput() {
         stream,
         get_output_mr());
     stream.synchronize();
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfGroupby node={} state=finalize.end outputRows={} "
-        "bufferedBytes={}",
-        diagnosticNodeId_,
-        result == nullptr ? 0 : result->size(),
-        bufferedResult_->estimateFlatSize()));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfGroupby node={} state=finalize.end outputRows={} "
+            "bufferedBytes={}",
+            diagnosticNodeId_,
+            result == nullptr ? 0 : result->size(),
+            bufferedResult_->estimateFlatSize()));
     bufferedResult_.reset();
     return result;
   }
