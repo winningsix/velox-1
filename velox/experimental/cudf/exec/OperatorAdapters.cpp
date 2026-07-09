@@ -262,7 +262,20 @@ class FilterProjectAdapter : public OperatorAdapter {
 
     // Check projects separately
     if (projectPlanNode) {
-      if (!canBeEvaluatedByCudf(
+      // A projection made entirely of direct field references is a positional
+      // select/rename.  It does not evaluate an expression on the CPU and can
+      // be executed by CudfFilterProject as a zero-copy column selection.  In
+      // particular, MPP exchange boundaries often need this form only to
+      // restore the consumer-side Velox field names.
+      const bool isDirectFieldProjection = std::all_of(
+          projectPlanNode->projections().begin(),
+          projectPlanNode->projections().end(),
+          [](const core::TypedExprPtr& expression) {
+            return std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
+                       expression) != nullptr;
+          });
+      if (!isDirectFieldProjection &&
+          !canBeEvaluatedByCudf(
               projectPlanNode->projections(), ctx->task->queryCtx().get())) {
         LOG_FALLBACK(
             "FilterProject projections cannot be evaluated by cuDF, PlanNode id: {}",

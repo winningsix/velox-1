@@ -108,7 +108,35 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
       hiveConfig_(hiveConfig),
-      outputReadColumnNames_(outputReadColumnNames) {}
+      outputReadColumnNames_(outputReadColumnNames) {
+  // Selecting only a top-level struct name makes libcudf return every child
+  // in the Parquet file's physical order. Iceberg/Spark may prune and reorder
+  // that ROW in the requested output schema, so positional dereference would
+  // read the wrong child. Request the exact nested leaf paths instead; libcudf
+  // retains the parent struct while pruning its children in selector order.
+  for (size_t i = 0; i < outputType_->size(); ++i) {
+    if (outputType_->childAt(i)->kind() != TypeKind::ROW) {
+      continue;
+    }
+    const auto& readName = i < outputReadColumnNames_.size()
+        ? outputReadColumnNames_[i]
+        : outputType_->nameOf(i);
+    auto it = std::find(readColumnNames_.begin(), readColumnNames_.end(), readName);
+    if (it == readColumnNames_.end()) {
+      continue;
+    }
+    const auto insertAt = std::distance(readColumnNames_.begin(), it);
+    readColumnNames_.erase(it);
+    const auto rowType = asRowType(outputType_->childAt(i));
+    std::vector<std::string> nested;
+    nested.reserve(rowType->size());
+    for (size_t child = 0; child < rowType->size(); ++child) {
+      nested.push_back(fmt::format("{}.{}", readName, rowType->nameOf(child)));
+    }
+    readColumnNames_.insert(
+        readColumnNames_.begin() + insertAt, nested.begin(), nested.end());
+  }
+}
 
 void CudfIcebergSplitReader::prepareSplit(
     dwio::common::RuntimeStatistics& runtimeStats) {

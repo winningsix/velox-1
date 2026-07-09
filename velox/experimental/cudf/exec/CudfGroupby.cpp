@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstUtils.h"
 
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
@@ -65,12 +66,16 @@ using cudf_velox::validateIntermediateColumnType;
         cudf::table_view const& tbl,                                     \
         std::vector<cudf::groupby::aggregation_request>& requests,       \
         rmm::cuda_stream_view stream) override {                         \
-      VELOX_CHECK(                                                       \
-          constant == nullptr,                                           \
-          #Name "Aggregator does not yet support constant input");       \
       auto& request = requests.emplace_back();                           \
       output_idx = requests.size() - 1;                                  \
-      request.values = tbl.column(inputIndex);                           \
+      if (constant != nullptr) {                                         \
+        auto scalar = cudf_velox::makeScalarFromConstantVector(constant); \
+        constant_input = cudf::make_column_from_scalar(                  \
+            *scalar, tbl.num_rows(), stream, get_temp_mr());             \
+        request.values = constant_input->view();                         \
+      } else {                                                           \
+        request.values = tbl.column(inputIndex);                         \
+      }                                                                  \
       request.aggregations.push_back(                                    \
           cudf::make_##name##_aggregation<cudf::groupby_aggregation>()); \
     }                                                                    \
@@ -89,6 +94,7 @@ using cudf_velox::validateIntermediateColumnType;
                                                                          \
    private:                                                              \
     uint32_t output_idx;                                                 \
+    std::unique_ptr<cudf::column> constant_input;                        \
   };
 
 DEFINE_SIMPLE_GROUPBY_AGGREGATOR(Sum, sum, SUM)
@@ -832,9 +838,18 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants) {
+    std::vector<VectorPtr> const& constants,
+    std::optional<core::AggregationNode::Step> forcedStep) {
   auto params =
       resolveAggregateInfos(aggregationNode, step, outputType, constants);
+
+  if (forcedStep.has_value()) {
+    const auto numKeys = aggregationNode.groupingKeys().size();
+    for (size_t i = 0; i < params.size(); ++i) {
+      params[i].companionStep = *forcedStep;
+      params[i].resultType = outputType->childAt(numKeys + i);
+    }
+  }
 
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators;
   aggregators.reserve(params.size());
@@ -923,6 +938,7 @@ CudfGroupby::CudfGroupby(
           std::nullopt,
           aggregationNode),
       aggregationNode_(aggregationNode),
+      diagnosticNodeId_(aggregationNode->id()),
       isPartialOutput_(
           exec::isPartialOutput(aggregationNode->step()) &&
           !hasFinalAggs(aggregationNode->aggregates())),
@@ -958,7 +974,22 @@ void CudfGroupby::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  streamingEnabled_ = !hasCompanionAggregates(aggregationNode_->aggregates());
+  // The old blanket companion-aggregate guard forced every input batch into
+  // inputs_ until noMoreInput(). Large MPP final aggregates consequently
+  // retained several GiB of materialized exchange pages per
+  // executor. Companion suffixes describe the external Spark plan step; for
+  // streaming compaction we explicitly force the internal intermediate step
+  // below, so these aggregates can be compacted incrementally as well.
+  streamingEnabled_ = true;
+
+  if (deviceMemoryDiagnosticsEnabled()) {
+    for (const auto& aggregate : aggregationNode_->aggregates()) {
+      LOG(WARNING) << "CUDF_GROUPBY_AGGREGATE node=" << diagnosticNodeId_
+                   << " planStep="
+                   << core::AggregationNode::toName(aggregationNode_->step())
+                   << " function=" << aggregate.call->name();
+    }
+  }
 
   // Make aggregators for intermediate step when streaming is enabled.
   if (streamingEnabled_) {
@@ -974,19 +1005,22 @@ void CudfGroupby::initialize() {
         *aggregationNode_,
         core::AggregationNode::Step::kIntermediate,
         bufferedResultType_,
-        nullConstants);
+        nullConstants,
+        core::AggregationNode::Step::kIntermediate);
 
     if (isSingleStep_) {
       partialAggregators_ = toGroupbyAggregators(
           *aggregationNode_,
           core::AggregationNode::Step::kPartial,
           bufferedResultType_,
-          aggregationInput.constants);
+          aggregationInput.constants,
+          core::AggregationNode::Step::kPartial);
       finalAggregators_ = toGroupbyAggregators(
           *aggregationNode_,
           core::AggregationNode::Step::kFinal,
           outputType_,
-          nullConstants);
+          nullConstants,
+          core::AggregationNode::Step::kFinal);
     }
   }
 
@@ -1285,6 +1319,12 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     }
     auto& aggs = isSingleStep_ ? finalAggregators_ : aggregators_;
     auto stream = bufferedResult_->stream();
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=finalize.begin bufferedRows={} "
+        "bufferedBytes={}",
+        diagnosticNodeId_,
+        bufferedResult_->size(),
+        bufferedResult_->estimateFlatSize()));
     auto result = doGroupByAggregation(
         bufferedResult_->getTableView(),
         groupingKeyOutputChannels_,
@@ -1293,6 +1333,12 @@ RowVectorPtr CudfGroupby::doGetOutput() {
         stream,
         get_output_mr());
     stream.synchronize();
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=finalize.end outputRows={} "
+        "bufferedBytes={}",
+        diagnosticNodeId_,
+        result == nullptr ? 0 : result->size(),
+        bufferedResult_->estimateFlatSize()));
     bufferedResult_.reset();
     return result;
   }

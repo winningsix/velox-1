@@ -246,7 +246,11 @@ void Communicator::run() {
       // or worker_->signal() is called (from addToWorkQueue,
       // deferEndpointCleanup, or stop).
       if (blockingMode) {
-        worker_->progressWorkerEvent(0);
+        // UCXX defines -1 as an indefinite epoll wait. Passing 0 here turns
+        // the supposedly blocking loop into a busy poll: epoll_wait returns
+        // immediately and the worker's eventfd is read repeatedly with
+        // EAGAIN, consuming a full CPU core per executor while idle.
+        worker_->progressWorkerEvent(-1);
       } else {
         worker_->progress();
       }

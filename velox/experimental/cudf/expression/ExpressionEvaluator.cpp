@@ -110,15 +110,13 @@ class ScopedCudfFunctionQueryConfig {
 cudf::size_type resolveFieldReferenceIndex(
     velox::exec::FieldReference& fieldExpr,
     const RowTypePtr& parentRowType) {
-  auto pool = memory::memoryManager()->addLeafPool();
-  auto queryCtx = core::QueryCtx::create();
-  core::ExecCtx execCtx(pool.get(), queryCtx.get());
-  exec::ExprSet exprSet({}, &execCtx, /*enableConstantFolding=*/false);
-  auto row = RowVector::createEmpty(parentRowType, pool.get());
-  exec::EvalCtx evalCtx(&execCtx, &exprSet, row.get());
-  auto fieldIndex = fieldExpr.index(evalCtx);
-  VELOX_CHECK_GE(fieldIndex, 0);
-  return static_cast<cudf::size_type>(fieldIndex);
+  // FieldReference::index(EvalCtx) may retain the index resolved against the
+  // original, outer input row. Re-evaluating it with a synthetic child row is
+  // therefore unsafe for nested dereferences and selected the wrong struct
+  // child in complex projection plans. Resolve the nested field directly
+  // against its declared parent ROW instead.
+  return static_cast<cudf::size_type>(
+      parentRowType->getChildIdx(fieldExpr.field()));
 }
 
 bool decimalScalarIsZero(
@@ -2906,8 +2904,19 @@ class CoalesceFunction : public CudfFunction {
     ColumnOrView result = asView(inputColumns[0]);
     size_t stop = std::min(numColumnsBeforeLiteral_, inputColumns.size());
     for (size_t i = 1; i < stop && asView(result).has_nulls(); ++i) {
-      result = cudf::replace_nulls(
-          asView(result), asView(inputColumns[i]), stream, mr);
+      const auto current = asView(result);
+      if (current.type().id() == cudf::type_id::LIST ||
+          current.type().id() == cudf::type_id::STRUCT) {
+        // libcudf replace_nulls does not specialize nested columns. Select
+        // whole rows instead, preserving child nulls inside a valid map/list/
+        // struct value while replacing only null parent rows.
+        auto nullRows = cudf::is_null(current, stream, mr);
+        result = cudf::copy_if_else(
+            asView(inputColumns[i]), current, nullRows->view(), stream, mr);
+      } else {
+        result = cudf::replace_nulls(
+            current, asView(inputColumns[i]), stream, mr);
+      }
     }
 
     if ((literalScalar_ || emptyArrayLiteralType_) &&
@@ -2915,8 +2924,20 @@ class CoalesceFunction : public CudfFunction {
       auto scalar = emptyArrayLiteralType_
           ? makeEmptyArrayScalar(emptyArrayLiteralType_, stream, mr)
           : nullptr;
-      result = cudf::replace_nulls(
-          asView(result), scalar ? *scalar : *literalScalar_, stream, mr);
+      const auto current = asView(result);
+      if (current.type().id() == cudf::type_id::LIST ||
+          current.type().id() == cudf::type_id::STRUCT) {
+        auto nullRows = cudf::is_null(current, stream, mr);
+        result = cudf::copy_if_else(
+            scalar ? *scalar : *literalScalar_,
+            current,
+            nullRows->view(),
+            stream,
+            mr);
+      } else {
+        result = cudf::replace_nulls(
+            current, scalar ? *scalar : *literalScalar_, stream, mr);
+      }
     }
 
     return result;

@@ -101,25 +101,69 @@ std::unique_ptr<cudf::table> concatenateTables(
   return cudf::concatenate(tableViews, stream, mr);
 }
 
-std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {
+std::unique_ptr<cudf::column> makeEmptyColumnForType(
+    const TypePtr& type,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto zeroOffsets = [&]() {
+    cudf::size_type zero = 0;
+    rmm::device_buffer offsets(&zero, sizeof(zero), stream, mr);
+    return std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::INT32},
+        1,
+        std::move(offsets),
+        rmm::device_buffer{},
+        0);
+  };
+  switch (type->kind()) {
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+      return cudf::make_strings_column(
+          0, zeroOffsets(), rmm::device_buffer{}, 0, rmm::device_buffer{});
+    case TypeKind::ARRAY:
+      return cudf::make_lists_column(
+          0,
+          zeroOffsets(),
+          makeEmptyColumnForType(type->childAt(0), stream, mr),
+          0,
+          rmm::device_buffer{});
+    case TypeKind::MAP: {
+      std::vector<std::unique_ptr<cudf::column>> entries;
+      entries.push_back(makeEmptyColumnForType(type->childAt(0), stream, mr));
+      entries.push_back(makeEmptyColumnForType(type->childAt(1), stream, mr));
+      auto entryStruct = cudf::make_structs_column(
+          0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
+      return cudf::make_lists_column(
+          0,
+          zeroOffsets(),
+          std::move(entryStruct),
+          0,
+          rmm::device_buffer{});
+    }
+    case TypeKind::ROW: {
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(
+            makeEmptyColumnForType(type->childAt(i), stream, mr));
+      }
+      return cudf::make_structs_column(
+          0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+    }
+    default:
+      return cudf::make_empty_column(
+          cudf_velox::veloxToCudfDataType(type));
+  }
+}
+
+std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
   std::vector<std::unique_ptr<cudf::column>> emptyColumns;
   for (size_t i = 0; i < inputType->size(); ++i) {
-    if (auto const& childType = inputType->childAt(i);
-        childType->kind() == TypeKind::ROW) {
-      auto tbl = makeEmptyTable(childType);
-      auto structColumn = std::make_unique<cudf::column>(
-          cudf::data_type(cudf::type_id::STRUCT),
-          0,
-          rmm::device_buffer(),
-          rmm::device_buffer(),
-          0,
-          tbl->release());
-      emptyColumns.push_back(std::move(structColumn));
-    } else {
-      auto emptyColumn = cudf::make_empty_column(
-          cudf_velox::veloxToCudfDataType(inputType->childAt(i)));
-      emptyColumns.push_back(std::move(emptyColumn));
-    }
+    emptyColumns.push_back(
+        makeEmptyColumnForType(inputType->childAt(i), stream, mr));
   }
   return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
@@ -131,7 +175,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
     rmm::device_async_resource_ref mr) {
   // Check for empty vector
   if (tables.size() == 0) {
-    return makeEmptyTable(tableType);
+    return makeEmptyTable(tableType, stream, mr);
   }
 
   auto inputStreams = std::vector<rmm::cuda_stream_view>();
@@ -167,7 +211,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
-    concatTables.push_back(makeEmptyTable(tableType));
+    concatTables.push_back(makeEmptyTable(tableType, stream, mr));
     return concatTables;
   }
 
@@ -264,7 +308,7 @@ std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
             pool,
             tableType,
             checkedVectorSize(chunkRows),
-            makeEmptyTable(tableType),
+            makeEmptyTable(tableType, stream, mr),
             stream));
     remainingRows -= chunkRows;
   } while (remainingRows > 0);

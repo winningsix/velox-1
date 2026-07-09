@@ -948,6 +948,45 @@ class UnixTimestampFunction : public CudfFunction {
   }
 };
 
+class TimestampMillisFunction : public CudfFunction {
+ public:
+  explicit TimestampMillisFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "timestamp_millis expects exactly 1 input");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::BIGINT,
+        "timestamp_millis input must be BIGINT");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::TIMESTAMP,
+        "timestamp_millis output must be TIMESTAMP");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    const auto timestampType =
+        cudf::data_type{CudfConfig::getInstance().timestampUnit};
+    const auto ticksPerMillisecond =
+        timestampTicksPerSecond(timestampType) / 1000;
+    VELOX_CHECK_GT(ticksPerMillisecond, 0);
+    const auto int64Type = cudf::data_type{cudf::type_id::INT64};
+    cudf::numeric_scalar<int64_t> multiplier(
+        ticksPerMillisecond, true, stream, mr);
+    auto ticks = cudf::binary_operation(
+        asView(inputColumns[0]),
+        multiplier,
+        cudf::binary_operator::MUL,
+        int64Type,
+        stream,
+        mr);
+    return std::make_unique<cudf::column>(
+        cudf::bit_cast(ticks->view(), timestampType), stream, mr);
+  }
+};
+
 class FromUnixTimeFunction : public CudfFunction {
  public:
   explicit FromUnixTimeFunction(
@@ -1675,6 +1714,16 @@ void registerSparkFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("timestamp")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "timestamp_millis",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<TimestampMillisFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .argumentType("bigint")
            .build()});
 
   registerCudfFunction(

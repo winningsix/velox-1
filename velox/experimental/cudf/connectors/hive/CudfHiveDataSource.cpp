@@ -152,7 +152,15 @@ CudfHiveDataSource::CudfHiveDataSource(
   // remaining filter path to avoid invalid AST operators on MAP/ARRAY/ROW.
   common::SubfieldFilters readerSubfieldFilters;
   bool skippedReaderFilter = false;
-  if (!subfieldFilters_.empty()) {
+  const bool parquetFilterPushdownEnabled =
+      cudfHiveConfig_->parquetFilterPushdownEnabledSession(
+          connectorQueryCtx_->sessionProperties());
+  if (!parquetFilterPushdownEnabled && !subfieldFilters_.empty()) {
+    // libcudf 26.08 can crash in stats_expression_converter when many MPP scan
+    // fragments initialize Parquet statistics filters concurrently.  Keep the
+    // original predicate for the post-scan cuDF evaluator in this mode.
+    skippedReaderFilter = true;
+  } else if (!subfieldFilters_.empty()) {
     for (const auto& [field, filter] : subfieldFilters_) {
       if (field.path().size() != 1) {
         skippedReaderFilter = true;
@@ -294,6 +302,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
+  CudaAllocationTraceScope allocationTrace("CudfHiveDataSource::next");
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
   auto chunkOpt = cudfSplitReader_->next(size);
