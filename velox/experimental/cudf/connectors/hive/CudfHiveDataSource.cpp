@@ -59,6 +59,12 @@ bool isSupportedCudfReaderFilterType(const TypePtr& type) {
   }
 }
 
+bool isStringLikeType(const TypePtr& type) {
+  return type != nullptr &&
+      (type->kind() == TypeKind::VARCHAR ||
+       type->kind() == TypeKind::VARBINARY);
+}
+
 TypePtr topLevelSubfieldType(
     const hive::HiveTableHandle& tableHandle,
     const RowTypePtr& outputType,
@@ -173,6 +179,13 @@ CudfHiveDataSource::CudfHiveDataSource(
       if (!isSupportedCudfReaderFilterType(type)) {
         skippedReaderFilter = true;
         VLOG(1) << "Skipping complex cuDF reader filter pushdown for subfield: "
+                << field.toString();
+        continue;
+      }
+
+      if (isStringLikeType(type)) {
+        skippedReaderFilter = true;
+        VLOG(1) << "Keeping string cuDF reader filter post-scan for subfield: "
                 << field.toString();
         continue;
       }

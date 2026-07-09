@@ -37,7 +37,7 @@ namespace facebook::velox::cudf_velox {
 namespace {
 
 constexpr uint64_t kSortedRunBytes = 3ULL << 30;
-constexpr uint64_t kMergeChunkBytes = 256ULL << 20;
+constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 std::atomic<uint64_t> orderBySpillDirectorySequence{0};
 
 std::unique_ptr<cudf::table> copyTableSlice(

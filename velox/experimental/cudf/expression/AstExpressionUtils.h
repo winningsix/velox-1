@@ -592,7 +592,8 @@ cudf::ast::expression const& AstContext::addPrecomputeInstructionOnSide(
         instruction,
         newColumnIndex,
         std::move(nestedIndices),
-        node);
+        node,
+        expectedType);
   }
   auto side = static_cast<cudf::ast::table_reference>(sideIdx);
   return tree.push(cudf::ast::column_reference(newColumnIndex, side));
@@ -946,6 +947,16 @@ std::vector<ColumnOrView> precomputeSubexpressions(
   std::vector<ColumnOrView> precomputedColumns;
   precomputedColumns.reserve(precomputeInstructions.size());
 
+  auto appendPrecomputed = [&](ColumnOrView result,
+                                   const std::optional<cudf::data_type>&
+                                       expectedType) {
+    if (expectedType && asView(result).type() != *expectedType) {
+      result =
+          cudf::cast(asView(result), *expectedType, stream, get_output_mr());
+    }
+    precomputedColumns.push_back(std::move(result));
+  };
+
   for (const auto& instruction : precomputeInstructions) {
     auto
         [dependent_column_index,
@@ -962,11 +973,7 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           stream,
           get_output_mr(),
           /*finalize=*/true);
-      if (expected_type && asView(result).type() != *expected_type) {
-        result =
-            cudf::cast(asView(result), *expected_type, stream, get_output_mr());
-      }
-      precomputedColumns.push_back(std::move(result));
+      appendPrecomputed(std::move(result), expected_type);
       continue;
     }
     if (ins_name.rfind("fill", 0) == 0) {
@@ -977,21 +984,22 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           inputColumnViews[dependent_column_index].size(),
           stream,
           get_output_mr());
-      precomputedColumns.push_back(std::move(newColumn));
+      appendPrecomputed(std::move(newColumn), expected_type);
     } else if (ins_name == "nested_column") {
       // Nested column already exists in input. Don't materialize.
       auto view = inputColumnViews[dependent_column_index].child(
           nested_dependent_column_indices[0]);
-      precomputedColumns.push_back(view);
+      appendPrecomputed(view, expected_type);
     } else if (ins_name == kTimestampCastInstruction) {
       auto targetType =
           cudf::data_type{CudfConfig::getInstance().timestampUnit};
       auto view = inputColumnViews[dependent_column_index];
       if (view.type() == targetType) {
-        precomputedColumns.push_back(view);
+        appendPrecomputed(view, expected_type);
       } else {
-        precomputedColumns.push_back(
-            cudf::cast(view, targetType, stream, get_output_mr()));
+        appendPrecomputed(
+            cudf::cast(view, targetType, stream, get_output_mr()),
+            expected_type);
       }
     } else {
       VELOX_FAIL("Unsupported precompute operation {}", ins_name);
