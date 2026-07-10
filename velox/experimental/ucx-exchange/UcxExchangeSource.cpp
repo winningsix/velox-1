@@ -23,8 +23,8 @@
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
-#include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
@@ -102,16 +102,16 @@ int64_t maxInFlightRecvHostBytes() {
 std::atomic<int64_t> inFlightRecvHostBytes{0};
 
 rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
-  // Keep UCX receive allocations out of the main cuDF pool. Receive pages are
-  // large, short-lived, and size-variable; mixing them into the operator pool
-  // makes the RMM pool reserve/grow far beyond live cuDF data because of
-  // fragmentation. A dedicated cuda_async resource still avoids synchronous
-  // cudaMalloc/cudaFree per packet, while the receive-only statistics wrapper
-  // keeps queued packed pages visible in diagnostics after ownership moves out
-  // of UcxExchangeSource.
+  // Keep UCX receive allocations out of the main cuDF resource, but match the
+  // configured cuDF resource type. Receive pages are large, short-lived, and
+  // size-variable; mixing them into the operator resource makes pool resources
+  // reserve/grow far beyond live cuDF data because of fragmentation.
+  // The receive-only statistics wrapper keeps queued packed pages visible in
+  // diagnostics after ownership moves out of UcxExchangeSource.
+  const auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
   static rmm::mr::statistics_resource_adaptor resource{
-      cuda::mr::any_resource<cuda::mr::device_accessible>{
-          rmm::mr::cuda_async_memory_resource{}}};
+      cudf_velox::createMemoryResource(
+          cudfConfig.memoryResource, cudfConfig.memoryPercent)};
   return resource;
 }
 
