@@ -277,9 +277,17 @@ bool CompileState::compile(bool allowCpuFallback) {
 
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
-      replaceOp.push_back(
-          std::make_unique<CudfToVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+      const bool keepDeviceOutput = isLastOperatorOfTask &&
+          ctx->queryConfig().get<bool>(
+              CudfConfig::kCudfSkipOutputToVelox, false);
+      if (!keepDeviceOutput) {
+        replaceOp.push_back(
+            std::make_unique<CudfToVelox>(
+                id,
+                planNode->outputType(),
+                ctx,
+                planNode->id() + "-to-velox"));
+      }
     }
 
     if (isPureCpuOperator && isMppFinalOutputBoundary(oper, planNode)) {
