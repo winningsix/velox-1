@@ -21,9 +21,8 @@
 #include <vector>
 
 #include <cudf/contiguous_split.hpp>
-#include <folly/String.h>
+#include <cudf/utilities/memory_resource.hpp>
 #include <folly/Uri.h>
-#include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -102,13 +101,14 @@ int64_t maxInFlightRecvHostBytes() {
 std::atomic<int64_t> inFlightRecvHostBytes{0};
 
 rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
-  // Keep UCX receive allocations on a synchronous, fresh cudaMalloc resource,
-  // but wrap it with RMM statistics so queued packed pages are visible in
-  // diagnostics even after ownership moves out of UcxExchangeSource.
-  static rmm::mr::statistics_resource_adaptor resource{
+  // UCX receive allocations must follow the active cuDF memory resource rather
+  // than hardcoding a separate allocator. This keeps receive buffers in the
+  // same pool policy as the rest of cuDF execution (cuda/pool/async/etc.) while
+  // preserving receive-only statistics for diagnostics.
+  static rmm::mr::statistics_resource_adaptor currentResource{
       cuda::mr::any_resource<cuda::mr::device_accessible>{
-          rmm::mr::cuda_memory_resource{}}};
-  return resource;
+          cudf::get_current_device_resource_ref()}};
+  return currentResource;
 }
 
 int64_t maxInFlightRecvDeviceBytes() {
@@ -756,13 +756,12 @@ bool UcxExchangeSource::tryStartDataReceive(
   ptr->stream = stream;
 
   // UCX writes receive buffers from its progress thread, outside CUDA stream
-  // ordering. Keep these buffers on a dedicated synchronous resource so UCX
-  // can never write into a block that a stream-ordered pool has recycled while
-  // work on another stream is still in flight. This also avoids waiting on an
-  // unrelated compute stream in the single UCX progress thread.
+  // ordering. The allocation-ready fence below is required when the active cuDF
+  // resource is stream-ordered: a pooled/async block may be valid only after the
+  // allocation stream reaches the allocation point.
   //
-  // Only transports without CUDA support stage through host memory and use a
-  // fresh synchronous device allocation for the final copy.
+  // Only transports without CUDA support stage through host memory and copy into
+  // the final device buffer after the host receive completes.
   try {
     auto& recvMemoryResource = receiveDeviceMemoryResource();
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
@@ -817,6 +816,16 @@ bool UcxExchangeSource::tryStartDataReceive(
     communicator_->addToWorkQueue(getSelfPtr());
     return false;
   }
+
+  // RMM pool resources are stream-ordered: if a block is freed and reallocated
+  // on the same stream, the allocator may hand it out without inserting a wait.
+  // That is correct only when the next use is also enqueued on that stream. UCX
+  // writes receive buffers from its progress thread, outside CUDA stream
+  // ordering, so wait until the allocation stream has reached this allocation
+  // before exposing the pointer to UCX. This closes the same-stream reuse race
+  // that can surface later as cudaErrorIllegalAddress or
+  // cudaErrorMisalignedAddress in unrelated cuDF kernels.
+  stream.synchronize();
 
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
           << " bytes of device memory";

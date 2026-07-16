@@ -292,7 +292,7 @@ bool CompileState::compile(bool allowCpuFallback) {
 
     if (isPureCpuOperator && isMppFinalOutputBoundary(oper, planNode)) {
       LOG(WARNING)
-          << "Allowing MPP final output boundary outside cuDF fallback accounting: "
+          << "Allowing MPP final output boundary outside cuDF compatibility accounting: "
           << oper->toString();
       isPureCpuOperator = false;
     }

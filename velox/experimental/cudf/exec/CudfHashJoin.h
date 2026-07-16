@@ -33,12 +33,19 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cstdint>
 #include <memory>
 
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+
+struct CudfJoinKeyRange {
+  bool valid{false};
+  int64_t min{0};
+  int64_t max{0};
+};
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -177,6 +184,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
  private:
   void waitForBuildReady(rmm::cuda_stream_view stream);
+  void ensureRightFirstKeyRanges(rmm::cuda_stream_view stream);
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
@@ -205,6 +213,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
   // Batched probe inputs needed for right join
   std::vector<CudfVectorPtr> inputs_;
+  RowVectorPtr pendingRightSemiOutput_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 
   /** @brief Column indices for join keys in left (probe) table */
@@ -253,6 +262,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<std::vector<ColumnOrView>> cachedRightPrecomputed_;
   /// Cached extended views for right tables (original + precomputed columns)
   std::vector<cudf::table_view> cachedExtendedRightViews_;
+
+  /// Min/max ranges for the first build-side join key. These are used only as
+  /// a conservative probe-side pruning hint for batched semi/anti joins.
+  std::vector<CudfJoinKeyRange> rightFirstKeyRanges_;
+  bool rightFirstKeyRangesComputed_{false};
 
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
