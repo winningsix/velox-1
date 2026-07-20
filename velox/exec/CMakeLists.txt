@@ -24,6 +24,8 @@ if(VELOX_ENABLE_CUDF)
              "${CMAKE_BINARY_DIR}/_deps/cccl-src/libcudacxx/include"
              "${CMAKE_BINARY_DIR}/_deps/cccl-src/thrust"
              "${CMAKE_BINARY_DIR}/_deps/cccl-src/cub"
+             "${CMAKE_BINARY_DIR}/_deps/cudf-src/cpp/include"
+             "$<TARGET_PROPERTY:cudf::cudf,INTERFACE_INCLUDE_DIRECTORIES>"
              "${CUDAToolkit_INCLUDE_DIRS}")
 endif()
 
