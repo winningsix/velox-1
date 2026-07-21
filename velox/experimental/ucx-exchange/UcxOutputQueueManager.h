@@ -50,6 +50,16 @@ class UcxOutputQueueManager {
       int numDestinations,
       int numDrivers);
 
+  /// Initializes a UCX output queue for a producer that is not represented by
+  /// a Velox exec::Task. This keeps Spark incremental shuffle on the same UCX
+  /// data plane without creating a synthetic Velox task.
+  void initializeStandaloneTask(
+      std::string_view taskId,
+      core::PartitionedOutputNode::Kind kind,
+      int numDestinations,
+      int numDrivers,
+      uint64_t maxSize);
+
   /// @brief Updates the number of destination buffers for a task.
   /// For broadcast mode, new destinations are backfilled with previously
   /// broadcast data.

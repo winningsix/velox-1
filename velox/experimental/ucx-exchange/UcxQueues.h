@@ -160,6 +160,17 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       core::PartitionedOutputNode::Kind kind =
           core::PartitionedOutputNode::Kind::kPartitioned);
 
+  /// Creates an initialized output queue that is not owned by a Velox Task.
+  /// Used by external runtimes that want to reuse the UCX exchange data plane
+  /// with their own lifecycle and task id, e.g. Spark incremental shuffle.
+  UcxOutputQueue(
+      std::string taskId,
+      uint32_t numDestinations,
+      uint32_t numDrivers,
+      uint64_t maxSize,
+      core::PartitionedOutputNode::Kind kind =
+          core::PartitionedOutputNode::Kind::kPartitioned);
+
   /// @brief initializes an unitialized queue. This is needed in order to
   /// support delayed construction, i.e. if a "getData" arrives before the queue
   /// exists, the queue manager can create an unitialized queue just for the
@@ -171,6 +182,14 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       std::shared_ptr<exec::Task> task,
       uint32_t numDestinations,
       uint32_t numDrivers,
+      core::PartitionedOutputNode::Kind kind =
+          core::PartitionedOutputNode::Kind::kPartitioned);
+
+  bool initializeStandalone(
+      std::string taskId,
+      uint32_t numDestinations,
+      uint32_t numDrivers,
+      uint64_t maxSize,
       core::PartitionedOutputNode::Kind kind =
           core::PartitionedOutputNode::Kind::kPartitioned);
 
@@ -295,8 +314,17 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       std::shared_ptr<cudf::packed_columns> data,
       std::vector<UcxDataAvailable>& dataAvailableCbs);
 
-  // Reference to the task that owns this UcxQueue.
-  std::shared_ptr<exec::Task> task_{nullptr};
+  std::string taskIdForLog() const;
+
+  // Weak reference to the task that owns this UcxQueue. The queue may outlive
+  // the producer task while downstream exchange readers drain buffered data.
+  std::weak_ptr<exec::Task> task_;
+
+  // Stable id for logging and queue-manager lookups after task destruction.
+  std::string taskId_;
+
+  // Synthetic task id for standalone queues that are not backed by exec::Task.
+  std::string standaloneTaskId_;
 
   // The output mode (partitioned, broadcast, etc.)
   core::PartitionedOutputNode::Kind kind_{

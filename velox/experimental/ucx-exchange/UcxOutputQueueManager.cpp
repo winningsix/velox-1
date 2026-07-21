@@ -64,6 +64,34 @@ void UcxOutputQueueManager::initializeTask(
   IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
 }
 
+void UcxOutputQueueManager::initializeStandaloneTask(
+    std::string_view taskId,
+    core::PartitionedOutputNode::Kind kind,
+    int numDestinations,
+    int numDrivers,
+    uint64_t maxSize) {
+  std::string taskIdStr{taskId};
+  queues_.withLock([&](auto& queues) {
+    auto it = queues.find(taskIdStr);
+    if (it == queues.end()) {
+      queues[taskIdStr] = std::make_shared<UcxOutputQueue>(
+          taskIdStr, numDestinations, numDrivers, maxSize, kind);
+      return;
+    }
+    if (!it->second->initializeStandalone(
+            taskIdStr, numDestinations, numDrivers, maxSize, kind)) {
+      VELOX_CHECK(
+          it->second->isInitialized(),
+          "Registering a standalone cudf output queue for pre-existing uninitialized taskId {}",
+          taskId);
+      VLOG(2) << "[QUEUE-MGR] standalone task=" << taskId
+              << " initializeStandalone ignored (already initialized)";
+    }
+  });
+  removedTasks_.withLock([&](auto& removed) { removed.erase(taskIdStr); });
+  IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
+}
+
 void UcxOutputQueueManager::updateOutputBuffers(
     std::string_view taskId,
     int numBuffers,

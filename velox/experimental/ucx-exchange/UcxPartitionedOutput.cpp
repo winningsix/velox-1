@@ -167,30 +167,26 @@ void UcxPartitionedOutput::flushPending() {
   }
 
   try {
-    cudf::table_view tableView;
+    cudf::table_view inputTableView;
     rmm::cuda_stream_view stream = pendingInputs_.back()->stream();
-    // Keeps the merged table alive while tableView references it.
+    // Keeps the merged table alive while inputTableView references it.
     std::unique_ptr<cudf::table> mergedTable;
 
     if (pendingInputs_.size() == 1) {
       // Fast path: use the single input's view directly (no GPU alloc).
       auto& cv = pendingInputs_[0];
       stream = cv->stream();
-      tableView = remap_.empty()
-          ? cv->getTableView()
-          : cv->getTableView().select(remap_.begin(), remap_.end());
+      inputTableView = cv->getTableView();
     } else {
-      // Collect (remapped) table views.
+      // Collect full input table views. Partition keys are defined over the
+      // input type; output remapping is applied only after partitioning.
       std::vector<cudf::table_view> views;
       std::vector<rmm::cuda_stream_view> inputStreams;
       views.reserve(pendingInputs_.size());
       inputStreams.reserve(pendingInputs_.size());
       for (auto& v : pendingInputs_) {
         inputStreams.push_back(v->stream());
-        views.push_back(
-            remap_.empty()
-                ? v->getTableView()
-                : v->getTableView().select(remap_.begin(), remap_.end()));
+        views.push_back(v->getTableView());
       }
 
       cudf::detail::join_streams(inputStreams, stream);
@@ -203,19 +199,19 @@ void UcxPartitionedOutput::flushPending() {
       // Free input GPU memory before partitioning (peak = 2x -> 1x).
       pendingInputs_.clear();
 
-      tableView = mergedTable->view();
+      inputTableView = mergedTable->view();
     }
 
     // Partition + enqueue (identical to previous addInput logic).
     auto queueManager = sharedQueueManager();
     if (numPartitions_ > 1) {
       if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
-        hashPartition(tableView, stream);
+        hashPartition(inputTableView, stream);
       } else {
-        equalPartition(tableView, stream);
+        equalPartition(inputTableView, stream);
       }
     } else {
-      const auto tableRows = tableView.num_rows();
+      const auto tableRows = inputTableView.num_rows();
       const auto rowsPerChunk = std::max<cudf::size_type>(
           1,
           targetRowsPerChunk_ > 0
@@ -230,10 +226,13 @@ void UcxPartitionedOutput::flushPending() {
            start += rowsPerChunk) {
         const auto end =
             std::min<cudf::size_type>(tableRows, start + rowsPerChunk);
-        auto slicedTables = cudf::slice(tableView, {start, end});
+        auto slicedTables = cudf::slice(inputTableView, {start, end});
         VELOX_CHECK_EQ(slicedTables.size(), 1);
+        auto outputView = remap_.empty()
+            ? slicedTables[0]
+            : slicedTables[0].select(remap_.begin(), remap_.end());
         auto packedCols = cudf::pack(
-            slicedTables[0], stream, cudf::get_current_device_resource_ref());
+            outputView, stream, cudf::get_current_device_resource_ref());
         stream.synchronize();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));
@@ -241,7 +240,7 @@ void UcxPartitionedOutput::flushPending() {
             this->taskId(),
             0,
             std::move(packedColsPtr),
-            slicedTables[0].num_rows());
+            outputView.num_rows());
       }
     }
 
@@ -322,6 +321,10 @@ void UcxPartitionedOutput::initPartitionKeys(
 
   // Get partition function specification string
   spec_ = planNode->partitionFunctionSpec().toString();
+  VLOG(1) << "UcxPartitionedOutput initPartitionKeys task=" << taskId()
+          << " node=" << planNode->id() << " spec=" << spec_
+          << " inputType=" << planNode->inputType()->toString()
+          << " outputType=" << planNode->outputType()->toString();
 
   // Only parse keys if it's a hash function
   if (spec_.find("HASH(") != std::string::npos) {
@@ -342,7 +345,7 @@ void UcxPartitionedOutput::initPartitionKeys(
       keys.push_back(keysStr); // Add the last key.
 
       // Find field indices for each key.
-      const auto& rowType = planNode->outputType();
+      const auto& rowType = planNode->inputType();
       for (const auto& key : keys) {
         auto trimmedKey = key;
         // Trim whitespace
@@ -351,6 +354,8 @@ void UcxPartitionedOutput::initPartitionKeys(
 
         auto fieldIndex = rowType->getChildIdx(trimmedKey);
         partitionKeyIndices_.push_back(fieldIndex);
+        VLOG(1) << "UcxPartitionedOutput partition key task=" << taskId()
+                << " key=" << trimmedKey << " inputIndex=" << fieldIndex;
       }
     }
   }
@@ -438,7 +443,10 @@ void UcxPartitionedOutput::splitAndEnqueue(
             std::min<cudf::size_type>(partitionRows, start + rowsPerChunk);
         auto slicedTables = cudf::slice(partitionTable.table, {start, end});
         VELOX_CHECK_EQ(slicedTables.size(), 1);
-        auto packedCols = cudf::pack(slicedTables[0], stream);
+        auto outputView = remap_.empty()
+            ? slicedTables[0]
+            : slicedTables[0].select(remap_.begin(), remap_.end());
+        auto packedCols = cudf::pack(outputView, stream);
         stream.synchronize();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));
@@ -446,14 +454,24 @@ void UcxPartitionedOutput::splitAndEnqueue(
             this->taskId(),
             i,
             std::move(packedColsPtr),
-            slicedTables[0].num_rows());
+            outputView.num_rows());
       }
       continue;
     }
 
-    auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-        std::move(contiguousTables[i].data.metadata),
-        std::move(contiguousTables[i].data.gpu_data));
+    std::unique_ptr<cudf::packed_columns> packedColsPtr;
+    if (remap_.empty()) {
+      packedColsPtr = std::make_unique<cudf::packed_columns>(
+          std::move(contiguousTables[i].data.metadata),
+          std::move(contiguousTables[i].data.gpu_data));
+    } else {
+      auto outputView =
+          partitionTable.table.select(remap_.begin(), remap_.end());
+      auto packedCols = cudf::pack(outputView, stream);
+      stream.synchronize();
+      packedColsPtr = std::make_unique<cudf::packed_columns>(
+          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+    }
 
     // enqueue partition data on Ucx Output Buffer
     queueManager->enqueue(

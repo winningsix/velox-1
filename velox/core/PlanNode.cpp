@@ -1341,6 +1341,7 @@ const std::vector<PlanNodePtr>& ExchangeNode::sources() const {
 
 void ExchangeNode::addDetails(std::stringstream& stream) const {
   addVectorSerdeKind(serdeKind_, stream);
+  stream << " transport " << toName(transportType_);
 }
 
 namespace {
@@ -3617,6 +3618,7 @@ void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
 
   stream << " ";
   addVectorSerdeKind(serdeKind_, stream);
+  stream << " transport " << toName(transportType_);
 }
 
 folly::dynamic PartitionedOutputNode::serialize() const {
