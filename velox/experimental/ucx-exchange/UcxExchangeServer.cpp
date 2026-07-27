@@ -298,6 +298,19 @@ void UcxExchangeServer::process() {
                         << " getData callback called after close, ignoring";
                 return;
               }
+              if (sequence != static_cast<int64_t>(self->sequenceNumber_)) {
+                LOG(WARNING)
+                    << "Closing stale UCX exchange server for task="
+                    << self->partitionKey_.taskId
+                    << " destination=" << self->partitionKey_.destination
+                    << " requestedSequence=" << self->sequenceNumber_
+                    << " acknowledgedSequence=" << sequence;
+                self->skipQueueDeleteOnClose_.store(
+                    true, std::memory_order_release);
+                self->setState(ServerState::Done);
+                self->communicator_->addToWorkQueue(self);
+                return;
+              }
               // This upcall may be called from another thread than the
               // communicator thread. It is called
               // when data on the queue becomes available.
@@ -381,7 +394,12 @@ void UcxExchangeServer::close() {
           << " hasDataRequest=" << (dataRequest_ != nullptr)
           << " hasDataPtr=" << (dataPtr_ != nullptr);
 
-  if (queueMgr_) {
+  if (queueMgr_ && !skipQueueDeleteOnClose_.load(std::memory_order_acquire)) {
+    LOG(INFO) << "[UCX-SERVER] close deleteResults task="
+              << partitionKey_.taskId
+              << " destination=" << partitionKey_.destination
+              << " state=" << toName(getState())
+              << " seq=" << sequenceNumber_;
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
   }
 
@@ -488,6 +506,10 @@ void UcxExchangeServer::sendData() {
               makeIntraNodeRetrieveWakeup());
       intraNodeAtEndPublished_ = true;
 
+      LOG(INFO) << "[UCX-SERVER] intra-node atEnd deleteResults task="
+                << partitionKey_.taskId
+                << " destination=" << partitionKey_.destination
+                << " seq=" << sequenceNumber_;
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
 
       // Wait for source to acknowledge atEnd before finishing. The registry
@@ -666,6 +688,10 @@ void UcxExchangeServer::sendData() {
       VLOG(3) << "@" << partitionKey_.taskId
               << " Finished transferring partition for task "
               << partitionKey_.toString();
+      LOG(INFO) << "[UCX-SERVER] remote atEnd deleteResults task="
+                << partitionKey_.taskId
+                << " destination=" << partitionKey_.destination
+                << " seq=" << sequenceNumber_;
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
       setState(ServerState::Done);
       communicator_->addToWorkQueue(getSelfPtr());
@@ -751,6 +777,10 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
 
   if (intraNodeAtEndPublished_) {
     // This was the final atEnd marker, we're done
+    LOG(INFO) << "[UCX-SERVER] intra-node atEnd acknowledged task="
+              << partitionKey_.taskId
+              << " destination=" << partitionKey_.destination
+              << " seq=" << sequenceNumber_;
     VLOG(3) << "@" << partitionKey_.taskId
             << " Intra-node transfer: atEnd acknowledged, finishing";
     setState(ServerState::Done);

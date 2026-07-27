@@ -105,6 +105,46 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
       prefix + "collect_set",
       core::AggregationNode::Step::kFinal,
       collectSetMergeSignature);
+
+  auto bloomFilterRawSignatures =
+      std::vector<exec::FunctionSignaturePtr>{
+          FunctionSignatureBuilder()
+              .returnType("varbinary")
+              .argumentType("bigint")
+              .build(),
+          FunctionSignatureBuilder()
+              .returnType("varbinary")
+              .argumentType("bigint")
+              .constantArgumentType("bigint")
+              .build(),
+          FunctionSignatureBuilder()
+              .returnType("varbinary")
+              .argumentType("bigint")
+              .constantArgumentType("bigint")
+              .constantArgumentType("bigint")
+              .build()};
+  auto bloomFilterMergeSignature = FunctionSignatureBuilder()
+                                       .returnType("varbinary")
+                                       .argumentType("varbinary")
+                                       .build();
+  registerAggregationFunctionForStep(
+      getReduceAggregationRegistry(),
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kSingle,
+      bloomFilterRawSignatures);
+  registerAggregationFunctionForStep(
+      getReduceAggregationRegistry(),
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kPartial,
+      bloomFilterRawSignatures);
+  appendReduceAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kIntermediate,
+      bloomFilterMergeSignature);
+  appendReduceAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kFinal,
+      bloomFilterMergeSignature);
 }
 
 } // namespace facebook::velox::cudf_velox

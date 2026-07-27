@@ -16,6 +16,7 @@ add_library(
   velox_cudf_expression
   ArrayAccessFunctions.cpp
   AstExpression.cpp
+  BloomFilterKernels.cu
   CommonFunctions.cpp
   DecimalExpressionKernels.cpp
   DecimalExpressionKernels.cu

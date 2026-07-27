@@ -28,7 +28,9 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/filtered_join.hpp>
 #include <cudf/join/hash_join.hpp>
+#include <cudf/join/key_remapping.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -40,6 +42,7 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+struct CudfReplicatedHashCacheEntry;
 
 struct CudfJoinKeyRange {
   bool valid{false};
@@ -62,15 +65,35 @@ struct CudfJoinKeyRange {
  */
 class CudfHashJoinBridge : public exec::JoinBridge {
  public:
+  struct HashState {
+    std::vector<std::shared_ptr<cudf::table>> tables;
+    std::vector<std::shared_ptr<cudf::hash_join>> hashJoins;
+
+    // Per-build-batch reusable state for no-filter left-semi-filter and anti
+    // joins. Keeping these handles with the build tables avoids rebuilding a
+    // cuDF hash table for every probe input batch. Entries are null when the
+    // cache is disabled, the build batch is empty, or null-aware anti semantics
+    // short-circuit before probing.
+    std::vector<std::shared_ptr<cudf::filtered_join>> filteredJoins;
+
+    // Set only for an inner join whose single build table has no duplicate
+    // non-null keys and whose build-side output consists solely of join keys.
+    std::shared_ptr<cudf::key_remapping> uniqueBuildKeyRemapping;
+
+    // Keeps an executor-local replicated-build cache entry alive while this
+    // task is probing its shared immutable tables/hash joins.
+    std::shared_ptr<void> replicatedCacheLease;
+  };
+
   // The bridge transfers all build side batches and the hash join objects
   // constructed from them to the probe operator
   /** @brief Hash tables paired with their corresponding join objects for
    * batched processing */
-  using hash_type = std::pair<
-      std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
+  using hash_type = HashState;
 
-  void setHashTable(std::optional<hash_type> hashObject);
+  void setHashTable(
+      std::optional<hash_type> hashObject,
+      std::shared_ptr<void> admissionToken = nullptr);
 
   std::optional<hash_type> hashOrFuture(ContinueFuture* future);
 
@@ -91,6 +114,8 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
+  /** Keeps optional executor-wide build admission until probe side is done. */
+  std::shared_ptr<void> admissionToken_;
 };
 
 /**
@@ -110,6 +135,8 @@ class CudfHashJoinBuild : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode);
 
+  void initialize() override;
+
   bool needsInput() const override;
 
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
@@ -120,11 +147,18 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doNoMoreInput() override;
+  void doClose() override;
 
  private:
+  bool finishReplicatedCacheHit();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+  std::string replicatedCacheKey_;
+  std::shared_ptr<CudfReplicatedHashCacheEntry> replicatedCacheEntry_;
+  bool replicatedCacheBuilder_{false};
+  bool replicatedCacheBarrierReached_{false};
 };
 
 /**
@@ -228,6 +262,12 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<size_t> leftColumnOutputIndices_;
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
+  /**
+   * Probe-side source channel for every output column in the unique-build-key
+   * inner-join fast path. Build join-key outputs equal the corresponding
+   * probe keys and can be sourced without a build-side gather.
+   */
+  std::vector<cudf::size_type> uniqueBuildKeyOutputSourceIndices_;
   bool finished_{false};
 
   /// True if any build table has NULL values in join key columns.
@@ -295,6 +335,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
    * @return Vector of result tables (multiple if build data was batched)
    */
   std::vector<JoinOutput> innerJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+
+  std::vector<JoinOutput> uniqueBuildKeyInnerJoin(
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**

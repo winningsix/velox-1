@@ -63,6 +63,8 @@ struct ResolvedAggregateInfo {
   VectorPtr constant;
   TypePtr resultType;
   std::optional<CountInputKind> countInputKind;
+  // Number of raw call arguments, including constant aggregate parameters.
+  size_t argumentCount;
   // True if the aggregate was declared on a decimal raw input in the plan.
   // Routing keys off the function family, not the physical batch type (which is
   // VARBINARY/STRING on intermediate and final steps).

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <optional>
+
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -47,18 +49,16 @@ class UcxPartitionedOutput : public exec::Operator,
   /// a non-blocked state, otherwise blocked.
   RowVectorPtr getOutput() override;
 
-  /// always true but the caller will check isBlocked before adding input, hence
-  /// the blocked state does not accumulate input.
+  /// Do not accept another input while a large input is being partitioned one
+  /// window at a time. The driver calls getOutput() to resume that work.
   bool needsInput() const override {
-    return true;
+    return !noMoreInput_ && !hasActiveFlush();
   }
 
-  // the operator is blocked if the queues are full, we are ignoring this so
-  // always return kNotBlocked
+  /// Moves the shared output queue's backpressure future to the Driver.
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
-  // The operaor is finished when the queue manager say the queues have all been
-  // drained ?
+  /// Finished after all input windows have been enqueued and EOS published.
   bool isFinished() override;
 
  private:
@@ -89,12 +89,14 @@ class UcxPartitionedOutput : public exec::Operator,
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
+  bool usesPrecomputedPartitionHash_{false};
   const size_t numPartitions_;
+  const bool isBroadcast_;
 
   const int pipelineId_;
   const int driverId_;
 
-  exec::BlockingReason blockingReason_;
+  exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture future_;
 
   bool finished_{false};
@@ -104,13 +106,29 @@ class UcxPartitionedOutput : public exec::Operator,
   // output.
   std::vector<uint32_t> remap_;
 
-  /// Concatenates pending inputs and partitions/enqueues the merged result.
+  /// Advances at most one partitioning window so the Driver can observe queue
+  /// backpressure between windows.
   void flushPending();
+
+  void preparePendingFlush();
+  void advanceActiveFlush();
+  void updateBackpressure();
+  bool hasActiveFlush() const;
+  cudf::table_view activeTableView();
+  void clearActiveFlush();
 
   /// Accumulated CudfVectors awaiting flush.
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
+
+  /// Ownership and cursor for a flush that yielded between windows.
+  std::vector<cudf_velox::CudfVectorPtr> activeInputs_;
+  std::unique_ptr<cudf::table> activeMergedTable_;
+  std::optional<rmm::cuda_stream_view> activeStream_;
+  cudf::size_type activeNextRow_{0};
+  cudf::size_type activeRowsPerWindow_{0};
+
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
 };

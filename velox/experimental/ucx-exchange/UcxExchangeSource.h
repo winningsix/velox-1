@@ -30,6 +30,8 @@
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 
+#include <atomic>
+#include <chrono>
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -37,13 +39,13 @@
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
-  UcxExchangeMetrics()
-      : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
-        totalBytes_(RuntimeCounter::Unit::kBytes),
-        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
-  RuntimeMetric numPackedColumns_; // total number of packed columns received.
-  RuntimeMetric totalBytes_; // total number of bytes received
-  RuntimeMetric rttPerRequest_;
+  std::atomic<int64_t> numPackedColumns_{0};
+  std::atomic<int64_t> totalBytes_{0};
+  std::atomic<int64_t> endpointCacheHits_{0};
+  std::atomic<int64_t> endpointCreates_{0};
+  std::atomic<int64_t> endpointAssocNanos_{0};
+  std::atomic<int64_t> handshakeNanos_{0};
+  std::atomic<int64_t> createToReadyNanos_{0};
 };
 
 /// The UcxExchangeSource is the client that communicates with the remote
@@ -336,6 +338,12 @@ class UcxExchangeSource
   // Releasing this at local completion can therefore let the allocator reuse
   // the buffer while the peer is still decoding it.
   std::shared_ptr<HandshakeMsg> handshakeRequestBuffer_{nullptr};
+
+  // One-shot lifecycle timings used to separate Spark's task-scoped logical
+  // exchange overhead from the process-wide physical UCXX endpoint cache.
+  const std::chrono::steady_clock::time_point createdAt_{
+      std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point handshakeStartedAt_;
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

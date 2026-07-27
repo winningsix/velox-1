@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
+#include "velox/experimental/cudf/expression/BloomFilterKernels.h"
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
@@ -59,10 +60,14 @@
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
@@ -74,6 +79,114 @@ namespace {
 
 constexpr cudf::size_type kMaxRoundedArrayLength =
     std::numeric_limits<int32_t>::max() - 15;
+
+class BloomFilterMightContainFunction : public CudfFunction {
+ public:
+  explicit BloomFilterMightContainFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "might_contain expects exactly 2 inputs");
+    auto serializedExpr =
+        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    if (!serializedExpr) {
+      dynamicBloomFilter_ = true;
+      return;
+    }
+    auto serializedValue = serializedExpr->value();
+    VELOX_CHECK_NOT_NULL(
+        serializedValue, "might_contain bloom filter value is missing");
+    if (serializedValue->isNullAt(0)) {
+      nullBloomFilter_ = true;
+      return;
+    }
+
+    const auto serialized =
+        serializedValue->as<SimpleVector<StringView>>()->valueAt(0);
+    VELOX_USER_CHECK_GE(
+        serialized.size(),
+        kSerializedHeaderSize,
+        "Serialized BloomFilter is too small: {}",
+        serialized.size());
+    VELOX_USER_CHECK_EQ(
+        static_cast<uint8_t>(serialized.data()[0]),
+        kBloomFilterV1,
+        "Unsupported BloomFilter version");
+
+    std::memcpy(
+        &bloomSize_, serialized.data() + sizeof(uint8_t), sizeof(bloomSize_));
+    VELOX_USER_CHECK_GT(bloomSize_, 0, "BloomFilter size must be positive");
+    VELOX_USER_CHECK_EQ(
+        bloomSize_ & (bloomSize_ - 1),
+        0,
+        "BloomFilter size must be a power of two");
+    const auto expectedSize =
+        kSerializedHeaderSize + bloomSize_ * sizeof(uint64_t);
+    VELOX_USER_CHECK_GE(
+        serialized.size(),
+        expectedSize,
+        "Serialized BloomFilter has {} bytes, expected at least {}",
+        serialized.size(),
+        expectedSize);
+
+    hostBits_.resize(bloomSize_);
+    std::memcpy(
+        hostBits_.data(),
+        serialized.data() + kSerializedHeaderSize,
+        bloomSize_ * sizeof(uint64_t));
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    if (dynamicBloomFilter_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      return bloomFilterMightContain(
+          asView(inputColumns[0]), asView(inputColumns[1]), stream, mr);
+    }
+
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    const auto input = asView(inputColumns[0]);
+    if (nullBloomFilter_) {
+      return cudf::make_fixed_width_column(
+          cudf::data_type{cudf::type_id::BOOL8},
+          input.size(),
+          cudf::mask_state::ALL_NULL,
+          stream,
+          mr);
+    }
+
+    if (deviceBits_.size() == 0) {
+      deviceBits_ = rmm::device_buffer{
+          hostBits_.size() * sizeof(uint64_t), stream, mr};
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          deviceBits_.data(),
+          hostBits_.data(),
+          deviceBits_.size(),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+    }
+    return bloomFilterMightContain(
+        input,
+        static_cast<const uint64_t*>(deviceBits_.data()),
+        bloomSize_,
+        stream,
+        mr);
+  }
+
+ private:
+  static constexpr uint8_t kBloomFilterV1 = 1;
+  static constexpr int32_t kSerializedHeaderSize =
+      sizeof(uint8_t) + sizeof(int32_t);
+
+  bool dynamicBloomFilter_{false};
+  bool nullBloomFilter_{false};
+  int32_t bloomSize_{0};
+  std::vector<uint64_t> hostBits_;
+  mutable rmm::device_buffer deviceBits_;
+};
 
 std::optional<std::string> translateSparkDatetimePattern(
     std::string_view pattern) {
@@ -1636,12 +1749,28 @@ void registerSparkFunctions(const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
   registerCudfFunction(
+      prefix + "might_contain",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<BloomFilterMightContainFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("varbinary")
+           .argumentType("bigint")
+           .build()});
+
+  registerCudfFunction(
       prefix + "hash_with_seed",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<sparksql::HashFunction>(expr);
       },
       {FunctionSignatureBuilder()
-           .returnType("bigint")
+           .returnType("integer")
            .constantArgumentType("integer")
            .argumentType("any")
            .build()});

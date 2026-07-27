@@ -187,7 +187,8 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   std::unique_ptr<cudf::table> joinWithBuildBatch(
       cudf::table_view probeTableView,
       cudf::table_view buildView,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      std::unique_ptr<cudf::table> ownedProbeTable = nullptr);
 
   /// Emits probe rows that had no match across all build batches, with null
   /// build columns. Used for left/full joins after all build batches exhausted.

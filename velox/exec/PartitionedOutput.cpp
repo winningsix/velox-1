@@ -207,10 +207,11 @@ PartitionedOutput::PartitionedOutput(
       numDestinations_(planNode->numPartitions()),
       replicateNullsAndAny_(planNode->isReplicateNullsAndAny()),
       partitionFunction_(
-          numDestinations_ == 1 ? nullptr
-                                : planNode->partitionFunctionSpec().create(
-                                      numDestinations_,
-                                      /*localExchange=*/false)),
+          numDestinations_ == 1 || !planNode->isPartitioned()
+              ? nullptr
+              : planNode->partitionFunctionSpec().create(
+                    numDestinations_,
+                    /*localExchange=*/false)),
       outputChannels_(calculateOutputChannels(
           planNode->inputType(),
           planNode->outputType(),
@@ -238,7 +239,11 @@ PartitionedOutput::PartitionedOutput(
               ->queryConfig()
               .minShuffleCompressionPageSizeBytes())) {
   if (!planNode->isPartitioned()) {
-    VELOX_USER_CHECK_EQ(numDestinations_, 1);
+    VELOX_USER_CHECK(
+        numDestinations_ == 1 ||
+            planNode->transportType() ==
+                core::PartitionedOutputNode::TransportType::kUcx,
+        "Multiple destinations for non-partitioned output require UCX transport");
   }
   if (numDestinations_ == 1) {
     VELOX_USER_CHECK(keyChannels_.empty());

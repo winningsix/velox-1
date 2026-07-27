@@ -129,6 +129,9 @@ class UcxExchangeServer
   /// thread while the lock is still held.
   std::recursive_mutex dataMutex_;
   std::atomic<bool> closed_{false};
+  // A duplicate server can reconnect at an already-acknowledged sequence. Its
+  // close must not clear the queue still owned by the active server.
+  std::atomic<bool> skipQueueDeleteOnClose_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
   std::future<void> intraNodeRetrieveFuture_;

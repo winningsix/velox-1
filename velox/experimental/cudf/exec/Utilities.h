@@ -89,7 +89,8 @@ getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    size_t maxRows = 0);
 
 /**
  * @brief Concatenates multiple CudfVectors into CudfVector output batches.
@@ -103,7 +104,8 @@ getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& vectors,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    size_t maxRows = 0);
 
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.

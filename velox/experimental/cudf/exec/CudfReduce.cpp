@@ -24,11 +24,14 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/BloomFilterKernels.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/type/Type.h"
 
 #include <cudf/binaryop.hpp>
@@ -721,8 +724,65 @@ struct ApproxDistinctAggregator : ReduceAggregator {
   std::int32_t precision_;
 };
 
+struct ReduceBloomFilterAggregator : ReduceAggregator {
+  ReduceBloomFilterAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType,
+      size_t argumentCount,
+      const core::QueryConfig& queryConfig)
+      : ReduceAggregator(step, inputIndex, constant, resultType) {
+    if (!exec::isRawInput(step)) {
+      return;
+    }
+
+    const functions::sparksql::SparkQueryConfig sparkConfig{queryConfig};
+    int64_t numBits;
+    if (argumentCount >= 3) {
+      VELOX_CHECK_NOT_NULL(constant);
+      numBits = constant->as<SimpleVector<int64_t>>()->valueAt(0);
+    } else if (argumentCount == 2) {
+      VELOX_CHECK_NOT_NULL(constant);
+      const auto expectedNumItems =
+          constant->as<SimpleVector<int64_t>>()->valueAt(0);
+      numBits = BloomFilter<>::optimalNumOfBits(
+          expectedNumItems, sparkConfig.bloomFilterMaxNumItems());
+    } else {
+      numBits = sparkConfig.bloomFilterNumBits();
+    }
+    numBits = std::min(numBits, sparkConfig.bloomFilterMaxNumBits());
+    VELOX_USER_CHECK_GT(numBits, 0, "BloomFilter numBits must be positive");
+
+    BloomFilter<> layout;
+    layout.reset(numBits / 16);
+    bloomSize_ =
+        (layout.serializedSize() - kSerializedHeaderSize) / sizeof(uint64_t);
+  }
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& /* outputType */,
+      vector_size_t /* inputRowCount */,
+      rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) override {
+    if (exec::isRawInput(step)) {
+      return cudf_velox::buildSerializedBloomFilter(
+          input.column(inputIndex), bloomSize_, stream, mr);
+    }
+    return cudf_velox::mergeSerializedBloomFilters(
+        input.column(inputIndex), stream, mr);
+  }
+
+ private:
+  static constexpr int32_t kSerializedHeaderSize =
+      sizeof(uint8_t) + sizeof(int32_t);
+  int32_t bloomSize_{0};
+};
+
 std::unique_ptr<ReduceAggregator> createReduceAggregator(
-    const ResolvedAggregateInfo& p) {
+    const ResolvedAggregateInfo& p,
+    const core::QueryConfig& queryConfig) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
   if (kind.rfind(prefix + "sum", 0) == 0) {
@@ -752,6 +812,14 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
   } else if (kind.rfind(prefix + "approx_distinct", 0) == 0) {
     return std::make_unique<ApproxDistinctAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
+  } else if (kind.rfind(prefix + "bloom_filter_agg", 0) == 0) {
+    return std::make_unique<ReduceBloomFilterAggregator>(
+        p.companionStep,
+        p.inputIndex,
+        p.constant,
+        p.resultType,
+        p.argumentCount,
+        queryConfig);
   } else {
     VELOX_NYI("Reduce aggregation not yet supported, kind: {}", kind);
   }
@@ -765,14 +833,15 @@ std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants) {
+    std::vector<VectorPtr> const& constants,
+    const core::QueryConfig& queryConfig) {
   auto params =
       resolveAggregateInfos(aggregationNode, step, outputType, constants);
 
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators;
   aggregators.reserve(params.size());
   for (const auto& p : params) {
-    aggregators.push_back(createReduceAggregator(p));
+    aggregators.push_back(createReduceAggregator(p, queryConfig));
   }
   return aggregators;
 }
@@ -871,7 +940,8 @@ void CudfReduce::initialize() {
       *aggregationNode_,
       aggregationNode_->step(),
       outputType_,
-      aggregationInput.constants);
+      aggregationInput.constants,
+      operatorCtx_->driverCtx()->queryConfig());
 
   aggregationNode_.reset();
 }

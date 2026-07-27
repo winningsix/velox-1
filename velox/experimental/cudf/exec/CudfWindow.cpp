@@ -127,6 +127,24 @@ bool isSupportedFullPartitionSumFunction(
   return isFieldAccessExpr(input) && isSupportedSumInputType(input->type());
 }
 
+bool isSupportedFullPartitionMaxFunction(
+    const core::WindowNode::Function& function) {
+  if (function.functionCall->name() != "max" || function.ignoreNulls ||
+      function.functionCall->inputs().size() != 1 ||
+      !isFullPartitionRowsFrame(function.frame)) {
+    return false;
+  }
+
+  const auto& input = function.functionCall->inputs()[0];
+  return isFieldAccessExpr(input) && isSupportedSumInputType(input->type());
+}
+
+bool isSupportedFullPartitionAggregateFunction(
+    const core::WindowNode::Function& function) {
+  return isSupportedFullPartitionSumFunction(function) ||
+      isSupportedFullPartitionMaxFunction(function);
+}
+
 bool isSupportedRunningSumFunction(const core::WindowNode::Function& function) {
   if (function.functionCall->name() != "sum" || function.ignoreNulls ||
       function.functionCall->inputs().size() != 1 ||
@@ -197,14 +215,14 @@ bool isSupportedCudfWindowNode(
   }
 
   bool hasRowNumber = false;
-  bool hasFullPartitionSum = false;
+  bool hasFullPartitionAggregate = false;
   bool hasRunningSum = false;
   bool hasFirstValue = false;
   for (const auto& function : node->windowFunctions()) {
     if (isSupportedRankLikeFunction(function)) {
       hasRowNumber = true;
-    } else if (isSupportedFullPartitionSumFunction(function)) {
-      hasFullPartitionSum = true;
+    } else if (isSupportedFullPartitionAggregateFunction(function)) {
+      hasFullPartitionAggregate = true;
     } else if (isSupportedRunningSumFunction(function)) {
       hasRunningSum = true;
     } else if (isSupportedFirstValueFunction(function)) {
@@ -223,7 +241,8 @@ bool isSupportedCudfWindowNode(
     return false;
   }
 
-  if ((hasRowNumber || hasFirstValue || hasRunningSum) && hasFullPartitionSum) {
+  if ((hasRowNumber || hasFirstValue || hasRunningSum) &&
+      hasFullPartitionAggregate) {
     return false;
   }
 
@@ -762,18 +781,39 @@ std::unique_ptr<cudf::column> CudfWindow::computeRankColumn(
   return std::move(scattered->release()[0]);
 }
 
-std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionSumColumn(
+std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionAggregateColumn(
     cudf::table_view const& input,
     const core::WindowNode::Function& function,
     const TypePtr& expectedType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const {
-  VELOX_CHECK(!partitionKeyChannels_.empty());
-
   const auto valueChannel =
       exec::exprToChannel(function.functionCall->inputs()[0].get(), inputType_);
   VELOX_CHECK(
-      valueChannel != kConstantChannel, "Window sum input must be a column");
+      valueChannel != kConstantChannel,
+      "Window aggregate input must be a column");
+  const bool isSum = function.functionCall->name() == "sum";
+  VELOX_CHECK(
+      isSum || function.functionCall->name() == "max",
+      "Unsupported full-partition window aggregate: {}",
+      function.functionCall->name());
+
+  if (partitionKeyChannels_.empty()) {
+    std::unique_ptr<cudf::reduce_aggregation> aggregate =
+        isSum ? cudf::make_sum_aggregation<cudf::reduce_aggregation>()
+              : cudf::make_max_aggregation<cudf::reduce_aggregation>();
+    const auto outputType =
+        isSum ? veloxToCudfDataType(expectedType)
+              : input.column(valueChannel).type();
+    auto scalar = cudf::reduce(
+        input.column(valueChannel),
+        *aggregate,
+        outputType,
+        stream,
+        get_temp_mr());
+    return cudf::make_column_from_scalar(
+        *scalar, input.num_rows(), stream, mr);
+  }
 
   auto partitionColumns = selectColumns(input, partitionKeyChannels_);
 
@@ -782,17 +822,23 @@ std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionSumColumn(
 
   std::vector<cudf::groupby::aggregation_request> requests(1);
   requests[0].values = input.column(valueChannel);
-  requests[0].aggregations.push_back(
-      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  if (isSum) {
+    requests[0].aggregations.push_back(
+        cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  } else {
+    requests[0].aggregations.push_back(
+        cudf::make_max_aggregation<cudf::groupby_aggregation>());
+  }
 
   auto [groupKeys, results] = grouper.aggregate(requests, stream, mr);
   VELOX_CHECK_EQ(results.size(), 1);
   VELOX_CHECK_EQ(results[0].results.size(), 1);
 
-  auto sumByGroup = std::move(results[0].results[0]);
+  auto aggregateByGroup = std::move(results[0].results[0]);
   const auto expectedCudfType = veloxToCudfDataType(expectedType);
-  if (sumByGroup->type() != expectedCudfType) {
-    sumByGroup = cudf::cast(sumByGroup->view(), expectedCudfType, stream, mr);
+  if (aggregateByGroup->type() != expectedCudfType) {
+    aggregateByGroup =
+        cudf::cast(aggregateByGroup->view(), expectedCudfType, stream, mr);
   }
 
   cudf::hash_join lookup(
@@ -814,7 +860,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionSumColumn(
       cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
 
   auto gatheredSums = cudf::gather(
-      cudf::table_view{{sumByGroup->view()}},
+      cudf::table_view{{aggregateByGroup->view()}},
       rightIndicesCol,
       cudf::out_of_bounds_policy::NULLIFY,
       stream,
@@ -975,15 +1021,15 @@ std::unique_ptr<cudf::table> CudfWindow::computeOutputTable(
   }
 
   const auto inputView = input->view();
-  const auto hasFullPartitionSum = std::all_of(
+  const auto hasFullPartitionAggregate = std::all_of(
       windowNode_->windowFunctions().begin(),
       windowNode_->windowFunctions().end(),
-      isSupportedFullPartitionSumFunction);
-  if (hasFullPartitionSum) {
+      isSupportedFullPartitionAggregateFunction);
+  if (hasFullPartitionAggregate) {
     std::vector<std::unique_ptr<cudf::column>> resultColumns;
     resultColumns.reserve(numFunctions);
     for (size_t i = 0; i < numFunctions; ++i) {
-      resultColumns.push_back(computeFullPartitionSumColumn(
+      resultColumns.push_back(computeFullPartitionAggregateColumn(
           inputView,
           windowNode_->windowFunctions()[i],
           outputType_->childAt(inputSize + i),

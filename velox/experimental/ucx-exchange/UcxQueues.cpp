@@ -121,8 +121,21 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
-  VELOX_CHECK_GE(
-      sequence, sequence_, "Get received for an already acknowledged item");
+  if (sequence < sequence_) {
+    // A retried connection can race with task abort after the original server
+    // has advanced this queue. Return the current sequence so only the stale
+    // server closes, without terminating the communicator thread.
+    LOG(WARNING) << "Ignoring stale UCX queue request: requestedSequence="
+                 << sequence << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_, {}, true};
+  }
+  if (notifyV2_ != nullptr && notify != nullptr) {
+    // Preserve the active waiter's callback. The mismatched sequence directs
+    // the duplicate server through its stale-connection close path.
+    LOG(WARNING) << "Ignoring duplicate UCX queue waiter: sequence=" << sequence
+                 << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_ + 1, {}, true};
+  }
   VELOX_CHECK(
       notify_ == nullptr && notifyV2_ == nullptr,
       "UcxDestinationQueue already has a pending data notification");
@@ -257,6 +270,12 @@ UcxOutputQueue::UcxOutputQueue(
     // create the destination queues inside the vector using emplace_back.
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
+  LOG(INFO) << "[UCX-QUEUE] created task=" << taskIdForLog()
+            << " destinations=" << numDestinations
+            << " drivers=" << numDrivers_
+            << " kind=" << core::PartitionedOutputNode::toName(kind_)
+            << " maxSize=" << maxSize_
+            << " continueSize=" << continueSize_;
 }
 
 UcxOutputQueue::UcxOutputQueue(
@@ -275,6 +294,12 @@ UcxOutputQueue::UcxOutputQueue(
   for (int i = 0; i < numDestinations; ++i) {
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
+  LOG(INFO) << "[UCX-QUEUE] created standalone task=" << taskIdForLog()
+            << " destinations=" << numDestinations
+            << " drivers=" << numDrivers_
+            << " kind=" << core::PartitionedOutputNode::toName(kind_)
+            << " maxSize=" << maxSize_
+            << " continueSize=" << continueSize_;
 }
 
 bool UcxOutputQueue::initialize(
@@ -303,6 +328,12 @@ bool UcxOutputQueue::initialize(
     // create the destination queues inside the vector using emplace_back.
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
+  LOG(INFO) << "[UCX-QUEUE] initialized task=" << taskIdForLog()
+            << " destinations=" << numDestinations
+            << " drivers=" << numDrivers_
+            << " kind=" << core::PartitionedOutputNode::toName(kind_)
+            << " maxSize=" << maxSize_
+            << " continueSize=" << continueSize_;
   return true;
 }
 
@@ -397,6 +428,11 @@ void UcxOutputQueue::enqueue(
 bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
   if (queuedBytes_ >= maxSize_ && future) {
+    LOG(WARNING) << "[UCX-QUEUE] producer blocked task=" << taskIdForLog()
+                 << " queuedBytes=" << queuedBytes_
+                 << " queuedPackedColumns=" << queuedPackedColumns_
+                 << " maxSize=" << maxSize_
+                 << " waitingProducers=" << (promises_.size() + 1);
     VLOG(2) << "[BACKPRESSURE] task=" << taskIdForLog()
             << " BLOCKED queuedBytes=" << queuedBytes_
             << " maxSize=" << maxSize_
@@ -552,6 +588,12 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
         numDrivers_,
         "Each driver should call noMoreData exactly once");
     atEnd_ = numFinished_ == numDrivers_;
+    LOG(INFO) << "[UCX-QUEUE] noMoreData task=" << taskIdForLog()
+              << " oneDriverFinished=" << oneDriverFinished
+              << " finishedDrivers=" << numFinished_ << "/" << numDrivers_
+              << " atEnd=" << atEnd_
+              << " queuedBytes=" << queuedBytes_
+              << " queuedPackedColumns=" << queuedPackedColumns_;
     if (!atEnd_) {
       return;
     }
@@ -559,7 +601,7 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
       int64_t avgRows = totalPackedColumnsSent_ > 0
           ? totalRowsSent_ / totalPackedColumnsSent_
           : 0;
-      VLOG(1) << "[OUTPUT-STATS] task=" << taskIdForLog()
+      LOG(INFO) << "[UCX-QUEUE] output stats task=" << taskIdForLog()
               << " totalRows=" << totalRowsSent_
               << " chunks=" << totalPackedColumnsSent_
               << " avgRowsPerChunk=" << avgRows
@@ -706,6 +748,12 @@ void UcxOutputQueue::deleteResults(int destination) {
     queue->finish();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
+    LOG(INFO) << "[UCX-QUEUE] deleteResults task=" << taskIdForLog()
+              << " destination=" << destination
+              << " queuedBytesBeforeDelete=" << bytes
+              << " queuedPackedColumnsBeforeDelete=" << packedCols
+              << " isFinished=" << isFinished
+              << " atEnd=" << atEnd_;
     // update UcxOutputQueue stats
     if (bytes > 0 || packedCols > 0) {
       updateStatsWithFreedLocked(bytes, packedCols, promises);
@@ -815,6 +863,11 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
   // Check whether queue is below low-water mark and return outstanding
   // promises
   if (queuedBytes_ <= continueSize_ && !promises_.empty()) {
+    LOG(INFO) << "[UCX-QUEUE] unblocking producers task=" << taskIdForLog()
+              << " producers=" << promises_.size()
+              << " queuedBytes=" << queuedBytes_
+              << " queuedPackedColumns=" << queuedPackedColumns_
+              << " continueSize=" << continueSize_;
     VLOG(2) << "[BACKPRESSURE] task=" << taskIdForLog()
             << " UNBLOCKING " << promises_.size() << " producers"
             << " queuedBytes=" << queuedBytes_

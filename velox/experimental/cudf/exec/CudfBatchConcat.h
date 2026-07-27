@@ -54,6 +54,7 @@ class CudfBatchConcat : public CudfOperatorBase {
   std::queue<CudfVectorPtr> outputQueue_;
   size_t currentNumRows_{0};
   const size_t targetRows_{0};
+  const size_t maxRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

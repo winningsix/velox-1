@@ -34,7 +34,7 @@ bool isSupportedCudfWindowNode(
 /// Narrow cuDF Window implementation for:
 /// - row_number() / rank() with the default UNBOUNDED PRECEDING to CURRENT ROW
 ///   frame.
-/// - sum(field) over a full partition ROWS frame.
+/// - sum(field) / max(field) over a full partition ROWS frame.
 /// - sum(field) over a partitioned ordered ROWS UNBOUNDED PRECEDING to
 ///   CURRENT ROW frame.
 /// - first(field) / first_value(field) over a partitioned ordered UNBOUNDED
@@ -77,7 +77,7 @@ class CudfWindow : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const;
 
-  std::unique_ptr<cudf::column> computeFullPartitionSumColumn(
+  std::unique_ptr<cudf::column> computeFullPartitionAggregateColumn(
       cudf::table_view const& input,
       const core::WindowNode::Function& function,
       const TypePtr& expectedType,

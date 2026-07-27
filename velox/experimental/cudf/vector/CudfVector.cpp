@@ -25,6 +25,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_stream.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/table/table.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -122,14 +123,20 @@ void validatePhysicalSchema(const TypePtr& type, cudf::table_view table) {
       continue;
     }
     const auto expected = veloxToCudfDataType(rowType->childAt(i));
+    const auto actual = table.column(i);
+    if (expected.id() == cudf::type_id::STRING &&
+        actual.type().id() == cudf::type_id::DICTIONARY32 &&
+        cudf::dictionary_column_view(actual).keys_type() == expected) {
+      continue;
+    }
     VELOX_CHECK(
-        expected == table.column(i).type(),
+        expected == actual.type(),
         "CudfVector schema mismatch at column {} ({}): Velox {} -> cuDF {}, actual cuDF {}. The producing GPU operator emitted columns in the wrong order.",
         i,
         rowType->nameOf(i),
         rowType->childAt(i)->toString(),
         static_cast<int>(expected.id()),
-        static_cast<int>(table.column(i).type().id()));
+        static_cast<int>(actual.type().id()));
   }
 }
 

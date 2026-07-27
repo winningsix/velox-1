@@ -755,6 +755,59 @@ TEST_P(MultiThreadedHashJoinTest, leftSemiJoinFilter) {
       .run();
 }
 
+TEST_P(MultiThreadedHashJoinTest, filteredJoinCacheSemiAndAnti) {
+  constexpr auto kFilteredJoinCacheEnabled =
+      "spark.gluten.sql.columnar.backend.velox.cudf.filteredJoinCache.enabled";
+  auto makeProbeVectors = [&]() {
+    return makeBatches(7, [&](int32_t batch) {
+      return makeRowVector(
+          {"t0", "t1"},
+          {makeFlatVector<int32_t>(
+               37, [batch](auto row) { return (row + batch) % 13; }),
+           makeFlatVector<int32_t>(
+               37, [batch](auto row) { return batch * 100 + row; })});
+    });
+  };
+  auto makeBuildVectors = [&]() {
+    return makeBatches(5, [&](int32_t batch) {
+      return makeRowVector(
+          {"u0"},
+          {makeFlatVector<int32_t>(
+              11, [batch](auto row) { return (row + batch) % 7; })});
+    });
+  };
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"t0"})
+      .probeVectors(makeProbeVectors())
+      .buildKeys({"u0"})
+      .buildVectors(makeBuildVectors())
+      .joinType(core::JoinType::kLeftSemiFilter)
+      .joinOutputLayout({"t0", "t1"})
+      .referenceQuery(
+          "SELECT t0, t1 FROM t WHERE t0 IN (SELECT u0 FROM u)")
+      .config(kFilteredJoinCacheEnabled, "true")
+      .run();
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"t0"})
+      .probeVectors(makeProbeVectors())
+      .buildKeys({"u0"})
+      .buildVectors(makeBuildVectors())
+      .joinType(core::JoinType::kAnti)
+      .nullAware(true)
+      .joinOutputLayout({"t0", "t1"})
+      .referenceQuery(
+          "SELECT t0, t1 FROM t WHERE t0 NOT IN (SELECT u0 FROM u)")
+      .config(kFilteredJoinCacheEnabled, "true")
+      .checkSpillStats(false)
+      .run();
+}
+
 TEST_P(MultiThreadedHashJoinTest, leftSemiJoinFilterWithEmptyBuild) {
   const std::vector<bool> finishOnEmptys = {false, true};
   for (const auto finishOnEmpty : finishOnEmptys) {

@@ -85,6 +85,7 @@
 #include <algorithm>
 #include <cctype>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
@@ -242,27 +243,26 @@ getCudfExpressionEvaluatorRegistry() {
 }
 
 static void ensureBuiltinExpressionEvaluatorsRegistered() {
-  static bool registered = false;
-  if (registered) {
-    return;
-  }
+  static std::once_flag registered;
+  std::call_once(registered, [] {
+    // Default priority for function evaluator
+    const int kFunctionPriority = 50;
 
-  // Default priority for function evaluator
-  const int kFunctionPriority = 50;
-
-  // Function evaluator
-  registerCudfExpressionEvaluator(
-      "function",
-      kFunctionPriority,
-      [](std::shared_ptr<velox::exec::Expr> expr) {
-        return FunctionExpression::canEvaluate(std::move(expr));
-      },
-      [](std::shared_ptr<velox::exec::Expr> expr, const RowTypePtr& row) {
-        return FunctionExpression::create(std::move(expr), row);
-      },
-      /*overwrite=*/false);
-
-  registered = true;
+    // Spark can enter cuDF validation concurrently from several tasks on the
+    // same executor. Serialize this lazy registry write so no validator
+    // iterates the unordered_map while another task mutates it, and so every
+    // caller observes the function evaluator before validation starts.
+    registerCudfExpressionEvaluator(
+        "function",
+        kFunctionPriority,
+        [](std::shared_ptr<velox::exec::Expr> expr) {
+          return FunctionExpression::canEvaluate(std::move(expr));
+        },
+        [](std::shared_ptr<velox::exec::Expr> expr, const RowTypePtr& row) {
+          return FunctionExpression::create(std::move(expr), row);
+        },
+        /*overwrite=*/false);
+  });
 }
 
 } // namespace

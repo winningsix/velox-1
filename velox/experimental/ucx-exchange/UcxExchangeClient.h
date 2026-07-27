@@ -90,6 +90,10 @@ class UcxExchangeClient
   }
 
  private:
+  // Requires queue_->mutex(). Keeps final source metrics available after
+  // close() moves sources_ out of the shared client.
+  folly::F14FastMap<std::string, RuntimeMetric> collectStatsLocked() const;
+
   // Handy for ad-hoc logging.
   const std::string taskId_;
   const int destination_;
@@ -100,6 +104,7 @@ class UcxExchangeClient
 
   std::unordered_set<std::string> remoteTaskIds_;
   std::vector<std::shared_ptr<UcxExchangeSource>> sources_;
+  folly::F14FastMap<std::string, RuntimeMetric> finalStats_;
   bool closed_{false};
 
   // Total number of packed_clumns in flight.

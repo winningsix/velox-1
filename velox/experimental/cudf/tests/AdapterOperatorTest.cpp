@@ -101,6 +101,30 @@ TEST_F(AdapterOperatorTest, fullPartitionWindowSumUsesCudfWindow) {
   EXPECT_TRUE(wasCudfWindowUsed(task));
 }
 
+TEST_F(AdapterOperatorTest, fullPartitionWindowMaxUsesCudfWindow) {
+  auto data = makeRowVector(
+      {"v"},
+      {makeNullableFlatVector<double>(
+          {10.5, std::nullopt, 20.25, 7.0, 20.25})});
+  createDuckDbTable({data});
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .window({"max(v) over (rows between unbounded preceding and "
+                   "unbounded following) as m"})
+          .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config("cudf.enabled", true)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT v, max(v) over (rows between unbounded preceding "
+                      "and unbounded following) FROM tmp");
+
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+}
+
 TEST_F(AdapterOperatorTest, orderedFirstValueUsesCudfWindow) {
   auto data = makeRowVector(
       {"k", "v", "o0", "o1"},

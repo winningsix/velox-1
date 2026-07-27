@@ -40,6 +40,12 @@
 #include <cudf/reduction.hpp>
 #include <cudf/unary.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+
 namespace {
 
 using namespace facebook::velox;
@@ -834,6 +840,104 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
 
 namespace facebook::velox::cudf_velox {
 
+namespace {
+
+constexpr const char* kPartialGroupbyMaxConcurrentConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.partialGroupby.maxConcurrent";
+constexpr const char* kPartialGroupbyBypassEnabledConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.partialGroupby.bypassEnabled";
+constexpr const char* kFinalGroupbyMaxConcurrentConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.finalGroupby.maxConcurrent";
+constexpr const char* kFinalGroupbyStreamingEnabledConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.finalGroupby.streamingEnabled";
+
+struct GroupbyAdmissionState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  int32_t active{0};
+};
+
+GroupbyAdmissionState& partialGroupbyAdmissionState() {
+  static GroupbyAdmissionState state;
+  return state;
+}
+
+GroupbyAdmissionState& finalGroupbyAdmissionState() {
+  static GroupbyAdmissionState state;
+  return state;
+}
+
+class GroupbyAdmissionToken {
+ public:
+  GroupbyAdmissionToken(
+      GroupbyAdmissionState& state,
+      int32_t limit,
+      std::string phase,
+      std::string label)
+      : state_(state),
+        limit_(limit),
+        phase_(std::move(phase)),
+        label_(std::move(label)) {
+    std::unique_lock<std::mutex> lock(state_.mutex);
+    const bool waited = state_.active >= limit_;
+    const auto waitStart = std::chrono::steady_clock::now();
+    state_.cv.wait(lock, [&] {
+      return state_.active < limit_;
+    });
+    ++state_.active;
+    if (waited) {
+      const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - waitStart)
+                              .count();
+      LOG(INFO) << "CUDF " << phase_
+                << " groupby admission acquired after wait"
+                << " waitMs=" << waitMs << " active=" << state_.active
+                << " maxConcurrent=" << limit_ << " label=" << label_;
+    } else {
+      VLOG(1) << "CUDF " << phase_ << " groupby admission acquired"
+              << " active=" << state_.active << " maxConcurrent=" << limit_
+              << " label=" << label_;
+    }
+  }
+
+  ~GroupbyAdmissionToken() {
+    std::unique_lock<std::mutex> lock(state_.mutex);
+    VELOX_CHECK_GT(
+        state_.active,
+        0,
+        "CUDF groupby admission active count underflow");
+    --state_.active;
+    VLOG(1) << "CUDF " << phase_ << " groupby admission released"
+            << " active=" << state_.active << " maxConcurrent=" << limit_
+            << " label=" << label_;
+    lock.unlock();
+    state_.cv.notify_one();
+  }
+
+  GroupbyAdmissionToken(const GroupbyAdmissionToken&) = delete;
+  GroupbyAdmissionToken& operator=(const GroupbyAdmissionToken&) = delete;
+
+ private:
+  GroupbyAdmissionState& state_;
+  const int32_t limit_;
+  const std::string phase_;
+  const std::string label_;
+};
+
+std::unique_ptr<GroupbyAdmissionToken> acquireGroupbyAdmissionToken(
+    GroupbyAdmissionState& state,
+    int32_t limit,
+    const std::string& phase,
+    const std::string& label) {
+  if (limit <= 0) {
+    return nullptr;
+  }
+  return std::make_unique<GroupbyAdmissionToken>(
+      state, limit, phase, label);
+}
+
+} // namespace
+
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
@@ -944,6 +1048,18 @@ CudfGroupby::CudfGroupby(
           !hasFinalAggs(aggregationNode->aggregates())),
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
+      partialGroupbyMaxConcurrent_(std::max(
+          0,
+          driverCtx->queryConfig().get<int32_t>(
+              kPartialGroupbyMaxConcurrentConfig, 0))),
+      partialGroupbyBypassEnabled_(driverCtx->queryConfig().get<bool>(
+          kPartialGroupbyBypassEnabledConfig, true)),
+      finalGroupbyMaxConcurrent_(std::max(
+          0,
+          driverCtx->queryConfig().get<int32_t>(
+              kFinalGroupbyMaxConcurrentConfig, 0))),
+      finalGroupbyStreamingEnabled_(driverCtx->queryConfig().get<bool>(
+          kFinalGroupbyStreamingEnabledConfig, true)),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
@@ -980,7 +1096,9 @@ void CudfGroupby::initialize() {
   // executor. Companion suffixes describe the external Spark plan step; for
   // streaming compaction we explicitly force the internal intermediate step
   // below, so these aggregates can be compacted incrementally as well.
-  streamingEnabled_ = true;
+  streamingEnabled_ =
+      aggregationNode_->step() != core::AggregationNode::Step::kFinal ||
+      finalGroupbyStreamingEnabled_;
 
   if (deviceMemoryDiagnosticsEnabled()) {
     for (const auto& aggregate : aggregationNode_->aggregates()) {
@@ -1059,6 +1177,10 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream,
       get_output_mr());
+  if (!groupbyOnInput) {
+    return;
+  }
+  const auto newPartialRows = groupbyOnInput->size();
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
@@ -1082,10 +1204,33 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         partialOutputStream,
         get_output_mr());
     bufferedResult_ = compactedOutput;
+    partialCumulativeInputRows_ += newPartialRows;
+
+    // Restore the old MPP aggregation engine's convergence heuristic. If
+    // compaction retains almost every pre-aggregated input row, key ranges are
+    // effectively disjoint and repeatedly merging a growing state adds work
+    // without reducing downstream rows.
+    if (partialGroupbyBypassEnabled_ && !partialBypassMode_ &&
+        bufferedResult_) {
+      static constexpr double kPartialBypassThreshold = 0.75;
+      const auto bufferedRows = bufferedResult_->size();
+      const double ratio = partialCumulativeInputRows_ > 0
+          ? static_cast<double>(bufferedRows) /
+              static_cast<double>(partialCumulativeInputRows_)
+          : 0.0;
+      if (ratio > kPartialBypassThreshold) {
+        LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
+                  << "] partial bypass mode triggered: ratio=" << ratio
+                  << " buf_rows=" << bufferedRows
+                  << " cum_input=" << partialCumulativeInputRows_;
+        partialBypassMode_ = true;
+      }
+    }
   } else {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
+    partialCumulativeInputRows_ += newPartialRows;
   }
 }
 
@@ -1135,20 +1280,12 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
 
     // The concatenation has consumed both views. Rebind their allocations to
     // finalStream (or order their original streams after it for packed inputs)
-    // and drop the owners now. This queues stream-ordered frees before the
-    // intermediate groupby allocates its output and workspace. Keeping these
-    // shared_ptrs until the function returns overlaps the previous buffered
-    // result and incoming batch with both the concatenated table and the next
-    // groupby output, which creates a large transient peak for high-cardinality
-    // FINAL aggregations.
+    // and drop the owners before the intermediate groupby allocates output and
+    // workspace.
     orderCudfVectorDeallocationsAfterStream(
         inputOwners, inputStreams, finalStream);
     inputOwners.clear();
 
-    // Materialized precomputed columns are owned separately by preparedInput
-    // and still deallocate on inputTableStream. Keep that stream ordered after
-    // the concatenate only when such an owner exists; views need no reverse
-    // fence and preserving their input-stream concurrency avoids a regression.
     const auto hasOwnedPrecomputed = std::any_of(
         preparedInput.precomputedColumns.begin(),
         preparedInput.precomputedColumns.end(),
@@ -1159,20 +1296,21 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
       cudf::detail::join_streams(
           std::vector<rmm::cuda_stream_view>{finalStream}, inputTableStream);
     }
+
+    auto compactedOutput = doGroupByAggregation(
+        concatenatedTable->view(),
+        groupingKeyOutputChannels_,
+        intermediateAggregators_,
+        bufferedResultType_,
+        finalStream,
+        get_output_mr());
+    bufferedResult_ = compactedOutput;
   } catch (...) {
-    // concatenate can enqueue work before a later column allocation fails.
-    // Complete it before input owners unwind on their original streams.
+    // Concatenate or groupby can enqueue work before a later allocation fails.
+    // Complete it before input owners unwind.
     finalStream.synchronize();
     throw;
   }
-  auto compactedOutput = doGroupByAggregation(
-      concatenatedTable->view(),
-      groupingKeyOutputChannels_,
-      intermediateAggregators_,
-      bufferedResultType_,
-      finalStream,
-      get_output_mr());
-  bufferedResult_ = compactedOutput;
 }
 
 void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
@@ -1229,13 +1367,39 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   if (streamingEnabled_) {
     if (isPartialOutput_) {
+      auto admissionToken = acquireGroupbyAdmissionToken(
+          partialGroupbyAdmissionState(),
+          partialGroupbyMaxConcurrent_,
+          "partial",
+          operatorCtx_->taskId() + " node=" + planNodeId());
+      const auto inputStream = cudfInput->stream();
       computePartialGroupbyStreaming(std::move(cudfInput));
+      if (admissionToken) {
+        if (bufferedResult_) {
+          bufferedResult_->stream().synchronize();
+        } else {
+          inputStream.synchronize();
+        }
+      }
       return;
     } else if (isSingleStep_) {
       computeSingleGroupbyStreaming(std::move(cudfInput));
       return;
     } else {
+      auto admissionToken = acquireGroupbyAdmissionToken(
+          finalGroupbyAdmissionState(),
+          finalGroupbyMaxConcurrent_,
+          "final",
+          operatorCtx_->taskId() + " node=" + planNodeId());
+      const auto inputStream = cudfInput->stream();
       computeFinalGroupbyStreaming(std::move(cudfInput));
+      if (admissionToken) {
+        if (bufferedResult_) {
+          bufferedResult_->stream().synchronize();
+        } else {
+          inputStream.synchronize();
+        }
+      }
       return;
     }
   }
@@ -1313,6 +1477,7 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   }
 
   numInputRows_ = 0;
+  partialCumulativeInputRows_ = 0;
   // We're moving bufferedResult_ to the caller because we want it to be null
   // after this call.
   return std::move(bufferedResult_);
@@ -1321,9 +1486,11 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 RowVectorPtr CudfGroupby::doGetOutput() {
   // Handle partial streaming groupby.
   if (isPartialOutput_ && streamingEnabled_) {
-    if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+    const bool bypassFlush = partialBypassMode_ && bufferedResult_;
+    if (bypassFlush ||
+        (bufferedResult_ &&
+         bufferedResult_->estimateFlatSize() >
+             maxPartialAggregationMemoryUsage_)) {
       return releaseAndResetBufferedResult();
     }
     if (not noMoreInput_) {

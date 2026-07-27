@@ -25,11 +25,13 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
@@ -100,6 +102,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           fmt::format("[{}]", planNode->id())),
       queueManager_(UcxOutputQueueManager::getInstanceRef()),
       numPartitions_(planNode->numPartitions()),
+      isBroadcast_(planNode->isBroadcast()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())) {
@@ -110,6 +113,16 @@ UcxPartitionedOutput::UcxPartitionedOutput(
         planNode->kind(),
         static_cast<int>(numPartitions_),
         numDrivers);
+    if (isBroadcast_) {
+      sharedQueueManager()->updateOutputBuffers(
+          ctx->task->taskId(), static_cast<int>(numPartitions_), true);
+    }
+    LOG(INFO) << "[UCX-POUT] initialized task=" << ctx->task->taskId()
+              << " planNode=" << planNode->id()
+              << " destinations=" << numPartitions_
+              << " drivers=" << numDrivers
+              << " kind=" << core::PartitionedOutputNode::toName(planNode->kind())
+              << " targetRowsPerChunk=" << targetRowsPerChunk_;
     VLOG(2) << "UcxPartitionedOutput initialized queue task="
             << ctx->task->taskId() << " destinations=" << numPartitions_
             << " drivers=" << numDrivers
@@ -130,6 +143,23 @@ UcxPartitionedOutput::UcxPartitionedOutput(
   if (inNames != outNames) {
     getRemapping(planNode->inputType(), planNode->outputType(), remap_);
   }
+  const auto dropsOnlyFirstColumn =
+      planNode->inputType()->size() == planNode->outputType()->size() + 1 &&
+      remap_.size() == planNode->outputType()->size() &&
+      std::all_of(
+          remap_.begin(),
+          remap_.end(),
+          [next = uint32_t{1}](uint32_t inputIndex) mutable {
+            return inputIndex == next++;
+          });
+  usesPrecomputedPartitionHash_ =
+      partitionKeyIndices_.size() == 1 && partitionKeyIndices_.front() == 0 &&
+      planNode->inputType()->childAt(0)->kind() == TypeKind::INTEGER &&
+      dropsOnlyFirstColumn;
+  VLOG(1) << "UcxPartitionedOutput partition input task=" << taskId()
+          << " precomputedHash=" << usesPrecomputedPartitionHash_
+          << " inputType=" << planNode->inputType()->toString()
+          << " outputType=" << planNode->outputType()->toString();
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
@@ -143,6 +173,7 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
   VELOX_CHECK(
       !future_.valid() || future_.hasValue(),
       "addInput with outstanding future!");
+  VELOX_CHECK(!hasActiveFlush(), "addInput while a flush is still active");
 
   // Record stats per-input (before buffering).
   {
@@ -162,99 +193,15 @@ void UcxPartitionedOutput::flushPending() {
   CudaAllocationTraceScope allocationTrace(
       fmt::format(
           "UcxPartitionedOutput task={} method=flushPending", taskId()));
-  if (pendingInputs_.empty()) {
+  if (!hasActiveFlush() && pendingInputs_.empty()) {
     return;
   }
 
   try {
-    cudf::table_view inputTableView;
-    rmm::cuda_stream_view stream = pendingInputs_.back()->stream();
-    // Keeps the merged table alive while inputTableView references it.
-    std::unique_ptr<cudf::table> mergedTable;
-
-    if (pendingInputs_.size() == 1) {
-      // Fast path: use the single input's view directly (no GPU alloc).
-      auto& cv = pendingInputs_[0];
-      stream = cv->stream();
-      inputTableView = cv->getTableView();
-    } else {
-      // Collect full input table views. Partition keys are defined over the
-      // input type; output remapping is applied only after partitioning.
-      std::vector<cudf::table_view> views;
-      std::vector<rmm::cuda_stream_view> inputStreams;
-      views.reserve(pendingInputs_.size());
-      inputStreams.reserve(pendingInputs_.size());
-      for (auto& v : pendingInputs_) {
-        inputStreams.push_back(v->stream());
-        views.push_back(v->getTableView());
-      }
-
-      cudf::detail::join_streams(inputStreams, stream);
-      mergedTable = cudf::concatenate(
-          views, stream, cudf::get_current_device_resource_ref());
-
-      orderCudfVectorDeallocationsAfterStream(
-          pendingInputs_, inputStreams, stream);
-
-      // Free input GPU memory before partitioning (peak = 2x -> 1x).
-      pendingInputs_.clear();
-
-      inputTableView = mergedTable->view();
+    if (!hasActiveFlush()) {
+      preparePendingFlush();
     }
-
-    // Partition + enqueue (identical to previous addInput logic).
-    auto queueManager = sharedQueueManager();
-    if (numPartitions_ > 1) {
-      if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
-        hashPartition(inputTableView, stream);
-      } else {
-        equalPartition(inputTableView, stream);
-      }
-    } else {
-      const auto tableRows = inputTableView.num_rows();
-      const auto rowsPerChunk = std::max<cudf::size_type>(
-          1,
-          targetRowsPerChunk_ > 0
-              ? std::min<cudf::size_type>(
-                    tableRows,
-                    static_cast<cudf::size_type>(targetRowsPerChunk_))
-              : tableRows);
-      // SINGLE/gather exchanges must obey the same chunk bound as HASH and
-      // RANGE.  Packing the whole input here bypassed splitAndEnqueue and let
-      // a global sort/gather create tens-of-GiB host-staging transfers.
-      for (cudf::size_type start = 0; start < tableRows;
-           start += rowsPerChunk) {
-        const auto end =
-            std::min<cudf::size_type>(tableRows, start + rowsPerChunk);
-        auto slicedTables = cudf::slice(inputTableView, {start, end});
-        VELOX_CHECK_EQ(slicedTables.size(), 1);
-        auto outputView = remap_.empty()
-            ? slicedTables[0]
-            : slicedTables[0].select(remap_.begin(), remap_.end());
-        auto packedCols = cudf::pack(
-            outputView, stream, cudf::get_current_device_resource_ref());
-        stream.synchronize();
-        auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-            std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-        queueManager->enqueue(
-            this->taskId(),
-            0,
-            std::move(packedColsPtr),
-            outputView.num_rows());
-      }
-    }
-
-    // Check backpressure after enqueue.
-    auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
-    if (blocked) {
-      VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
-              << " is blocked, can no longer write to output!";
-    }
-    blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
-                              : exec::BlockingReason::kNotBlocked;
-
-    pendingInputs_.clear();
-    pendingRows_ = 0;
+    advanceActiveFlush();
 
   } catch (const rmm::bad_alloc& e) {
     VLOG(1)
@@ -262,11 +209,141 @@ void UcxPartitionedOutput::flushPending() {
         << " caught memory alloc error, removing all memory in output queues";
     pendingInputs_.clear();
     pendingRows_ = 0;
+    clearActiveFlush();
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
     throw;
   }
+}
+
+void UcxPartitionedOutput::preparePendingFlush() {
+  VELOX_CHECK(!hasActiveFlush());
+  VELOX_CHECK(!pendingInputs_.empty());
+
+  activeInputs_ = std::move(pendingInputs_);
+  pendingInputs_.clear();
+  pendingRows_ = 0;
+
+  auto stream = activeInputs_.back()->stream();
+  if (activeInputs_.size() > 1) {
+    std::vector<cudf::table_view> views;
+    std::vector<rmm::cuda_stream_view> inputStreams;
+    views.reserve(activeInputs_.size());
+    inputStreams.reserve(activeInputs_.size());
+    for (auto& input : activeInputs_) {
+      inputStreams.push_back(input->stream());
+      views.push_back(input->getTableView());
+    }
+
+    cudf::detail::join_streams(inputStreams, stream);
+    activeMergedTable_ = cudf::concatenate(
+        views, stream, cudf::get_current_device_resource_ref());
+    orderCudfVectorDeallocationsAfterStream(
+        activeInputs_, inputStreams, stream);
+    activeInputs_.clear();
+  }
+
+  activeStream_ = stream;
+  activeNextRow_ = 0;
+  const auto tableRows = activeTableView().num_rows();
+  activeRowsPerWindow_ = std::max<cudf::size_type>(
+      1,
+      targetRowsPerChunk_ > 0
+          ? std::min<cudf::size_type>(
+                tableRows,
+                static_cast<cudf::size_type>(targetRowsPerChunk_))
+          : tableRows);
+  VLOG(1) << "[UCX-POUT] prepared bounded flush task=" << taskId()
+          << " pipeline=" << pipelineId_ << " driver=" << driverId_
+          << " rows=" << tableRows
+          << " rowsPerWindow=" << activeRowsPerWindow_
+          << " destinations=" << numPartitions_
+          << " broadcast=" << isBroadcast_;
+}
+
+bool UcxPartitionedOutput::hasActiveFlush() const {
+  return activeMergedTable_ != nullptr || !activeInputs_.empty();
+}
+
+cudf::table_view UcxPartitionedOutput::activeTableView() {
+  VELOX_CHECK(hasActiveFlush());
+  if (activeMergedTable_) {
+    return activeMergedTable_->view();
+  }
+  VELOX_CHECK_EQ(activeInputs_.size(), 1);
+  return activeInputs_.front()->getTableView();
+}
+
+void UcxPartitionedOutput::clearActiveFlush() {
+  activeInputs_.clear();
+  activeMergedTable_.reset();
+  activeStream_.reset();
+  activeNextRow_ = 0;
+  activeRowsPerWindow_ = 0;
+}
+
+void UcxPartitionedOutput::updateBackpressure() {
+  auto blocked = sharedQueueManager()->checkBlocked(this->taskId(), &future_);
+  if (blocked) {
+    const auto remainingRows = hasActiveFlush()
+        ? activeTableView().num_rows() - activeNextRow_
+        : cudf::size_type{0};
+    VLOG(1) << "[UCX-POUT] blocked after bounded window task=" << taskId()
+            << " pipeline=" << pipelineId_ << " driver=" << driverId_
+            << " remainingRows=" << remainingRows
+            << " rowsPerWindow=" << activeRowsPerWindow_
+            << " destinations=" << numPartitions_;
+  }
+  blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
+                            : exec::BlockingReason::kNotBlocked;
+}
+
+void UcxPartitionedOutput::advanceActiveFlush() {
+  VELOX_CHECK(hasActiveFlush());
+  VELOX_CHECK(activeStream_.has_value());
+  VELOX_CHECK_EQ(blockingReason_, exec::BlockingReason::kNotBlocked);
+
+  auto tableView = activeTableView();
+  const auto tableRows = tableView.num_rows();
+  if (activeNextRow_ >= tableRows) {
+    clearActiveFlush();
+    return;
+  }
+
+  auto stream = *activeStream_;
+  const auto end = std::min<cudf::size_type>(
+      tableRows, activeNextRow_ + activeRowsPerWindow_);
+  auto slices = cudf::slice(tableView, {activeNextRow_, end}, stream);
+  VELOX_CHECK_EQ(slices.size(), 1);
+  auto window = slices[0];
+
+  if (isBroadcast_ || numPartitions_ == 1) {
+    auto outputView = remap_.empty()
+        ? window
+        : window.select(remap_.begin(), remap_.end());
+    auto packedCols = cudf::pack(
+        outputView, stream, cudf::get_current_device_resource_ref());
+    stream.synchronize();
+    auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+        std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+    // Broadcast queues fan out a destination-zero enqueue to all consumers.
+    sharedQueueManager()->enqueue(
+        this->taskId(),
+        0,
+        std::move(packedColsPtr),
+        outputView.num_rows());
+  } else if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
+    hashPartition(window, stream);
+  } else {
+    equalPartition(window, stream);
+  }
+
+  activeNextRow_ = end;
+  if (activeNextRow_ == tableRows) {
+    clearActiveFlush();
+  }
+  updateBackpressure();
 }
 
 exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
@@ -283,9 +360,27 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   if (finished_) {
     return nullptr;
   }
-  if (noMoreInput_) {
-    flushPending(); // drain any remaining buffered inputs
+  // The Driver normally calls isBlocked() first. Keep this guard so an
+  // outstanding queue future is never overwritten by a direct getOutput().
+  if (blockingReason_ != exec::BlockingReason::kNotBlocked) {
+    return nullptr;
+  }
+  if (hasActiveFlush() || (noMoreInput_ && !pendingInputs_.empty())) {
+    flushPending();
+  }
+  // A final window may have filled the queue. Publish EOS only after the Driver
+  // has observed and resumed that queue future.
+  if (noMoreInput_ && !hasActiveFlush() && pendingInputs_.empty() &&
+      blockingReason_ == exec::BlockingReason::kNotBlocked) {
+    LOG(INFO) << "[UCX-POUT] noMoreInput task=" << taskId()
+              << " pipeline=" << pipelineId_
+              << " driver=" << driverId_
+              << " pendingRows=" << pendingRows_
+              << " destinations=" << numPartitions_;
     sharedQueueManager()->noMoreData(this->taskId());
+    LOG(INFO) << "[UCX-POUT] noMoreData sent task=" << taskId()
+              << " pipeline=" << pipelineId_
+              << " driver=" << driverId_;
     finished_ = true;
   }
   return nullptr;
@@ -373,13 +468,43 @@ void UcxPartitionedOutput::hashPartition(
     partitionKeyIndices.push_back(static_cast<cudf::size_type>(idx));
   }
 
-  auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
-      tableView,
-      partitionKeyIndices,
-      numPartitions_,
-      cudf::hash_id::HASH_MURMUR3,
-      cudf::DEFAULT_HASH_SEED,
-      stream);
+  auto [partitionedTable, partitionOffsets] = [&]() {
+    if (usesPrecomputedPartitionHash_) {
+      const auto hashColumn = tableView.column(partitionKeyIndices.front());
+      VELOX_CHECK(
+          hashColumn.type().id() == cudf::type_id::INT32,
+          "Precomputed Spark partition hash must be INT32");
+      VELOX_CHECK_EQ(
+          hashColumn.null_count(),
+          0,
+          "Precomputed Spark partition hash must be non-null");
+      cudf::numeric_scalar<int32_t> divisor(
+          static_cast<int32_t>(numPartitions_),
+          true,
+          stream,
+          cudf::get_current_device_resource_ref());
+      auto partitionMap = cudf::binary_operation(
+          hashColumn,
+          divisor,
+          cudf::binary_operator::PMOD,
+          cudf::data_type{cudf::type_id::INT32},
+          stream,
+          cudf::get_current_device_resource_ref());
+      return cudf::partition(
+          tableView,
+          partitionMap->view(),
+          numPartitions_,
+          stream,
+          cudf::get_current_device_resource_ref());
+    }
+    return cudf::hash_partition(
+        tableView,
+        partitionKeyIndices,
+        numPartitions_,
+        cudf::hash_id::HASH_MURMUR3,
+        cudf::DEFAULT_HASH_SEED,
+        stream);
+  }();
 
   VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
   VELOX_CHECK_EQ(partitionOffsets[0], 0);

@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -23,6 +24,8 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <folly/Uri.h>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -109,6 +112,54 @@ rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
       cuda::mr::any_resource<cuda::mr::device_accessible>{
           cudf::get_current_device_resource_ref()}};
   return currentResource;
+}
+
+enum class ReceiveDeviceMemoryResourceMode {
+  ActiveCudf,
+  DedicatedCuda,
+  DedicatedAsync,
+};
+
+ReceiveDeviceMemoryResourceMode receiveDeviceMemoryResourceMode() {
+  static const auto mode = [] {
+    const auto* value =
+        std::getenv("GLUTEN_UCX_RECV_USE_DEDICATED_CUDA_MR");
+    if (value == nullptr) {
+      return ReceiveDeviceMemoryResourceMode::ActiveCudf;
+    }
+    std::string normalized{value};
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "async") {
+      return ReceiveDeviceMemoryResourceMode::DedicatedAsync;
+    }
+    if (!normalized.empty() && normalized != "0" && normalized != "false" &&
+        normalized != "off" && normalized != "no") {
+      return ReceiveDeviceMemoryResourceMode::DedicatedCuda;
+    }
+    return ReceiveDeviceMemoryResourceMode::ActiveCudf;
+  }();
+  return mode;
+}
+
+rmm::mr::cuda_memory_resource& dedicatedReceiveDeviceMemoryResource() {
+  // Preserve the allocator used by the stable Gluten-MPP UCX path. cudaMalloc
+  // returns fresh storage and cudaFree synchronizes before reuse, avoiding
+  // cross-stream lifetime bugs that a shared stream-ordered pool can expose.
+  static rmm::mr::cuda_memory_resource resource;
+  return resource;
+}
+
+rmm::mr::cuda_async_memory_resource&
+dedicatedAsyncReceiveDeviceMemoryResource() {
+  // A private cudaMallocAsync pool isolates UCX's out-of-stream writes from
+  // cuDF operator allocations without paying one synchronous cudaMalloc/free
+  // pair for every Spark task-scoped receive packet.
+  static rmm::mr::cuda_async_memory_resource resource;
+  return resource;
 }
 
 int64_t maxInFlightRecvDeviceBytes() {
@@ -261,11 +312,23 @@ void UcxExchangeSource::process() {
       // Get the endpoint.
       HostPort hp{host_, port_};
       std::shared_ptr<UcxExchangeSource> selfPtr = getSelfPtr();
-      auto epRef = communicator_->assocEndpointRef(selfPtr, hp);
+      bool endpointReused = false;
+      const auto endpointAssocStart = std::chrono::steady_clock::now();
+      auto epRef =
+          communicator_->assocEndpointRef(selfPtr, hp, &endpointReused);
+      metrics_.endpointAssocNanos_.store(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - endpointAssocStart)
+              .count(),
+          std::memory_order_relaxed);
+      (endpointReused ? metrics_.endpointCacheHits_
+                      : metrics_.endpointCreates_)
+          .store(1, std::memory_order_relaxed);
       if (epRef) {
         setEndpoint(epRef);
         setStateIf(
             ReceiverState::Created, ReceiverState::WaitingForHandshakeComplete);
+        handshakeStartedAt_ = std::chrono::steady_clock::now();
         sendHandshake();
       } else {
         // connection failed.
@@ -433,9 +496,25 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
 
   // these metrics will be aggregated over all exchange sources of the same
   // exchange client.
-  map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
-  map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
-  map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
+  map["ucxExchangeSource.logicalSources"] = RuntimeMetric(1);
+  map["ucxExchangeSource.numPackedColumns"] = RuntimeMetric(
+      metrics_.numPackedColumns_.load(std::memory_order_relaxed));
+  map["ucxExchangeSource.totalBytes"] = RuntimeMetric(
+      metrics_.totalBytes_.load(std::memory_order_relaxed),
+      RuntimeCounter::Unit::kBytes);
+  map["ucxExchangeSource.endpointCacheHits"] = RuntimeMetric(
+      metrics_.endpointCacheHits_.load(std::memory_order_relaxed));
+  map["ucxExchangeSource.endpointCreates"] = RuntimeMetric(
+      metrics_.endpointCreates_.load(std::memory_order_relaxed));
+  map["ucxExchangeSource.endpointAssocNanos"] = RuntimeMetric(
+      metrics_.endpointAssocNanos_.load(std::memory_order_relaxed),
+      RuntimeCounter::Unit::kNanos);
+  map["ucxExchangeSource.handshakeNanos"] = RuntimeMetric(
+      metrics_.handshakeNanos_.load(std::memory_order_relaxed),
+      RuntimeCounter::Unit::kNanos);
+  map["ucxExchangeSource.createToReadyNanos"] = RuntimeMetric(
+      metrics_.createToReadyNanos_.load(std::memory_order_relaxed),
+      RuntimeCounter::Unit::kNanos);
   return map;
 }
 
@@ -762,14 +841,35 @@ bool UcxExchangeSource::tryStartDataReceive(
   //
   // Only transports without CUDA support stage through host memory and copy into
   // the final device buffer after the host receive completes.
+  const auto receiveMemoryResourceMode = receiveDeviceMemoryResourceMode();
   try {
-    auto& recvMemoryResource = receiveDeviceMemoryResource();
-    ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-        ptr->metadata.dataSizeBytes,
-        stream,
-        cuda::mr::any_resource<cuda::mr::device_accessible>{
-            recvMemoryResource});
-    if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    if (receiveMemoryResourceMode ==
+        ReceiveDeviceMemoryResourceMode::DedicatedCuda) {
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes,
+          stream,
+          cuda::mr::any_resource<cuda::mr::device_accessible>{
+              dedicatedReceiveDeviceMemoryResource()});
+    } else if (
+        receiveMemoryResourceMode ==
+        ReceiveDeviceMemoryResourceMode::DedicatedAsync) {
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes,
+          stream,
+          cuda::mr::any_resource<cuda::mr::device_accessible>{
+              dedicatedAsyncReceiveDeviceMemoryResource()});
+    } else {
+      auto& recvMemoryResource = receiveDeviceMemoryResource();
+      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+          ptr->metadata.dataSizeBytes,
+          stream,
+          cuda::mr::any_resource<cuda::mr::device_accessible>{
+              recvMemoryResource});
+    }
+    if (receiveMemoryResourceMode ==
+            ReceiveDeviceMemoryResourceMode::ActiveCudf &&
+        facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+      auto& recvMemoryResource = receiveDeviceMemoryResource();
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
       const auto peakBucket = bytes.peak / kReportStep;
@@ -933,8 +1033,9 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     // The source-level pageable fallback buffer is intentionally retained and
     // reused by the next serial host-staged receive.
 
-    metrics_.numPackedColumns_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+    metrics_.numPackedColumns_.fetch_add(1, std::memory_order_relaxed);
+    metrics_.totalBytes_.fetch_add(
+        ptr->metadata.dataSizeBytes, std::memory_order_relaxed);
 
     // Create packed_columns from the received metadata and data buffer
     cudf::packed_columns packedCols(
@@ -1021,6 +1122,18 @@ void UcxExchangeSource::onHandshakeResponse(
       std::static_pointer_cast<HandshakeResponse>(arg);
 
   isIntraNodeTransfer_ = response->isIntraNodeTransfer;
+
+  const auto readyAt = std::chrono::steady_clock::now();
+  metrics_.handshakeNanos_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          readyAt - handshakeStartedAt_)
+          .count(),
+      std::memory_order_relaxed);
+  metrics_.createToReadyNanos_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          readyAt - createdAt_)
+          .count(),
+      std::memory_order_relaxed);
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-RESPONSE] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
@@ -1118,8 +1231,9 @@ void UcxExchangeSource::onIntraNodeData(
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
           << " size=" << data->gpu_data->size();
 
-  metrics_.numPackedColumns_.addValue(1);
-  metrics_.totalBytes_.addValue(data->gpu_data->size());
+  metrics_.numPackedColumns_.fetch_add(1, std::memory_order_relaxed);
+  metrics_.totalBytes_.fetch_add(
+      data->gpu_data->size(), std::memory_order_relaxed);
   // Broadcast output can share the same packed_columns across multiple
   // destinations. Keep the zero-copy path for uniquely owned partitioned
   // pages, but clone shared pages before moving out of them.
@@ -1142,6 +1256,22 @@ void UcxExchangeSource::onIntraNodeData(
       sharedPage ? std::make_unique<rmm::device_buffer>(
                        data->gpu_data->data(), data->gpu_data->size(), stream)
                  : std::move(data->gpu_data));
+
+  if (sharedPage) {
+    // rmm::device_buffer's copy constructor enqueues an asynchronous copy on
+    // `stream`.  The shared source page can subsequently reach its last
+    // destination, be moved into that consumer, and be freed or reused on
+    // `producerStream` before this copy completes.  This used to corrupt a
+    // replicated build side silently (for example, intermittent short Q20
+    // results) and could later poison the CUDA context with an illegal address.
+    //
+    // Order the source page's stream after the clone without blocking the host.
+    // Its stream-ordered deallocation, and the zero-copy last consumer's work,
+    // can then only run after every previously scheduled clone has finished.
+    facebook::velox::cudf_velox::CudaEvent cloneComplete(
+        cudaEventDisableTiming);
+    cloneComplete.recordFrom(stream).waitOn(producerStream);
+  }
 
   // Unpack to get the table_view and create a packed_table
   cudf::table_view tableView = cudf::unpack(packedCols);

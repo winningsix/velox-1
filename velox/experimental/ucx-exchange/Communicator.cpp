@@ -253,16 +253,14 @@ void Communicator::run() {
       // or worker_->signal() is called (from addToWorkQueue,
       // deferEndpointCleanup, or stop).
       if (blockingMode) {
-        // CUDA IPC/copy completions are not guaranteed to signal the UCX
-        // worker event fd. Busy-progress while an exchange or a deferred
-        // request is active; otherwise a rendezvous can sleep until an
-        // unrelated signal arrives and serialize large GPU shuffles. Once the
-        // communicator is idle, retain the indefinite wait to avoid burning a
-        // CPU core per executor.
-        const bool needsBusyProgress =
-            numCommElements_.load(std::memory_order_relaxed) > 0 ||
-            !deferredRequests_.empty();
-        worker_->progressWorkerEvent(needsBusyProgress ? 0 : -1);
+        // CUDA IPC/copy completions and an active-message handshake arriving
+        // while this executor has no registered exchange elements are not
+        // guaranteed to signal the UCX worker event fd. Keep progressing even
+        // while idle. Spark can create a consumer source before the producer
+        // task is launched on the remote executor; sleeping indefinitely here
+        // otherwise leaves that handshake waiting for an unrelated signal.
+        // This also restores the progress behavior used by the MPP baseline.
+        worker_->progressWorkerEvent(0);
       } else {
         worker_->progress();
       }
@@ -325,13 +323,20 @@ void Communicator::unregister(std::shared_ptr<CommElement> comms) {
 
 std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     std::shared_ptr<CommElement> comms,
-    HostPort hostPort) {
+    HostPort hostPort,
+    bool* reused) {
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
   auto it = endpoints_.find(hostPort);
   if (it != endpoints_.end()) {
+    if (reused != nullptr) {
+      *reused = true;
+    }
     std::shared_ptr<EndpointRef> ep = it->second;
     ep->addCommElem(comms);
     return ep;
+  }
+  if (reused != nullptr) {
+    *reused = false;
   }
   // endpoint doesn't exist. Need to connect. Enable error handling.
   auto ep = worker_->createEndpointFromHostname(

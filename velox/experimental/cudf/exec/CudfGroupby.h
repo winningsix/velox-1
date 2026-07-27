@@ -128,6 +128,10 @@ class CudfGroupby : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const bool isSingleStep_;
+  const int32_t partialGroupbyMaxConcurrent_;
+  const bool partialGroupbyBypassEnabled_;
+  const int32_t finalGroupbyMaxConcurrent_;
+  const bool finalGroupbyStreamingEnabled_;
   // Companion aggregate names encode the Spark plan step. Internal streaming
   // compaction overrides that suffix with the intermediate step.
   bool streamingEnabled_{true};
@@ -142,6 +146,8 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+  bool partialBypassMode_{false};
+  int64_t partialCumulativeInputRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

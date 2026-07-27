@@ -214,6 +214,7 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
         isCountFunctionName(aggregate.call->name())
             ? std::make_optional(getCountInputKind(aggregate, constants[i]))
             : std::nullopt,
+        aggregate.call->inputs().size(),
         isDecimalAggregate);
   }
   return params;
@@ -279,7 +280,6 @@ AggregationInputChannels buildAggregationInputChannels(
           auto constant =
               dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
         result.constants[i] = constant->toConstantVector(operatorCtx.pool());
-        aggInputs.push_back(fallbackChannel);
       } else {
         aggInputs.push_back(
             inputRowSchema->size() + result.precomputedInputs.size());

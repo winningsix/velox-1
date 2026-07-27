@@ -55,13 +55,373 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <iterator>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox {
+
+struct CudfReplicatedHashCacheEntry {
+  CudfReplicatedHashCacheEntry(std::string key, std::string builderTaskId)
+      : key(std::move(key)), builderTaskId(std::move(builderTaskId)) {}
+
+  const std::string key;
+  const std::string builderTaskId;
+  bool buildComplete{false};
+  bool buildFailed{false};
+  std::optional<CudfHashJoinBridge::HashState> hashState;
+  std::optional<rmm::cuda_stream_view> buildStream;
+  std::shared_ptr<CudaEvent> buildReadyEvent;
+  std::vector<ContinuePromise> buildPromises;
+};
 
 namespace {
 
 constexpr uint64_t kSemiAntiBuildConcatGroupBytes = 8ULL << 30;
+constexpr const char* kFilteredJoinCacheEnabledConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.filteredJoinCache.enabled";
+constexpr const char* kReplicatedReadStreamsConfig =
+    "spark.gluten.ucx.shuffle.native.read.replicatedStreams";
+constexpr const char* kReplicatedHashCacheEnabledConfig =
+    "spark.gluten.ucx.shuffle.replicatedHashCache.enabled";
+
+struct CudfReplicatedHashCache {
+  std::mutex mutex;
+  std::unordered_map<
+      std::string,
+      std::shared_ptr<CudfReplicatedHashCacheEntry>>
+      entries;
+};
+
+CudfReplicatedHashCache& replicatedHashCache() {
+  static CudfReplicatedHashCache cache;
+  return cache;
+}
+
+bool planContainsNodeId(
+    const core::PlanNodePtr& plan,
+    const core::PlanNodeId& nodeId) {
+  if (plan->id() == nodeId) {
+    return true;
+  }
+  for (const auto& source : plan->sources()) {
+    if (planContainsNodeId(source, nodeId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string replicatedHashCacheKey(
+    const std::shared_ptr<const core::HashJoinNode>& joinNode,
+    exec::OperatorCtx* operatorCtx) {
+  const auto& queryConfig =
+      operatorCtx->task()->queryCtx()->queryConfig();
+  const auto enabled =
+      queryConfig.get<bool>(kReplicatedHashCacheEnabledConfig, false);
+  const auto replicatedStreams =
+      queryConfig.get<std::string>(kReplicatedReadStreamsConfig, "");
+  const auto taskId = operatorCtx->taskId();
+  VLOG(1) << "CUDF replicated hash cache CHECK"
+          << " enabled=" << enabled
+          << " replicatedStreams=" << replicatedStreams
+          << " taskId=" << taskId
+          << " node=" << joinNode->id()
+          << " inner=" << joinNode->isInnerJoin()
+          << " source0=" << joinNode->sources()[0]->id()
+          << " source1=" << joinNode->sources()[1]->id();
+  if (!enabled || !joinNode->isInnerJoin()) {
+    return "";
+  }
+
+  const auto mapMarker = taskId.find("_Map_");
+  if (mapMarker == std::string::npos) {
+    return "";
+  }
+
+  std::stringstream values(replicatedStreams);
+  std::string token;
+  while (std::getline(values, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    const auto exchangeNodeId = fmt::format("ucx_exchange_{}", token);
+    VLOG(1) << "CUDF replicated hash cache CHECK_STREAM"
+            << " exchange=" << exchangeNodeId
+            << " node=" << joinNode->id()
+            << " inSource0="
+            << planContainsNodeId(joinNode->sources()[0], exchangeNodeId)
+            << " inSource1="
+            << planContainsNodeId(joinNode->sources()[1], exchangeNodeId);
+    if (planContainsNodeId(joinNode->sources()[1], exchangeNodeId)) {
+      return fmt::format(
+          "{}:join={}:build={}",
+          taskId.substr(0, mapMarker),
+          joinNode->id(),
+          exchangeNodeId);
+    }
+  }
+  return "";
+}
+
+std::shared_ptr<CudfReplicatedHashCacheEntry> getReplicatedHashCacheEntry(
+    const std::string& key,
+    const std::string& taskId) {
+  auto& cache = replicatedHashCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = cache.entries.find(key);
+  auto entry =
+      it == cache.entries.end() ? nullptr : it->second;
+  if (entry == nullptr || entry->buildFailed) {
+    // Keep a completed entry strongly reachable across Spark task waves in the
+    // same stage. A weak entry disappears as soon as the first wave finishes,
+    // which makes later tasks rebuild the same replicated table. Reclaim
+    // quiescent entries when a new cache key arrives; entries with an active
+    // build/probe lease have use_count() > 1 and remain valid.
+    for (auto old = cache.entries.begin(); old != cache.entries.end();) {
+      if (old->first != key && old->second.use_count() == 1 &&
+          (old->second->buildComplete || old->second->buildFailed)) {
+        old = cache.entries.erase(old);
+      } else {
+        ++old;
+      }
+    }
+    entry = std::make_shared<CudfReplicatedHashCacheEntry>(key, taskId);
+    cache.entries[key] = entry;
+    return entry;
+  }
+  return entry;
+}
+
+void waitForReplicatedHashCacheEntry(
+    const std::shared_ptr<CudfReplicatedHashCacheEntry>& entry,
+    ContinueFuture* future) {
+  VELOX_CHECK_NOT_NULL(future);
+  auto& cache = replicatedHashCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  if (entry->buildFailed) {
+    VELOX_FAIL(
+        "CUDF replicated hash cache builder failed for key {}", entry->key);
+  }
+  if (entry->buildComplete) {
+    return;
+  }
+  auto [promise, waitFuture] = makeVeloxContinuePromiseContract(
+      fmt::format("CudfReplicatedHashCache::{}", entry->key));
+  entry->buildPromises.push_back(std::move(promise));
+  *future = std::move(waitFuture);
+}
+
+void putReplicatedHashCacheEntry(
+    const std::shared_ptr<CudfReplicatedHashCacheEntry>& entry,
+    CudfHashJoinBridge::HashState hashState,
+    rmm::cuda_stream_view buildStream,
+    std::shared_ptr<CudaEvent> buildReadyEvent) {
+  std::vector<ContinuePromise> promises;
+  {
+    auto& cache = replicatedHashCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    VELOX_CHECK(!entry->buildComplete);
+    VELOX_CHECK(!entry->buildFailed);
+    hashState.replicatedCacheLease.reset();
+    entry->hashState = std::move(hashState);
+    entry->buildStream = buildStream;
+    entry->buildReadyEvent = std::move(buildReadyEvent);
+    entry->buildComplete = true;
+    promises = std::move(entry->buildPromises);
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+void failReplicatedHashCacheEntry(
+    const std::shared_ptr<CudfReplicatedHashCacheEntry>& entry) {
+  std::vector<ContinuePromise> promises;
+  {
+    auto& cache = replicatedHashCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (entry->buildComplete || entry->buildFailed) {
+      return;
+    }
+    entry->buildFailed = true;
+    promises = std::move(entry->buildPromises);
+    const auto it = cache.entries.find(entry->key);
+    if (it != cache.entries.end() && it->second == entry) {
+      cache.entries.erase(it);
+    }
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+struct ReplicatedHashCacheSnapshot {
+  CudfHashJoinBridge::HashState hashState;
+  rmm::cuda_stream_view buildStream;
+  std::shared_ptr<CudaEvent> buildReadyEvent;
+};
+
+std::optional<ReplicatedHashCacheSnapshot> replicatedHashCacheSnapshot(
+    const std::shared_ptr<CudfReplicatedHashCacheEntry>& entry) {
+  auto& cache = replicatedHashCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  if (entry->buildFailed) {
+    VELOX_FAIL(
+        "CUDF replicated hash cache builder failed for key {}", entry->key);
+  }
+  if (!entry->buildComplete) {
+    return std::nullopt;
+  }
+  VELOX_CHECK(entry->hashState.has_value());
+  VELOX_CHECK(entry->buildStream.has_value());
+  VELOX_CHECK_NOT_NULL(entry->buildReadyEvent);
+  return ReplicatedHashCacheSnapshot{
+      .hashState = entry->hashState.value(),
+      .buildStream = entry->buildStream.value(),
+      .buildReadyEvent = entry->buildReadyEvent};
+}
+
+struct HashJoinBuildAdmissionState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  int active{0};
+};
+
+HashJoinBuildAdmissionState& hashJoinBuildAdmissionState() {
+  static HashJoinBuildAdmissionState state;
+  return state;
+}
+
+int hashJoinBuildAdmissionLimit() {
+  static const int limit = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_BUILD_MAX_CONCURRENT");
+    if (value == nullptr) {
+      return 0;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtol(value, &end, 10);
+    const auto bounded = end == value ? 0 : std::min<long>(
+                                             std::numeric_limits<int>::max(),
+                                             std::max<long>(0, parsed));
+    if (bounded > 0) {
+      LOG(INFO) << "CUDF hash join build admission enabled: maxConcurrent="
+                << bounded;
+    }
+    return static_cast<int>(bounded);
+  }();
+  return limit;
+}
+
+class HashJoinBuildAdmissionToken {
+ public:
+  explicit HashJoinBuildAdmissionToken(std::string label)
+      : label_(std::move(label)) {
+    const auto limit = hashJoinBuildAdmissionLimit();
+    auto& state = hashJoinBuildAdmissionState();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    const bool waited = state.active >= limit;
+    const auto waitStart = std::chrono::steady_clock::now();
+    state.cv.wait(lock, [&] {
+      return state.active < limit;
+    });
+    ++state.active;
+    if (waited) {
+      const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - waitStart)
+                              .count();
+      LOG(INFO) << "CUDF hash join build admission acquired after wait"
+                << " waitMs=" << waitMs << " active=" << state.active
+                << " maxConcurrent=" << limit << " label=" << label_;
+    } else {
+      VLOG(1) << "CUDF hash join build admission acquired"
+              << " active=" << state.active << " maxConcurrent=" << limit
+              << " label=" << label_;
+    }
+  }
+
+  ~HashJoinBuildAdmissionToken() {
+    const auto limit = hashJoinBuildAdmissionLimit();
+    auto& state = hashJoinBuildAdmissionState();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    VELOX_CHECK_GT(
+        state.active,
+        0,
+        "CUDF hash join build admission active count underflow");
+    --state.active;
+    VLOG(1) << "CUDF hash join build admission released"
+            << " active=" << state.active << " maxConcurrent=" << limit
+            << " label=" << label_;
+    lock.unlock();
+    state.cv.notify_one();
+  }
+
+  HashJoinBuildAdmissionToken(const HashJoinBuildAdmissionToken&) = delete;
+  HashJoinBuildAdmissionToken& operator=(const HashJoinBuildAdmissionToken&) =
+      delete;
+
+ private:
+  std::string label_;
+};
+
+std::shared_ptr<void> acquireHashJoinBuildAdmissionToken(
+    const std::string& label) {
+  if (hashJoinBuildAdmissionLimit() <= 0) {
+    return nullptr;
+  }
+  return std::make_shared<HashJoinBuildAdmissionToken>(label);
+}
+
+bool canUseUniqueBuildKeyRemapping(
+    const std::shared_ptr<const core::HashJoinNode>& joinNode) {
+  if (!joinNode->isInnerJoin() || joinNode->filter() ||
+      joinNode->outputType()->size() == 0) {
+    return false;
+  }
+
+  const auto& probeType = joinNode->sources()[0]->outputType();
+  const auto& buildType = joinNode->sources()[1]->outputType();
+  std::unordered_set<std::string> buildKeyNames;
+  for (const auto& key : joinNode->rightKeys()) {
+    buildKeyNames.insert(key->name());
+  }
+
+  // Match CudfHashJoinProbe's output-channel resolution order. A build-side
+  // non-key output requires a real build gather and disqualifies this path.
+  for (const auto& outputName : joinNode->outputType()->names()) {
+    if (probeType->getChildIdxIfExists(outputName).has_value()) {
+      continue;
+    }
+    if (buildType->getChildIdxIfExists(outputName).has_value() &&
+        buildKeyNames.count(outputName) != 0) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool uniqueBuildKeyRemappingEnabled() {
+  static const bool enabled = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_UNIQUE_BUILD_KEY_JOIN_ENABLED");
+    const bool parsed = value != nullptr && std::string(value) == "true";
+    if (parsed) {
+      LOG(INFO) << "CUDF unique-build-key remapping enabled";
+    }
+    return parsed;
+  }();
+  return enabled;
+}
 
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
@@ -249,7 +609,8 @@ void CudfHashJoinProbe::doClose() {
 }
 
 void CudfHashJoinBridge::setHashTable(
-    std::optional<CudfHashJoinBridge::hash_type> hashObject) {
+    std::optional<CudfHashJoinBridge::hash_type> hashObject,
+    std::shared_ptr<void> admissionToken) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBridge::setHashTable";
   }
@@ -260,6 +621,7 @@ void CudfHashJoinBridge::setHashTable(
         !hashObject_.has_value(),
         "CudfHashJoinBridge already has a hash table");
     hashObject_ = std::move(hashObject);
+    admissionToken_ = std::move(admissionToken);
     promises = std::move(promises_);
   }
   notify(std::move(promises));
@@ -326,7 +688,34 @@ CudfHashJoinBuild::CudfHashJoinBuild(
           joinNode),
       joinNode_(joinNode) {}
 
+void CudfHashJoinBuild::initialize() {
+  Operator::initialize();
+  replicatedCacheKey_ = replicatedHashCacheKey(joinNode_, operatorCtx_.get());
+  if (replicatedCacheKey_.empty()) {
+    return;
+  }
+  replicatedCacheEntry_ = getReplicatedHashCacheEntry(
+      replicatedCacheKey_, operatorCtx_->taskId());
+  replicatedCacheBuilder_ =
+      replicatedCacheEntry_->builderTaskId == operatorCtx_->taskId();
+  VLOG(1) << "CUDF replicated hash cache "
+          << (replicatedCacheBuilder_
+                  ? "MISS"
+                  : "DRAIN_CONSUMER")
+          << " key=" << replicatedCacheKey_
+          << " taskId=" << operatorCtx_->taskId()
+          << " node=" << planNodeId();
+}
+
 void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
+  if (replicatedCacheEntry_ != nullptr && !replicatedCacheBuilder_) {
+    // Every Spark consumer owns a distinct replicated UCX stream. Keep
+    // pulling that stream to completion so writers and endpoint cleanup are
+    // never held up by a cache hit, but do not retain or rebuild the duplicate
+    // table. The completed hash state is installed after this input is fully
+    // drained.
+    return;
+  }
   // Queue inputs, process all at once.
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
@@ -353,6 +742,10 @@ RowVectorPtr CudfHashJoinBuild::doGetOutput() {
 
 void CudfHashJoinBuild::doNoMoreInput() {
   Operator::noMoreInput();
+  if (replicatedCacheEntry_ != nullptr && !replicatedCacheBuilder_) {
+    waitForReplicatedHashCacheEntry(replicatedCacheEntry_, &future_);
+    return;
+  }
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
   // Only last driver collects all answers
@@ -397,6 +790,9 @@ void CudfHashJoinBuild::doNoMoreInput() {
     }
   }
 
+  auto admissionToken = acquireHashJoinBuildAdmissionToken(
+      operatorCtx_->taskId() + " node=" + planNodeId());
+
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using output_mr here to allow spilling queued up large tables. Inner,
   // outer, and semi-project joins build reusable cudf::hash_join objects, so
@@ -440,16 +836,86 @@ void CudfHashJoinBuild::doNoMoreInput() {
         buildType->getChildIdx(rightKeys[i]->name()));
   }
 
+  std::shared_ptr<cudf::key_remapping> uniqueBuildKeyRemapping;
+  if (uniqueBuildKeyRemappingEnabled() && tbls.size() == 1 &&
+      canUseUniqueBuildKeyRemapping(joinNode_)) {
+    auto candidate = std::make_shared<cudf::key_remapping>(
+        tbls[0]->view().select(buildKeyIndices),
+        cudf::null_equality::UNEQUAL,
+        cudf::compute_metrics::YES,
+        stream);
+    const auto distinctKeys = candidate->get_distinct_count();
+    const auto maxDuplicateCount = candidate->get_max_duplicate_count();
+    LOG(INFO) << "CUDF unique-build-key remapping candidate"
+              << " node=" << planNodeId()
+              << " buildRows=" << tbls[0]->num_rows()
+              << " distinctNonNullKeys=" << distinctKeys
+              << " maxDuplicateCount=" << maxDuplicateCount;
+    if (maxDuplicateCount <= 1) {
+      uniqueBuildKeyRemapping = std::move(candidate);
+      LOG(INFO) << "CUDF hash join using unique-build-key remapping"
+                << " node=" << planNodeId()
+                << " buildRows=" << tbls[0]->num_rows();
+    }
+  }
+
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  hashObjects.reserve(tbls.size());
+  const auto& queryConfig =
+      operatorCtx_->task()->queryCtx()->queryConfig();
+  const bool filteredJoinCacheEnabled =
+      queryConfig.get<bool>(kFilteredJoinCacheEnabledConfig, false);
+  VLOG(1) << "CUDF filtered join cache CHECK"
+            << " node=" << planNodeId()
+            << " enabled=" << filteredJoinCacheEnabled
+            << " hasFilter=" << (joinNode_->filter() != nullptr)
+            << " leftSemiFilter=" << joinNode_->isLeftSemiFilterJoin()
+            << " anti=" << joinNode_->isAntiJoin()
+            << " nullAware=" << joinNode_->isNullAware()
+            << " buildBatches=" << tbls.size();
+  bool buildFilteredJoins = filteredJoinCacheEnabled &&
+      !joinNode_->filter() &&
+      (joinNode_->isLeftSemiFilterJoin() || joinNode_->isAntiJoin());
+  if (buildFilteredJoins && joinNode_->isAntiJoin() &&
+      joinNode_->isNullAware()) {
+    // A NULL in any build batch makes a null-aware anti join empty. The probe
+    // path detects this before consulting filteredJoins, so do not allocate
+    // cache state that can never be used.
+    for (const auto& table : tbls) {
+      if (cudf::has_nulls(table->view().select(buildKeyIndices))) {
+        buildFilteredJoins = false;
+        break;
+      }
+    }
+  }
+  std::vector<std::shared_ptr<cudf::filtered_join>> filteredJoins;
+  filteredJoins.reserve(tbls.size());
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::null_equality::UNEQUAL,
-                              stream)
-                        : nullptr);
-    if (buildHashJoin) {
+        (buildHashJoin && uniqueBuildKeyRemapping == nullptr)
+        ? std::make_shared<cudf::hash_join>(
+              tbls[i]->view().select(buildKeyIndices),
+              cudf::null_equality::UNEQUAL,
+              stream)
+        : nullptr);
+    if (buildHashJoin && uniqueBuildKeyRemapping == nullptr) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
+    }
+    const bool buildThisFilteredJoin =
+        buildFilteredJoins && tbls[i]->num_rows() > 0;
+    filteredJoins.push_back(
+        buildThisFilteredJoin
+        ? std::make_shared<cudf::filtered_join>(
+              tbls[i]->view().select(buildKeyIndices),
+              cudf::null_equality::UNEQUAL,
+              stream)
+        : nullptr);
+    if (buildThisFilteredJoin) {
+      VELOX_CHECK_NOT_NULL(filteredJoins.back());
+      VLOG(1) << "CUDF filtered join cache BUILD"
+                << " node=" << planNodeId()
+                << " batch=" << i
+                << " buildRows=" << tbls[i]->num_rows();
     }
     if (CudfConfig::getInstance().debugEnabled) {
       if (hashObjects.back() != nullptr) {
@@ -463,6 +929,18 @@ void CudfHashJoinBuild::doNoMoreInput() {
 
   auto buildReadyEvent = std::make_shared<CudaEvent>(cudaEventDisableTiming);
   buildReadyEvent->recordFrom(stream);
+  if (admissionToken != nullptr) {
+    // The admission limit protects hash-table construction, not the whole
+    // build/probe lifetime. Keeping the token in the join bridge can deadlock
+    // pipelined Spark plans: an upstream probe holds the only token while a
+    // downstream build that is needed to drain that probe waits for it.
+    //
+    // Wait for the admitted construction work before releasing the token so a
+    // subsequent build cannot overlap kernels from this one. The default
+    // unlimited path keeps the existing asynchronous build-ready event.
+    stream.synchronize();
+    admissionToken.reset();
+  }
 
   std::vector<std::shared_ptr<cudf::table>> shared_tbls;
   for (auto& tbl : tbls) {
@@ -474,11 +952,24 @@ void CudfHashJoinBuild::doNoMoreInput() {
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
+  CudfHashJoinBridge::HashState hashState{
+      .tables = std::move(shared_tbls),
+      .hashJoins = std::move(hashObjects),
+      .filteredJoins = std::move(filteredJoins),
+      .uniqueBuildKeyRemapping = std::move(uniqueBuildKeyRemapping)};
+  if (replicatedCacheEntry_ != nullptr) {
+    putReplicatedHashCacheEntry(
+        replicatedCacheEntry_, hashState, stream, buildReadyEvent);
+    hashState.replicatedCacheLease = replicatedCacheEntry_;
+    VLOG(1) << "CUDF replicated hash cache PUBLISH"
+            << " key=" << replicatedCacheKey_
+            << " taskId=" << operatorCtx_->taskId()
+            << " node=" << planNodeId();
+  }
+
   cudfHashJoinBridge->setBuildStream(stream);
-  cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
-  cudfHashJoinBridge->setHashTable(
-      std::make_optional(
-          std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+  cudfHashJoinBridge->setBuildReadyEvent(buildReadyEvent);
+  cudfHashJoinBridge->setHashTable(std::make_optional(std::move(hashState)));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -490,7 +981,60 @@ exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinBuild::isFinished() {
+  if (replicatedCacheEntry_ != nullptr && !replicatedCacheBuilder_) {
+    if (replicatedCacheBarrierReached_) {
+      return !future_.valid();
+    }
+    return finishReplicatedCacheHit();
+  }
   return !future_.valid() && noMoreInput_;
+}
+
+bool CudfHashJoinBuild::finishReplicatedCacheHit() {
+  auto snapshot = replicatedHashCacheSnapshot(replicatedCacheEntry_);
+  if (!snapshot.has_value()) {
+    return false;
+  }
+
+  if (!noMoreInput_) {
+    Operator::noMoreInput();
+  }
+  std::vector<ContinuePromise> promises;
+  std::vector<std::shared_ptr<exec::Driver>> peers;
+  if (!operatorCtx_->task()->allPeersFinished(
+          planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
+    replicatedCacheBarrierReached_ = true;
+    return false;
+  }
+
+  snapshot->hashState.replicatedCacheLease = replicatedCacheEntry_;
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfHashJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
+  cudfHashJoinBridge->setBuildStream(snapshot->buildStream);
+  cudfHashJoinBridge->setBuildReadyEvent(snapshot->buildReadyEvent);
+  cudfHashJoinBridge->setHashTable(
+      std::make_optional(std::move(snapshot->hashState)));
+  replicatedCacheBarrierReached_ = true;
+  VLOG(1) << "CUDF replicated hash cache HIT"
+          << " key=" << replicatedCacheKey_
+          << " taskId=" << operatorCtx_->taskId()
+          << " node=" << planNodeId();
+
+  peers.clear();
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+  return true;
+}
+
+void CudfHashJoinBuild::doClose() {
+  if (replicatedCacheEntry_ != nullptr && replicatedCacheBuilder_) {
+    failReplicatedHashCacheEntry(replicatedCacheEntry_);
+  }
+  Operator::close();
 }
 
 CudfHashJoinProbe::CudfHashJoinProbe(
@@ -584,6 +1128,36 @@ CudfHashJoinProbe::CudfHashJoinProbe(
         "Join field {} not in probe or build input", outputType->children()[i]);
   }
 
+  // Precompute how to source every output from the probe table if runtime
+  // validation proves that the build keys are unique. Build-side outputs are
+  // restricted to direct join keys by canUseUniqueBuildKeyRemapping().
+  uniqueBuildKeyOutputSourceIndices_.reserve(outputType->size());
+  for (const auto& outputName : outputType->names()) {
+    auto probeChannel = probeType_->getChildIdxIfExists(outputName);
+    if (probeChannel.has_value()) {
+      uniqueBuildKeyOutputSourceIndices_.push_back(
+          static_cast<cudf::size_type>(probeChannel.value()));
+      continue;
+    }
+
+    auto buildChannel = buildType_->getChildIdxIfExists(outputName);
+    if (!buildChannel.has_value()) {
+      uniqueBuildKeyOutputSourceIndices_.clear();
+      break;
+    }
+    auto keyIt = std::find(
+        rightKeyIndices_.begin(),
+        rightKeyIndices_.end(),
+        static_cast<cudf::size_type>(buildChannel.value()));
+    if (keyIt == rightKeyIndices_.end()) {
+      uniqueBuildKeyOutputSourceIndices_.clear();
+      break;
+    }
+    const auto keyIndex =
+        static_cast<size_t>(std::distance(rightKeyIndices_.begin(), keyIt));
+    uniqueBuildKeyOutputSourceIndices_.push_back(leftKeyIndices_[keyIndex]);
+  }
+
   if (CudfConfig::getInstance().debugEnabled) {
     for (int i = 0; i < leftColumnIndicesToGather_.size(); i++) {
       VLOG(1) << "Left index to gather " << i << ": "
@@ -609,7 +1183,7 @@ void CudfHashJoinProbe::ensureRightFirstKeyRanges(
     return;
   }
 
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
   rightFirstKeyRanges_.clear();
   rightFirstKeyRanges_.reserve(rightTables.size());
 
@@ -831,7 +1405,7 @@ void CudfHashJoinProbe::doNoMoreInput() {
   VELOX_CHECK(
       hashObject_.has_value(),
       "Right semi probe must have build hash object before finalization");
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
   VELOX_CHECK_EQ(
       rightTables.size(),
       1,
@@ -1028,8 +1602,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
 
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
@@ -1115,13 +1689,48 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
   return cudfOutputs;
 }
 
+std::vector<CudfHashJoinProbe::JoinOutput>
+CudfHashJoinProbe::uniqueBuildKeyInnerJoin(
+    cudf::table_view leftTableView,
+    rmm::cuda_stream_view stream) {
+  auto& remapping = hashObject_.value().uniqueBuildKeyRemapping;
+  VELOX_CHECK_NOT_NULL(remapping);
+  VELOX_CHECK_EQ(
+      uniqueBuildKeyOutputSourceIndices_.size(),
+      outputType_->size(),
+      "Unique-build-key join output is not sourceable from probe keys");
+
+  auto remapped = remapping->remap_probe_keys(
+      leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+  cudf::numeric_scalar<cudf::size_type> zero(
+      0, true, stream, get_temp_mr());
+  auto matched = cudf::binary_operation(
+      remapped->view(),
+      zero,
+      cudf::binary_operator::GREATER_EQUAL,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      get_temp_mr());
+  auto output = cudf::apply_boolean_mask(
+      leftTableView.select(uniqueBuildKeyOutputSourceIndices_),
+      matched->view(),
+      stream,
+      get_output_mr());
+  const auto numRows = static_cast<vector_size_t>(output->num_rows());
+  stream.synchronize();
+
+  std::vector<JoinOutput> outputs;
+  outputs.push_back({std::move(output), numRows});
+  return outputs;
+}
+
 std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
     cudf::table_view leftTableView,
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
 
   // Precompute left (probe) table columns if needed (once, outside loop)
   std::vector<ColumnOrView> leftPrecomputed;
@@ -1209,8 +1818,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::rightJoin(
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
 
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
@@ -1345,8 +1954,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
 
   // For now, AST support is necessary to filter join output
   if (joinNode_->filter() && !useAstFilter_) {
@@ -1504,7 +2113,7 @@ CudfHashJoinProbe::leftSemiFilterJoin(
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
   std::unique_ptr<cudf::table> remainingTable;
   auto remainingLeftView = leftTableView;
   auto remainingOriginalIndices =
@@ -1557,12 +2166,18 @@ CudfHashJoinProbe::leftSemiFilterJoin(
           stream,
           get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          stream);
-      leftJoinIndices = filter_join.semi_join(
-          remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      auto& filteredJoins = hashObject_.value().filteredJoins;
+      if (i < filteredJoins.size() && filteredJoins[i] != nullptr) {
+        leftJoinIndices = filteredJoins[i]->semi_join(
+            remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      } else {
+        cudf::filtered_join filterJoin(
+            rightTableView.select(rightKeyIndices_),
+            cudf::null_equality::UNEQUAL,
+            stream);
+        leftJoinIndices = filterJoin.semi_join(
+            remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      }
     }
 
     if (leftJoinIndices->size() == 0) {
@@ -1768,8 +2383,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     VELOX_NYI("Left semi project join requires AST support for filtering");
   }
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
   auto numProbeRows = leftTableView.num_rows();
 
   const bool isNullAware = joinNode_->isNullAware();
@@ -2159,7 +2774,7 @@ CudfHashJoinProbe::rightSemiFilterJoin(
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
 
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
   auto rightTableView = rightTables[0]->view();
 
   VELOX_CHECK_EQ(
@@ -2252,7 +2867,7 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
     cudf::table_view leftTableViewParam,
     rmm::cuda_stream_view stream) {
   std::vector<JoinOutput> cudfOutputs;
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
 
   // For the special case where we need to drop nulls, we create a local table.
   // Otherwise, we use the input view directly.
@@ -2336,12 +2951,18 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
           stream,
           get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          stream);
-      matchedIndices = filter_join.semi_join(
-          remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      auto& filteredJoins = hashObject_.value().filteredJoins;
+      if (i < filteredJoins.size() && filteredJoins[i] != nullptr) {
+        matchedIndices = filteredJoins[i]->semi_join(
+            remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      } else {
+        cudf::filtered_join filterJoin(
+            rightTableView.select(rightKeyIndices_),
+            cudf::null_equality::UNEQUAL,
+            stream);
+        matchedIndices = filterJoin.semi_join(
+            remainingLeftView.select(leftKeyIndices_), stream, get_temp_mr());
+      }
     }
     if (matchedIndices->size() == 0) {
       continue;
@@ -2396,7 +3017,7 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
     // If no more input, emit unmatched-right rows if needed.
     if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) && noMoreInput_ &&
         !finished_ && isLastDriver_) {
-      auto& rightTables = hashObject_.value().first;
+      auto& rightTables = hashObject_.value().tables;
       auto stream = cudfGlobalStreamPool().get_stream();
       std::vector<std::unique_ptr<cudf::table>> toConcat;
       vector_size_t unmatchedRows = 0;
@@ -2486,8 +3107,8 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
     VLOG(1) << "Probe table number of rows: " << leftTableView.num_rows();
   }
 
-  auto& rightTables = hashObject_.value().first;
-  auto& hbs = hashObject_.value().second;
+  auto& rightTables = hashObject_.value().tables;
+  auto& hbs = hashObject_.value().hashJoins;
   for (auto i = 0; i < rightTables.size(); i++) {
     auto& rightTable = rightTables[i];
     auto& hb = hbs[i];
@@ -2505,7 +3126,10 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   std::vector<JoinOutput> cudfOutputs;
   switch (joinNode_->joinType()) {
     case core::JoinType::kInner:
-      cudfOutputs = innerJoin(leftTableView, stream);
+      cudfOutputs =
+          hashObject_.value().uniqueBuildKeyRemapping != nullptr
+          ? uniqueBuildKeyInnerJoin(leftTableView, stream)
+          : innerJoin(leftTableView, stream);
       break;
     case core::JoinType::kLeft:
       cudfOutputs = leftJoin(leftTableView, stream);
@@ -2609,7 +3233,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
       joinNode_->isFullJoin()) {
-    auto& rightTablesInit = hashObject_.value().first;
+    auto& rightTablesInit = hashObject_.value().tables;
     rightMatchedFlags_.clear();
     rightMatchedFlags_.reserve(rightTablesInit.size());
     auto initStream = cudfGlobalStreamPool().get_stream();
@@ -2627,7 +3251,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 
   // Precompute right table columns if filter exists (once when build is done)
   if (joinNode_->filter() && !rightPrecomputeInstructions_.empty()) {
-    auto& rightTablesInit = hashObject_.value().first;
+    auto& rightTablesInit = hashObject_.value().tables;
     cachedRightPrecomputed_.clear();
     cachedExtendedRightViews_.clear();
     cachedRightPrecomputed_.reserve(rightTablesInit.size());
@@ -2655,7 +3279,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   // Check if build side has any null keys (needed for null-aware left semi
   // project)
   if (joinNode_->isLeftSemiProjectJoin() && joinNode_->isNullAware()) {
-    auto& rightTablesInit = hashObject_.value().first;
+    auto& rightTablesInit = hashObject_.value().tables;
     buildSideHasNullKeys_ = false;
     for (auto& rt : rightTablesInit) {
       auto keyView = rt->view().select(rightKeyIndices_);
@@ -2671,7 +3295,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     }
   }
 
-  auto& rightTables = hashObject_.value().first;
+  auto& rightTables = hashObject_.value().tables;
   // should be rightTable->numDistinct() but it needs compute,
   // so we use num_rows()
   if (rightTables[0]->num_rows() == 0) {

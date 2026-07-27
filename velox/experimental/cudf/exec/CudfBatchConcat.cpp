@@ -20,10 +20,17 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+constexpr const char* kBatchSizeMinThresholdConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
+constexpr const char* kBatchSizeMaxThresholdConfig =
+    "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_max_threshold";
 
 RowTypePtr getConcatOutputType(
     const std::shared_ptr<const core::PlanNode>& planNode) {
@@ -51,7 +58,17 @@ CudfBatchConcat::CudfBatchConcat(
           std::nullopt,
           planNode),
       driverCtx_(driverCtx),
-      targetRows_(CudfConfig::getInstance().batchSizeMinThreshold) {}
+      targetRows_(std::max<int64_t>(
+          1,
+          driverCtx->queryConfig().get<int64_t>(
+              kBatchSizeMinThresholdConfig,
+              CudfConfig::getInstance().batchSizeMinThreshold))),
+      maxRows_(std::max<int64_t>(
+          1,
+          driverCtx->queryConfig().get<int64_t>(
+              kBatchSizeMaxThresholdConfig,
+              CudfConfig::getInstance().batchSizeMaxThreshold.value_or(
+                  std::numeric_limits<cudf::size_type>::max())))) {}
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
@@ -83,7 +100,8 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
         std::exchange(buffer_, {}),
         outputType_,
         outputStream,
-        get_output_mr());
+        get_output_mr(),
+        maxRows_);
 
     currentNumRows_ = 0;
     VELOX_CHECK_GT(outputVectors.size(), 0);

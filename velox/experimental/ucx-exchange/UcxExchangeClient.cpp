@@ -64,6 +64,7 @@ void UcxExchangeClient::close() {
     if (closed_) {
       return;
     }
+    finalStats_ = collectStatsLocked();
     closed_ = true;
     sources = std::move(sources_);
   }
@@ -76,8 +77,22 @@ void UcxExchangeClient::close() {
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
-  // TODO: Implement stats collection.
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  if (sources_.empty() && !finalStats_.empty()) {
+    return finalStats_;
+  }
+  return collectStatsLocked();
+}
+
+folly::F14FastMap<std::string, RuntimeMetric>
+UcxExchangeClient::collectStatsLocked() const {
   folly::F14FastMap<std::string, RuntimeMetric> stats;
+  for (const auto& source : sources_) {
+    for (const auto& [name, value] : source->metrics()) {
+      auto iter = stats.try_emplace(name, value.unit).first;
+      iter->second.merge(value);
+    }
+  }
   return stats;
 }
 

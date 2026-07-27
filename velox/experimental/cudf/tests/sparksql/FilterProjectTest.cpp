@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
@@ -163,6 +164,58 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, hashResults);
+}
+
+TEST_F(CudfFilterProjectTest, bloomFilterMightContain) {
+  constexpr int32_t kSize = 10;
+  BloomFilter bloomFilter;
+  bloomFilter.reset(kSize);
+  for (int64_t value = 0; value < kSize; ++value) {
+    bloomFilter.insert(folly::hasher<int64_t>()(value));
+  }
+  std::string serialized(bloomFilter.serializedSize(), '\0');
+  bloomFilter.serialize(serialized.data());
+
+  std::vector<core::TypedExprPtr> args{
+      std::make_shared<core::ConstantTypedExpr>(
+          VARBINARY(), variant::binary(serialized)),
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")};
+  auto expression = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::move(args), "might_contain");
+  auto data = makeRowVector({makeNullableFlatVector<int64_t>(
+      {0, 9, 123451, std::nullopt, 4})});
+
+  assertTypedExpressionMatchesCpu(expression, data);
+}
+
+TEST_F(CudfFilterProjectTest, bloomFilterMightContainDynamic) {
+  constexpr int32_t kSize = 10;
+  BloomFilter bloomFilter;
+  bloomFilter.reset(kSize);
+  for (int64_t value = 0; value < kSize; ++value) {
+    bloomFilter.insert(folly::hasher<int64_t>()(value));
+  }
+  std::string serialized(bloomFilter.serializedSize(), '\0');
+  bloomFilter.serialize(serialized.data());
+
+  std::vector<core::TypedExprPtr> args{
+      std::make_shared<core::FieldAccessTypedExpr>(VARBINARY(), "c0"),
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c1")};
+  auto expression = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::move(args), "might_contain");
+  auto data = makeRowVector({
+      makeFlatVector<StringView>(
+          {StringView(serialized),
+           StringView(serialized),
+           StringView(serialized),
+           StringView(serialized),
+           StringView(serialized)},
+          VARBINARY()),
+      makeNullableFlatVector<int64_t>(
+          {0, 9, 123451, std::nullopt, 4}),
+  });
+
+  assertTypedExpressionMatchesCpu(expression, data);
 }
 
 TEST_F(CudfFilterProjectTest, monotonicallyIncreasingId) {

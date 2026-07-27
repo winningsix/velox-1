@@ -102,7 +102,8 @@ class Communicator {
   /// @returns The endpoint reference or null if no connection was possible.
   [[nodiscard]] std::shared_ptr<EndpointRef> assocEndpointRef(
       std::shared_ptr<CommElement> commElement,
-      HostPort hostPort);
+      HostPort hostPort,
+      bool* reused = nullptr);
 
   /// @brief Removes an endpoint from the communicator. This is required when
   /// the endpoint has become stale since the other side has disappeared.

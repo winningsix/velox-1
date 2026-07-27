@@ -33,6 +33,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/join/conditional_join.hpp>
 #include <cudf/join/join.hpp>
@@ -525,7 +526,8 @@ void CudfNestedLoopJoinProbe::syncBuildStream(
 std::unique_ptr<cudf::table> CudfNestedLoopJoinProbe::joinWithBuildBatch(
     cudf::table_view probeTableView,
     cudf::table_view buildView,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<cudf::table> ownedProbeTable) {
   VELOX_NVTX_FUNC_RANGE();
 
   syncBuildStream(stream);
@@ -667,6 +669,54 @@ std::unique_ptr<cudf::table> CudfNestedLoopJoinProbe::joinWithBuildBatch(
       probeTableView.num_rows(),
       buildView.num_rows(),
       outputRows);
+
+  // Runtime Bloom filters arrive as a one-row VARBINARY replicated build.
+  // Keep the scalar encoded once instead of making cross_join copy it into
+  // every probe row. The downstream might_contain implementation consumes
+  // this dictionary directly and the restoring projection drops it.
+  if (buildView.num_rows() == 1 &&
+      buildColumnIndicesToGather_.size() == 1) {
+    const auto buildColumnIndex = buildColumnIndicesToGather_.front();
+    const auto buildColumn = buildView.column(buildColumnIndex);
+    if (buildColumn.type().id() == cudf::type_id::STRING &&
+        buildColumn.null_count() == 0) {
+      cudf::numeric_scalar<int32_t> zeroIndex(
+          0, true, stream, get_temp_mr());
+      auto dictionaryIndices = cudf::make_column_from_scalar(
+          zeroIndex,
+          probeTableView.num_rows(),
+          stream,
+          get_output_mr());
+      auto dictionaryKeys = std::make_unique<cudf::column>(
+          buildColumn, stream, get_output_mr());
+      auto repeatedBuild = cudf::make_dictionary_column(
+          std::move(dictionaryKeys),
+          std::move(dictionaryIndices),
+          stream,
+          get_output_mr());
+
+      std::vector<std::unique_ptr<cudf::column>> outCols(
+          numOutputColumns);
+      if (ownedProbeTable) {
+        auto probeCols = ownedProbeTable->release();
+        for (size_t i = 0; i < probeColumnOutputIndices_.size(); ++i) {
+          outCols[probeColumnOutputIndices_[i]] =
+              std::move(probeCols[probeColumnIndicesToGather_[i]]);
+        }
+      } else {
+        auto gatheredProbe = std::make_unique<cudf::table>(
+            probeTableView.select(probeColumnIndicesToGather_),
+            stream,
+            get_output_mr());
+        auto probeCols = gatheredProbe->release();
+        for (size_t i = 0; i < probeColumnOutputIndices_.size(); ++i) {
+          outCols[probeColumnOutputIndices_[i]] = std::move(probeCols[i]);
+        }
+      }
+      outCols[buildColumnOutputIndices_.front()] = std::move(repeatedBuild);
+      return std::make_unique<cudf::table>(std::move(outCols));
+    }
+  }
 
   auto crossResult =
       cudf::cross_join(probeTableView, buildView, stream, get_output_mr());
@@ -965,8 +1015,17 @@ RowVectorPtr CudfNestedLoopJoinProbe::doGetOutput() {
 
   // Join probe against the single build table.
   if (!buildEmpty_) {
+    std::unique_ptr<cudf::table> ownedProbeTable;
+    cudf::table_view probeTableView = cudfInput->getTableView();
+    if (!hasFilter_) {
+      ownedProbeTable = cudfInput->release();
+      probeTableView = ownedProbeTable->view();
+    }
     auto result = joinWithBuildBatch(
-        cudfInput->getTableView(), buildData_.value()->view(), stream);
+        probeTableView,
+        buildData_.value()->view(),
+        stream,
+        std::move(ownedProbeTable));
     if (result->num_rows() > 0) {
       input_.reset();
       auto size = static_cast<vector_size_t>(result->num_rows());
