@@ -466,6 +466,13 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
   map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
   map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
+  map["ucxExchangeSource.metadataWaitNanos"] = metrics_.metadataWaitNanos_;
+  map["ucxExchangeSource.receiveAllocationNanos"] =
+      metrics_.receiveAllocationNanos_;
+  map["ucxExchangeSource.dataWaitNanos"] = metrics_.dataWaitNanos_;
+  map["ucxExchangeSource.metadataCallbackNanos"] =
+      metrics_.metadataCallbackNanos_;
+  map["ucxExchangeSource.dataCallbackNanos"] = metrics_.dataCallbackNanos_;
   return map;
 }
 
@@ -569,11 +576,13 @@ void UcxExchangeSource::sendHandshake() {
       sizeof(handshakeReq->taskId) - 1);
   handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
   handshakeReq->workerId = communicator->getWorkerId();
+  handshakeReq->dataPort = communicator->getDataListenerPort();
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-SEND] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
           << " destination=" << partitionKey_.destination << " peer=" << host_
-          << ":" << port_ << " workerId=" << handshakeReq->workerId;
+          << ":" << port_ << " workerId=" << handshakeReq->workerId
+          << " dataPort=" << handshakeReq->dataPort;
 
   // Create the handshake which will register client's existence with the server
   ucxx::AmReceiverCallbackInfo info(
@@ -652,6 +661,7 @@ void UcxExchangeSource::getMetadata() {
   }
   auto metadataReq = metadataReceiveBuffer_;
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber_);
+  requestStart_ = metadataStart_ = Clock::now();
 
   VLOG(3) << toString()
           << " waiting for metadata for chunk: " << sequenceNumber_
@@ -678,6 +688,14 @@ void UcxExchangeSource::getMetadata() {
 void UcxExchangeSource::onMetadata(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
+  const auto callbackStart = Clock::now();
+  const auto metadataDone = Clock::now();
+  if (metadataStart_ != Clock::time_point{}) {
+    metrics_.metadataWaitNanos_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            metadataDone - metadataStart_)
+            .count());
+  }
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(2) << "[UCX-SOURCE-METADATA-AFTER-CLOSE] " << toString()
@@ -729,6 +747,10 @@ void UcxExchangeSource::onMetadata(
       deliverEndMarker();
       setStateIf(ReceiverState::WaitingForMetadata, ReceiverState::Done);
       wakeCommunicator();
+      metrics_.metadataCallbackNanos_.addValue(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              Clock::now() - callbackStart)
+              .count());
       // jump out of this function.
       return;
     }
@@ -736,6 +758,10 @@ void UcxExchangeSource::onMetadata(
     pendingReceive_ = ptr;
     tryStartDataReceive(pendingReceive_, ReceiverState::WaitingForMetadata);
   }
+  metrics_.metadataCallbackNanos_.addValue(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - callbackStart)
+          .count());
 }
 
 bool UcxExchangeSource::tryStartDataReceive(
@@ -796,6 +822,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
 
   // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX.
+  const auto allocationStart = Clock::now();
   auto stream =
       facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   ptr->stream = stream;
@@ -881,6 +908,10 @@ bool UcxExchangeSource::tryStartDataReceive(
       }
     }
   } else {
+    metrics_.receiveAllocationNanos_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - allocationStart)
+            .count());
     releaseReceiveReservation();
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
@@ -888,6 +919,10 @@ bool UcxExchangeSource::tryStartDataReceive(
     wakeCommunicator();
     return false;
   }
+  metrics_.receiveAllocationNanos_.addValue(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - allocationStart)
+          .count());
 
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
           << " bytes of device memory";
@@ -923,6 +958,7 @@ bool UcxExchangeSource::tryStartDataReceive(
 
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
+  dataStart_ = Clock::now();
   request_ = endpointRef_->endpoint_->tagRecv(
       receiveBuffer,
       ptr->metadata.dataSizeBytes,
@@ -940,6 +976,20 @@ bool UcxExchangeSource::tryStartDataReceive(
 }
 
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
+  const auto callbackStart = Clock::now();
+  const auto dataDone = Clock::now();
+  if (dataStart_ != Clock::time_point{}) {
+    metrics_.dataWaitNanos_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            dataDone - dataStart_)
+            .count());
+  }
+  if (requestStart_ != Clock::time_point{}) {
+    metrics_.rttPerRequest_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            dataDone - requestStart_)
+            .count());
+  }
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(2) << "[UCX-SOURCE-DATA-AFTER-CLOSE] " << toString()
@@ -1017,6 +1067,10 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
   wakeCommunicator();
+  metrics_.dataCallbackNanos_.addValue(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - callbackStart)
+          .count());
 }
 
 void UcxExchangeSource::receiveHandshakeResponse() {
